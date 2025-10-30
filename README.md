@@ -1,8 +1,8 @@
 # OpsControl Official Templates
 
 Automation assets for the OpsControl platform:
-- Ansible playbooks (deploy, health checks, mobility)
-- Terraform modules (infrastructure baselines)
+- Ansible playbooks
+- Terraform modules
 - Dynamic inventory
 - Template/Blueprint packages
 
@@ -12,9 +12,3 @@ Automation assets for the OpsControl platform:
 - `catalog/ansible/inventory/` — Dynamic inventory script
 - `catalog/terraform/modules/` — Infrastructure modules
 - `catalog/packages/` — Template and blueprint manifests
-
-## Usage
-
-Templates are consumed through OpsControl. Production jobs use baked assets; development can fetch specific refs.
-
-No secrets in templates — use vault/secret references only.
