@@ -1,0 +1,188 @@
+---
+- name: Install and configure Traefik reverse proxy
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_volume_name: "traefik-acme"
+    traefik_dashboard_router: "traefik-dashboard"
+    acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+  tasks:
+    - name: OPERATION_STEP traefik:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"traefik:start","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Ensure Docker packages present
+      apt:
+        name:
+          - docker.io
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker service running
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Ensure Traefik ACME volume exists
+      community.docker.docker_volume:
+        name: "{{ traefik_volume_name }}"
+        state: present
+
+    - name: Remove existing Traefik container
+      community.docker.docker_container:
+        name: "{{ traefik_container_name }}"
+        state: absent
+
+    - name: Remove containers publishing host port 80
+      shell: |
+        docker ps --format '{{"{{.Names}}"}} {{"{{.Ports}}"}}' \
+        | awk '$2 ~ /0\.0\.0\.0:80->/ {print $1}' \
+        | xargs -r docker rm -f
+      args:
+        executable: /bin/sh
+      register: removed_port80
+      changed_when: removed_port80.stdout != ""
+
+    - name: Debug removed host-80 containers
+      debug:
+        var: removed_port80.stdout_lines
+      when: removed_port80.stdout != ""
+
+    - name: Show running containers after cleanup
+      shell: docker ps --format '{{"{{.Names}}"}} {{"{{.Ports}}"}}'
+      args:
+        executable: /bin/sh
+      register: docker_ps_after_cleanup
+      changed_when: false
+
+    - name: Debug containers after cleanup
+      debug:
+        var: docker_ps_after_cleanup.stdout_lines
+
+    - name: Build Traefik command arguments
+      set_fact:
+        traefik_command_args: >-
+          {{
+            [
+              '--providers.docker',
+              '--providers.docker.exposedbydefault=false',
+              '--entrypoints.web.address=:80',
+              '--entrypoints.websecure.address=:443',
+              '--entrypoints.web.http.redirections.entrypoint.to=websecure',
+              '--entrypoints.web.http.redirections.entrypoint.scheme=https',
+              '--entrypoints.web.http.redirections.entrypoint.permanent=true',
+              '--certificatesresolvers.letsencrypt.acme.email={{ traefik_email }}',
+              '--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json',
+              '--certificatesresolvers.letsencrypt.acme.httpchallenge=true',
+              '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
+            ]
+            + (
+              ['--certificatesresolvers.letsencrypt.acme.caserver={{ acme_staging_url }}']
+              if (traefik_acme_server | default('staging')) == 'staging'
+              else []
+            )
+            + (
+              ['--api.dashboard=true']
+              if (traefik_dashboard_enabled | default(false))
+              else []
+            )
+          }}
+
+    - name: Build Traefik labels
+      set_fact:
+        traefik_labels: >-
+          {{
+            {'traefik.enable': 'true'}
+            | combine(
+                (
+                  (traefik_dashboard_enabled | default(false))
+                  and ((traefik_dashboard_host | default('')) | length > 0)
+                )
+                | ternary(
+                    {
+                      'traefik.http.routers.' + traefik_dashboard_router + '.rule': 'Host("' ~ traefik_dashboard_host ~ '")',
+                      'traefik.http.routers.' + traefik_dashboard_router + '.entrypoints': 'websecure',
+                      'traefik.http.routers.' + traefik_dashboard_router + '.tls.certresolver': 'letsencrypt'
+                    },
+                    {}
+                  )
+              )
+            | combine(
+                (
+                  (traefik_dashboard_enabled | default(false))
+                  and (traefik_dashboard_auth is defined)
+                  and ((traefik_dashboard_auth | default('') | length) > 0)
+                )
+                | ternary(
+                    {
+                      'traefik.http.routers.' + traefik_dashboard_router + '.middlewares': 'traefik-dashboard-auth',
+                      'traefik.http.middlewares.traefik-dashboard-auth.basicauth.users': traefik_dashboard_auth
+                    },
+                    {}
+                  )
+              )
+          }}
+      no_log: "{{ (traefik_dashboard_enabled | default(false)) and (traefik_dashboard_auth | default('') | length > 0) }}"
+
+    - name: Ensure Traefik container is running
+      community.docker.docker_container:
+        name: "{{ traefik_container_name }}"
+        image: "traefik:2.11"
+        state: started
+        recreate: true
+        restart_policy: always
+        detach: true
+        published_ports:
+          - "80:80"
+          - "443:443"
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock:ro"
+          - "{{ traefik_volume_name }}:/letsencrypt"
+        command: "{{ traefik_command_args }}"
+        labels: "{{ traefik_labels }}"
+        pull: false
+      no_log: "{{ (traefik_dashboard_enabled | default(false)) and (traefik_dashboard_auth | default('') | length > 0) }}"
+
+    - name: Inspect Traefik container state
+      community.docker.docker_container_info:
+        name: "{{ traefik_container_name }}"
+      register: traefik_container_info
+
+    - name: Extract Traefik container details
+      set_fact:
+        traefik_container_details: >-
+          {{
+            (traefik_container_info.get('containers', []) | first)
+            if ((traefik_container_info.get('containers', []) | length) > 0)
+            else (traefik_container_info.get('container', None))
+          }}
+
+    - name: Fail if Traefik inspection missing
+      fail:
+        msg: "Unable to inspect Traefik container state"
+      when: traefik_container_details is none
+
+    - name: Ensure Traefik container reported running
+      assert:
+        that:
+          - traefik_container_details.State is defined
+          - traefik_container_details.State.Status is defined
+          - traefik_container_details.State.Status == "running"
+        fail_msg: "Traefik container is not running"
+
+    - name: OPERATION_STEP traefik:ready
+      shell: |
+        printf 'OPERATION_STEP={"name":"traefik:ready","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP traefik:complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"traefik:complete","status":"completed"}\n'
+      args:
+        executable: /bin/sh

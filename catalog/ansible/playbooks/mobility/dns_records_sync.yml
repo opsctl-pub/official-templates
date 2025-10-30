@@ -1,0 +1,10 @@
+---
+- name: DNS records sync (official)
+  hosts: localhost
+  gather_facts: false
+  vars:
+    mode: sync
+  tasks:
+    - name: Placeholder DNS sync
+      debug:
+        msg: "DNS {{ mode }} for project {{ project_id | default('proj') }} domains={{ domains | default([]) }}"

@@ -1,0 +1,16 @@
+---
+- name: Runner self-test (official)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Echo OPERATION_STEP running
+      shell: |
+        printf 'OPERATION_STEP={"name":"Ansible playbook","status":"running","metadata":{"playbook":"runner_selftest.yml"}}\n'
+
+    - name: No-op
+      debug:
+        msg: "Runner and inventory wiring OK"
+
+    - name: Echo OPERATION_STEP completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"Ansible playbook","status":"completed","metadata":{"duration_ms":1}}\n'

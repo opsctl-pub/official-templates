@@ -1,0 +1,655 @@
+---
+- name: Deploy container to target server
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('app') }}"
+    router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
+    health_path: "{{ app_health_path | default('/health') }}"
+    host_health_port: "{{ app_health_port | default(app_ports[0]) }}"
+    traefik_enabled: "{{ app_traefik_enabled | default(false) | bool }}"
+    # IMPORTANT: Variables used in task conditionals MUST use single-line Jinja2 expressions.
+    # NEVER use YAML folding (>-) with if/elif/else blocks for variables used in when: conditions.
+    # Reason: YAML folding injects whitespace that breaks string comparisons (e.g., " host " != "host").
+    # Fixed 2025-10-29: effective_health_mode and health_check_target converted to single-line ternaries.
+    health_mode: "{{ app_health_mode | default('auto') }}"
+    effective_health_mode: "{{ 'container' if (traefik_enabled and health_mode == 'auto') else ('traefik' if (health_mode == 'traefik' and traefik_enabled) else health_mode) }}"
+    container_health_port: "{{ app_health_container_port | default(None, true) }}"
+    health_container_path: "{{ app_health_container_path | default(health_path) }}"
+    health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
+    health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
+    published_ports: >-
+      {{
+        traefik_enabled
+        | ternary(
+            [],
+            (
+              (
+                app_container_ports is defined and (app_container_ports | length > 0)
+              )
+              | ternary(
+                  app_ports | zip(app_container_ports) | map('join', ':') | list,
+                  app_ports | map('regex_replace', '^(.*)$', '\\1:\\1') | list
+              )
+            )
+        )
+      }}
+    traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
+    traefik_label_map: {}
+    opsctl_label_map:
+      "com.opsctl.managed": "true"
+      "com.opsctl.org_id": "{{ app_org_id | default('') }}"
+      "com.opsctl.project_id": "{{ app_project_id | default('') }}"
+      "com.opsctl.app": "{{ app_slug | default(container_name) }}"
+    final_label_map: "{{ opsctl_label_map }}"
+    deploy_host_ports: []
+  tasks:
+    - name: Ensure container health port derived when missing
+      set_fact:
+        container_health_port: "{{ app_container_ports[0] }}"
+      when:
+        - container_health_port is none
+        - app_container_ports is defined
+        - (app_container_ports | length) > 0
+
+    - name: OPERATION_STEP start
+      shell: |
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"running","metadata":{"phase":"init"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP docker:install
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"running","metadata":{}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Install Docker packages (docker.io)
+      apt:
+        name:
+          - docker.io
+        state: present
+        update_cache: true
+
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: OPERATION_STEP docker:ready
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Capture host ports for baseline preflight
+      set_fact:
+        deploy_host_ports: "{{ published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list }}"
+      when:
+        - not traefik_enabled
+        - (published_ports | length) > 0
+
+    - name: OPERATION_STEP preflight:ports start
+      shell: |
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"running","metadata":{"ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Detect host port conflicts
+      shell: |
+        python3 - <<'PY'
+        import json, subprocess, sys
+
+        ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
+        if not ports:
+            print("[]")
+            sys.exit(0)
+
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{ '{{json .}}' }}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+
+        seen = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ports_field = data.get("Ports") or ""
+            matches = sorted({port for port in ports if f":{port}->" in ports_field})
+            if not matches:
+                continue
+            name = data.get("Names") or data.get("ID")
+            if not name:
+                continue
+            seen.setdefault(name, set()).update(matches)
+
+        conflicts = [
+            {"name": name, "ports": sorted(list(values))}
+            for name, values in seen.items()
+        ]
+        print(json.dumps(conflicts))
+        PY
+      args:
+        executable: /bin/bash
+      register: port_conflicts_result
+      changed_when: false
+      failed_when: port_conflicts_result.rc != 0
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Parse port conflict results
+      set_fact:
+        port_conflict_entries: "{{ port_conflicts_result.stdout | default('[]') | from_json }}"
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Initialize post-conflict list
+      set_fact:
+        port_conflict_entries_post: "{{ port_conflict_entries | default([]) }}"
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Record conflicting container names
+      set_fact:
+        port_conflict_names: "{{ port_conflict_entries | map(attribute='name') | list }}"
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Fail on port conflicts without override
+      block:
+        - name: OPERATION_STEP preflight:ports failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"ports":%s,"conflicts":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_names | default([]) | to_json }}'
+          args:
+            executable: /bin/sh
+        - name: Abort due to port conflict
+          fail:
+            msg: "port_conflict"
+      when:
+        - not traefik_enabled
+        - (port_conflict_entries | length) > 0
+        - not (replace_conflicts | default(false) | bool)
+
+    - name: Determine removable conflict containers
+      shell: |
+        python3 - <<'PY'
+        import json, subprocess, sys
+
+        conflicts = json.loads('''{{ port_conflict_entries | default([]) | to_json }}''')
+        target_org = {{ app_org_id | default('') | to_json }}
+        project_id = {{ app_project_id | default('') | to_json }}
+        require_project = bool(project_id)
+
+        names = [item.get("name") for item in conflicts if item.get("name")]
+        if not names:
+            print("[]")
+            sys.exit(0)
+
+        result = subprocess.run(["docker", "inspect"] + names, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print("[]")
+            sys.exit(0)
+
+        removable = []
+        for item in data:
+            labels = item.get("Config", {}).get("Labels") or {}
+            if labels.get("com.opsctl.managed") != "true":
+                continue
+            if labels.get("com.opsctl.org_id") != target_org:
+                continue
+            if require_project and labels.get("com.opsctl.project_id") != project_id:
+                continue
+            name = item.get("Name", "").lstrip("/")
+            if name:
+                removable.append(name)
+
+        print(json.dumps(sorted(removable)))
+        PY
+      args:
+        executable: /bin/bash
+      register: removable_conflicts
+      changed_when: false
+      failed_when: removable_conflicts.rc != 0
+      when:
+        - not traefik_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+
+    - name: Parse removable container list
+      set_fact:
+        removable_containers: "{{ removable_conflicts.stdout | default('[]') | from_json }}"
+      when:
+        - not traefik_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+
+    - name: Remove conflicting container "{{ item }}"
+      command: docker rm -f {{ item }}
+      loop: "{{ removable_containers | default([]) }}"
+      when:
+        - not traefik_enabled
+        - replace_conflicts | default(false) | bool
+        - (removable_containers | default([]) | length) > 0
+
+    - name: OPERATION_STEP replace:complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"replace:complete","status":"completed","metadata":{"removed":%s}}\n' '{{ removable_containers | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - not traefik_enabled
+        - replace_conflicts | default(false) | bool
+        - (removable_containers | default([]) | length) > 0
+
+    - name: Re-check host port conflicts after removal
+      shell: |
+        python3 - <<'PY'
+        import json, subprocess, sys
+
+        ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
+        if not ports:
+            print("[]")
+            sys.exit(0)
+
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{ '{{json .}}' }}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+
+        seen = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ports_field = data.get("Ports") or ""
+            matches = sorted({port for port in ports if f":{port}->" in ports_field})
+            if not matches:
+                continue
+            name = data.get("Names") or data.get("ID")
+            if not name:
+                continue
+            seen.setdefault(name, set()).update(matches)
+
+        conflicts = [
+            {"name": name, "ports": sorted(list(values))}
+            for name, values in seen.items()
+        ]
+        print(json.dumps(conflicts))
+        PY
+      args:
+        executable: /bin/bash
+      register: port_conflicts_retry_result
+      changed_when: false
+      failed_when: port_conflicts_retry_result.rc != 0
+      when:
+        - not traefik_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries | length) > 0
+
+    - name: Parse post-removal conflicts
+      set_fact:
+        port_conflict_entries_post: "{{ port_conflicts_retry_result.stdout | default('[]') | from_json }}"
+      when:
+        - not traefik_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries | length) > 0
+
+    - name: Fail when conflicts remain after override
+      block:
+        - name: OPERATION_STEP preflight:ports failed after override
+          shell: |
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"ports":%s,"conflicts_remaining":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_entries_post | map(attribute="name") | list | to_json }}'
+          args:
+            executable: /bin/sh
+        - name: Abort due to remaining port conflicts
+          fail:
+            msg: "port_conflict"
+      when:
+        - not traefik_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries_post | default([]) | length) > 0
+
+    - name: OPERATION_STEP preflight:ports complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"completed","metadata":{"ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - not traefik_enabled
+        - (deploy_host_ports | length) > 0
+        - (
+            (port_conflict_entries | length == 0)
+            or
+            (
+              replace_conflicts | default(false) | bool
+              and (port_conflict_entries_post | default([]) | length) == 0
+            )
+          )
+
+    - name: OPERATION_STEP creds:check
+      shell: |
+        printf 'OPERATION_STEP={"name":"creds:check","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Load registry auth content
+      set_fact:
+        auth_content_raw: "{{ lookup('file', '/secrets/registry-auth.json') | default('', true) | trim }}"
+
+    - name: Normalize registry auth when already parsed
+      set_fact:
+        auth: "{{ auth_content_raw }}"
+        auth_is_mapping: true
+      when:
+        - auth_content_raw is mapping
+
+    - name: Parse registry auth JSON when present
+      set_fact:
+        auth: "{{ auth_content_raw | from_json }}"
+        auth_is_mapping: true
+      when:
+        - auth_content_raw is string
+        - auth_content_raw | length > 0
+
+    - name: Normalize registry auth facts when absent
+      set_fact:
+        auth: {}
+        auth_is_mapping: false
+      when: auth_content_raw | length == 0
+
+    - name: OPERATION_STEP creds:check complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"creds:check","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP auth:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"auth:start","status":"running","metadata":{"host":"%s"}}\n' "{{ auth.host | default('') }}"
+      args:
+        executable: /bin/sh
+      when: auth_is_mapping | default(false)
+
+    - name: Docker login to "{{ auth.host }}" using token
+      shell: |
+        echo "{{ auth.token }}" | docker login "{{ auth.host }}" -u "{{ auth.username | default('oauth2') }}" --password-stdin >/dev/null 2>&1
+      args:
+        executable: /bin/sh
+      register: login_token_result
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is defined
+
+    - name: Docker login to "{{ auth.host }}" using username/password
+      shell: |
+        echo "{{ auth.password }}" | docker login "{{ auth.host }}" -u "{{ auth.username }}" --password-stdin >/dev/null 2>&1
+      args:
+        executable: /bin/sh
+      register: login_user_result
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is not defined
+        - auth.username is defined
+        - auth.password is defined
+
+    - name: Compute auth exit code from token login
+      set_fact:
+        auth_exit_code: "{{ login_token_result.rc | default(1) | int }}"
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is defined
+        - login_token_result is defined
+
+    - name: Compute auth exit code from username/password login
+      set_fact:
+        auth_exit_code: "{{ login_user_result.rc | default(1) | int }}"
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is not defined
+        - login_user_result is defined
+
+    - name: OPERATION_STEP auth:start complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"auth:start","status":"%s","metadata":{"host":"%s","exit_code":%d}}\n' \
+        "{{ 'completed' if ((auth_exit_code | default(1)) | int) == 0 else 'failed' }}" \
+        "{{ auth.host | default('') }}" \
+        {{ (auth_exit_code | default(1)) | int }}
+      args:
+        executable: /bin/sh
+      when: auth_is_mapping | default(false)
+
+    - name: Mark registry login success
+      set_fact:
+        auth_logout_required: true
+      when:
+        - auth_is_mapping | default(false)
+        - ((auth_exit_code | default(1)) | int) == 0
+
+    - name: Fail when registry authentication unsuccessful
+      fail:
+        msg: "Registry authentication failed. Verify credentials and rate limits."
+      when:
+        - auth_is_mapping | default(false)
+        - ((auth_exit_code | default(1)) | int) != 0
+
+    - name: OPERATION_STEP image:check
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:check","status":"running","metadata":{"image":"{{ app_image }}"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Inspect local image "{{ app_image }}"
+      shell: docker image inspect "{{ app_image }}"
+      register: inspect_result
+      failed_when: false
+      changed_when: false
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP image:check complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:check","status":"completed","metadata":{"image":"{{ app_image }}","exists":%s}}\n' \
+        "{{ 'true' if inspect_result.rc == 0 else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP image:pull
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:pull","status":"running","metadata":{"image":"{{ app_image }}"}}\n'
+      args:
+        executable: /bin/sh
+      when: inspect_result.rc != 0
+
+    - name: Pull image "{{ app_image }}" from registry
+      shell: docker pull "{{ app_image }}"
+      register: pull_result
+      changed_when: true
+      failed_when: pull_result.rc != 0
+      args:
+        executable: /bin/sh
+      when: inspect_result.rc != 0
+
+    - name: OPERATION_STEP image:pull complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:pull","status":"%s","metadata":{"image":"{{ app_image }}"}}\n' \
+        "{{ 'completed' if (inspect_result.rc == 0 and (pull_result is not defined or pull_result.rc == 0)) else 'failed' }}"
+      args:
+        executable: /bin/sh
+      when: inspect_result.rc != 0
+
+    - name: Docker logout from "{{ auth.host }}"
+      shell: docker logout "{{ auth.host }}"
+      args:
+        executable: /bin/sh
+      no_log: true
+      failed_when: false
+      when:
+        - auth_is_mapping | default(false)
+        - auth.host is defined
+        - auth_logout_required | default(false)
+
+    - name: Build Traefik labels for router "{{ router_name }}"
+      set_fact:
+        traefik_label_map: >-
+          {{
+            {
+              'traefik.enable': 'true',
+              ('traefik.http.routers.' ~ router_name ~ '.rule'): 'Host("' ~ app_traefik_host ~ '")',
+              ('traefik.http.routers.' ~ router_name ~ '.entrypoints'): 'websecure'
+            }
+            | combine(
+                (app_traefik_https | default(true))
+                | ternary(
+                    {('traefik.http.routers.' ~ router_name ~ '.tls.certresolver'): 'letsencrypt'},
+                    {}
+                )
+            )
+            | combine(
+                (traefik_middlewares | length > 0)
+                | ternary(
+                    {('traefik.http.routers.' ~ router_name ~ '.middlewares'): (traefik_middlewares | join(','))},
+                    {}
+                )
+            )
+          }}
+      when: traefik_enabled
+
+    - name: Merge OpsControl and Traefik labels
+      set_fact:
+        final_label_map: "{{ opsctl_label_map | combine(traefik_label_map) }}"
+      when: traefik_enabled
+
+    - name: Apply baseline OpsControl labels
+      set_fact:
+        final_label_map: "{{ opsctl_label_map }}"
+      when: not traefik_enabled
+
+    - name: OPERATION_STEP container:prepare
+      shell: |
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"running","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: Start container "{{ container_name }}"
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        image: "{{ app_image }}"
+        command: "{{ app_run_command | default(omit) }}"
+        state: started
+        recreate: true
+        restart_policy: unless-stopped
+        detach: true
+        pull: false
+        published_ports: "{{ published_ports }}"
+        env: "{{ app_env | default({}) }}"
+        labels: "{{ final_label_map }}"
+
+    - name: OPERATION_STEP container:running
+      shell: |
+        printf 'OPERATION_STEP={"name":"container:running","status":"completed","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP health:check
+      shell: |
+        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"mode":"%s","target":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}"
+      args:
+        executable: /bin/sh
+
+    - name: Verify health endpoint at {{ health_url_local }}
+      uri:
+        url: "{{ health_url_local }}"
+        method: GET
+        status_code: 200
+        timeout: 20
+      register: health_result_host
+      retries: 10
+      delay: 3
+      until: health_result_host.status == 200
+      when: effective_health_mode == 'host'
+
+    - name: Probe Docker HEALTHCHECK capability for "{{ container_name }}"
+      shell: |
+        docker inspect --format '{% raw %}{{if .Config.Healthcheck}}yes{{else}}no{{end}}{% endraw %}' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      register: docker_health_support
+      changed_when: false
+      failed_when: false
+      when: effective_health_mode in ['container', 'traefik']
+
+    - name: Wait for Docker HEALTHCHECK status on "{{ container_name }}"
+      shell: |
+        docker inspect --format '{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{end}}{% endraw %}' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      register: docker_health_status
+      retries: 20
+      delay: 3
+      until: docker_health_status.stdout.strip() == "healthy"
+      when:
+        - effective_health_mode in ['container', 'traefik']
+        - docker_health_support.stdout.strip() == "yes"
+
+    - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
+      shell: |
+        docker exec "{{ container_name }}" sh -c "wget -q --spider http://127.0.0.1:{{ container_health_port }}{{ health_container_path }}"
+      args:
+        executable: /bin/sh
+      register: container_health_exec
+      retries: 20
+      delay: 3
+      until: container_health_exec.rc == 0
+      when:
+        - effective_health_mode in ['container', 'traefik']
+        - docker_health_support.stdout.strip() != "yes"
+
+    - name: OPERATION_STEP health:check complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"mode":"%s","target":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}"
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP deploy:start complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"completed","metadata":{"container":"{{ container_name }}"}}\n'
+      args:
+        executable: /bin/sh

@@ -1,0 +1,18 @@
+---
+- name: Verify HTTP health endpoint (official)
+  hosts: localhost
+  gather_facts: false
+  vars:
+    timeout_s: 60
+  tasks:
+    - name: Check health
+      uri:
+        url: "{{ health_url }}"
+        method: GET
+        status_code: 200
+        return_content: no
+        validate_certs: no
+      register: _resp
+      retries: 10
+      delay: 3
+      until: _resp.status == 200

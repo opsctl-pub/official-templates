@@ -1,0 +1,41 @@
+---
+- name: Baseline Docker (install and verify)
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: OPERATION_STEP docker:install start
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Install Docker packages (docker.io)
+      apt:
+        name:
+          - docker.io
+        state: present
+        update_cache: true
+
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Verify Docker daemon is responsive
+      command: docker info
+      register: docker_info_result
+      failed_when: docker_info_result.rc != 0
+
+    - name: OPERATION_STEP docker:install completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP baseline:complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:complete","status":"completed"}\n'
+      args:
+        executable: /bin/sh

@@ -1,0 +1,10 @@
+---
+- name: Drain and detach backend from load balancer (official)
+  hosts: localhost
+  gather_facts: false
+  vars:
+    timeout_s: 60
+  tasks:
+    - name: Placeholder drain/detach action
+      debug:
+        msg: "Drain+detach {{ container_name | default('container') }} from LB {{ lb_id | default('lb') }}"

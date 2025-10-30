@@ -1,0 +1,10 @@
+---
+- name: Attach backend to load balancer (official)
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pool: default
+  tasks:
+    - name: Placeholder attach action
+      debug:
+        msg: "Attach {{ container_name | default('container') }} on {{ server_id | default('server') }} to LB {{ lb_id | default('lb') }} in pool {{ pool }}"
