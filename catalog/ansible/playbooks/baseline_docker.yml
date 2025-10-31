@@ -3,6 +3,26 @@
   hosts: all
   gather_facts: false
   become: true
+  pre_tasks:
+    - name: Skip baseline when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
+    - name: Wait for SSH availability
+      wait_for_connection:
+        timeout: "{{ ssh_wait_timeout | default(60) }}"
+        sleep: 5
+        connect_timeout: 5
+
+    - name: Wait for cloud-init completion if present
+      command: test -f /var/lib/cloud/instance/boot-finished
+      register: cloud_init_ready
+      retries: 12
+      delay: 5
+      until: cloud_init_ready.rc == 0
+      changed_when: false
+      failed_when: false
+
   tasks:
     - name: OPERATION_STEP docker:install start
       shell: |
