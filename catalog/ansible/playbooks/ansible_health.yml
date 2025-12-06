@@ -1,0 +1,16 @@
+---
+- name: Ansible engine health check (official)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Emit ansible:health:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"ansible:health:start","status":"running","metadata":{"engine":"ansible"}}\n'
+
+    - name: Verify ansible execution
+      debug:
+        msg: "Ansible engine operational"
+
+    - name: Emit ansible:health:done
+      shell: |
+        printf 'OPERATION_STEP={"name":"ansible:health:done","status":"completed","metadata":{"engine":"ansible","duration_ms":1}}\n'
