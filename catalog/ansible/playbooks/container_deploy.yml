@@ -107,6 +107,11 @@
         import json, subprocess, sys
 
         ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
+        target_container = {{ container_name | to_json }}
+        target_org = {{ app_org_id | default('') | to_json }}
+        target_project = {{ app_project_id | default('') | to_json }}
+        target_app = {{ app_slug | default(container_name) | to_json }}
+        require_project = bool(target_project)
         if not ports:
             print("[]")
             sys.exit(0)
@@ -136,6 +141,27 @@
             name = data.get("Names") or data.get("ID")
             if not name:
                 continue
+            if name == target_container:
+                inspect_result = subprocess.run(
+                    ["docker", "inspect", target_container],
+                    capture_output=True,
+                    text=True,
+                )
+                if inspect_result.returncode == 0:
+                    try:
+                        inspect_payload = json.loads(inspect_result.stdout)
+                    except json.JSONDecodeError:
+                        inspect_payload = []
+                    inspect_item = inspect_payload[0] if inspect_payload else {}
+                    labels = ((inspect_item.get("Config") or {}).get("Labels") or {})
+                    owned = (
+                        labels.get("com.opsctl.managed") == "true"
+                        and labels.get("com.opsctl.org_id") == target_org
+                        and labels.get("com.opsctl.app") == target_app
+                        and ((not require_project) or labels.get("com.opsctl.project_id") == target_project)
+                    )
+                    if owned:
+                        continue
             seen.setdefault(name, set()).update(matches)
 
         conflicts = [
@@ -272,6 +298,11 @@
         import json, subprocess, sys
 
         ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
+        target_container = {{ container_name | to_json }}
+        target_org = {{ app_org_id | default('') | to_json }}
+        target_project = {{ app_project_id | default('') | to_json }}
+        target_app = {{ app_slug | default(container_name) | to_json }}
+        require_project = bool(target_project)
         if not ports:
             print("[]")
             sys.exit(0)
@@ -301,6 +332,27 @@
             name = data.get("Names") or data.get("ID")
             if not name:
                 continue
+            if name == target_container:
+                inspect_result = subprocess.run(
+                    ["docker", "inspect", target_container],
+                    capture_output=True,
+                    text=True,
+                )
+                if inspect_result.returncode == 0:
+                    try:
+                        inspect_payload = json.loads(inspect_result.stdout)
+                    except json.JSONDecodeError:
+                        inspect_payload = []
+                    inspect_item = inspect_payload[0] if inspect_payload else {}
+                    labels = ((inspect_item.get("Config") or {}).get("Labels") or {})
+                    owned = (
+                        labels.get("com.opsctl.managed") == "true"
+                        and labels.get("com.opsctl.org_id") == target_org
+                        and labels.get("com.opsctl.app") == target_app
+                        and ((not require_project) or labels.get("com.opsctl.project_id") == target_project)
+                    )
+                    if owned:
+                        continue
             seen.setdefault(name, set()).update(matches)
 
         conflicts = [
