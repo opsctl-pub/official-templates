@@ -1,0 +1,73 @@
+---
+- name: Remove OpsCtl-managed deployment container
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('app') }}"
+    router_name: "{{ app_router_name | default(container_name) }}"
+    expected_org_id: "{{ app_org_id | default('') }}"
+    expected_project_id: "{{ app_project_id | default('') }}"
+    expected_app_slug: "{{ app_slug | default(container_name) }}"
+  tasks:
+    - name: OPERATION_STEP remove:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"container_name":"%s","router_name":"%s"}}\n' "{{ container_name }}" "{{ router_name }}"
+      args:
+        executable: /bin/sh
+
+    - name: Inspect target container
+      shell: docker inspect "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      register: container_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: OPERATION_STEP remove:complete when missing
+      shell: |
+        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":"%s","removed":false,"reason":"not_found"}}\n' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      when: container_inspect.rc != 0
+
+    - name: Parse inspect payload
+      set_fact:
+        container_payload: "{{ (container_inspect.stdout | from_json)[0] }}"
+      when: container_inspect.rc == 0
+
+    - name: Evaluate ownership guard
+      set_fact:
+        label_guard_ok: "{{ ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.managed') == 'true' and ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.org_id') == expected_org_id and ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.app') == expected_app_slug and ((expected_project_id | length == 0) or (((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.project_id') == expected_project_id)) }}"
+      when: container_inspect.rc == 0
+
+    - name: OPERATION_STEP remove:fail label mismatch
+      shell: |
+        printf 'OPERATION_STEP={"name":"remove:fail","status":"failed","metadata":{"container_name":"%s","reason":"label_mismatch"}}\n' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      when:
+        - container_inspect.rc == 0
+        - not label_guard_ok
+
+    - name: Abort on ownership mismatch
+      fail:
+        msg: "Refusing to remove container without matching OpsCtl ownership labels"
+      when:
+        - container_inspect.rc == 0
+        - not label_guard_ok
+
+    - name: Remove owned container
+      command: docker rm -f "{{ container_name }}"
+      when:
+        - container_inspect.rc == 0
+        - label_guard_ok
+
+    - name: OPERATION_STEP remove:complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":"%s","removed":true}}\n' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      when:
+        - container_inspect.rc == 0
+        - label_guard_ok

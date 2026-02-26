@@ -569,6 +569,94 @@
       args:
         executable: /bin/sh
 
+    - name: Discover legacy OpsCtl-managed containers for deployment identity
+      shell: |
+        python3 - <<'PY'
+        import json, subprocess, sys
+
+        target_container = {{ container_name | to_json }}
+        target_org = {{ app_org_id | default('') | to_json }}
+        target_project = {{ app_project_id | default('') | to_json }}
+        target_app = {{ app_slug | default(container_name) | to_json }}
+        require_project = bool(target_project)
+
+        ps = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{ '{{json .}}' }}"],
+            capture_output=True,
+            text=True,
+        )
+        if ps.returncode != 0:
+            sys.stderr.write(ps.stderr)
+            sys.exit(ps.returncode)
+
+        names = []
+        for line in ps.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = row.get("Names")
+            if name:
+                names.append(name)
+
+        if not names:
+            print("[]")
+            sys.exit(0)
+
+        inspect = subprocess.run(["docker", "inspect"] + names, capture_output=True, text=True)
+        if inspect.returncode != 0:
+            sys.stderr.write(inspect.stderr)
+            sys.exit(inspect.returncode)
+
+        try:
+            payload = json.loads(inspect.stdout)
+        except json.JSONDecodeError:
+            print("[]")
+            sys.exit(0)
+
+        legacy = []
+        for item in payload:
+            labels = (item.get("Config") or {}).get("Labels") or {}
+            if labels.get("com.opsctl.managed") != "true":
+                continue
+            if labels.get("com.opsctl.org_id") != target_org:
+                continue
+            if labels.get("com.opsctl.app") != target_app:
+                continue
+            if require_project and labels.get("com.opsctl.project_id") != target_project:
+                continue
+            name = (item.get("Name") or "").lstrip("/")
+            if not name or name == target_container:
+                continue
+            legacy.append(name)
+
+        print(json.dumps(sorted(set(legacy))))
+        PY
+      args:
+        executable: /bin/bash
+      register: legacy_opsctl_containers_result
+      changed_when: false
+      failed_when: legacy_opsctl_containers_result.rc != 0
+
+    - name: Parse legacy OpsCtl containers list
+      set_fact:
+        legacy_opsctl_containers: "{{ legacy_opsctl_containers_result.stdout | default('[]') | from_json }}"
+
+    - name: Remove legacy OpsCtl-managed container "{{ item }}"
+      command: docker rm -f "{{ item }}"
+      loop: "{{ legacy_opsctl_containers | default([]) }}"
+      when: (legacy_opsctl_containers | default([]) | length) > 0
+
+    - name: OPERATION_STEP replace:legacy_cleanup complete
+      shell: |
+        printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when: (legacy_opsctl_containers | default([]) | length) > 0
+
     - name: Start container "{{ container_name }}"
       community.docker.docker_container:
         name: "{{ container_name }}"
