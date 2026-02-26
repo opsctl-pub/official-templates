@@ -44,6 +44,7 @@
       "com.opsctl.app": "{{ app_slug | default(container_name) }}"
     final_label_map: "{{ opsctl_label_map }}"
     deploy_host_ports: []
+    health_strategy: "running"
   tasks:
     - name: Ensure container health port derived when missing
       set_fact:
@@ -588,9 +589,24 @@
       args:
         executable: /bin/sh
 
+    - name: Probe Docker HEALTHCHECK capability for "{{ container_name }}"
+      shell: |
+        docker inspect --format '{% raw %}{{if .Config.Healthcheck}}yes{{else}}no{{end}}{% endraw %}' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      register: docker_health_support
+      changed_when: false
+      failed_when: false
+      when:
+        - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
+
+    - name: Determine health verification strategy
+      set_fact:
+        health_strategy: "{{ 'healthcheck' if ((docker_health_support.stdout | default('') | trim) == 'yes') else ('http' if (effective_health_mode == 'host' or health_mode in ['container', 'traefik']) else 'running') }}"
+
     - name: OPERATION_STEP health:check
       shell: |
-        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"mode":"%s","target":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}"
+        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
       args:
         executable: /bin/sh
 
@@ -606,16 +622,6 @@
       until: health_result_host.status == 200
       when: effective_health_mode == 'host'
 
-    - name: Probe Docker HEALTHCHECK capability for "{{ container_name }}"
-      shell: |
-        docker inspect --format '{% raw %}{{if .Config.Healthcheck}}yes{{else}}no{{end}}{% endraw %}' "{{ container_name }}"
-      args:
-        executable: /bin/sh
-      register: docker_health_support
-      changed_when: false
-      failed_when: false
-      when: effective_health_mode in ['container', 'traefik']
-
     - name: Wait for Docker HEALTHCHECK status on "{{ container_name }}"
       shell: |
         docker inspect --format '{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{end}}{% endraw %}' "{{ container_name }}"
@@ -626,8 +632,8 @@
       delay: 3
       until: docker_health_status.stdout.strip() == "healthy"
       when:
-        - effective_health_mode in ['container', 'traefik']
-        - docker_health_support.stdout.strip() == "yes"
+        - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
+        - (docker_health_support.stdout | default('') | trim) == "yes"
 
     - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
       shell: |
@@ -640,11 +646,12 @@
       until: container_health_exec.rc == 0
       when:
         - effective_health_mode in ['container', 'traefik']
-        - docker_health_support.stdout.strip() != "yes"
+        - health_mode != 'auto'
+        - (docker_health_support.stdout | default('') | trim) != "yes"
 
     - name: OPERATION_STEP health:check complete
       shell: |
-        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"mode":"%s","target":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}"
+        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
       args:
         executable: /bin/sh
 

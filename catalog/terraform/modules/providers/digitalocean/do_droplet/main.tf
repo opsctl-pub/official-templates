@@ -16,7 +16,7 @@ provider "digitalocean" {
 
 # Look up existing SSH key by name (only for provisioning)
 data "digitalocean_ssh_key" "existing" {
-  count = !var.destroy && var.ssh_key_name != "" ? 1 : 0
+  count = !var.destroy && var.ssh_key_id == "" && var.ssh_key_name != "" ? 1 : 0
   name  = var.ssh_key_name
 }
 
@@ -36,13 +36,22 @@ resource "digitalocean_droplet" "server" {
   vpc_uuid          = var.vpc_uuid != "" ? var.vpc_uuid : null
 
   # Add SSH keys if provided
-  ssh_keys = var.ssh_key_name != "" ? [data.digitalocean_ssh_key.existing[0].id] : []
+  ssh_keys = var.ssh_key_id != "" ? [var.ssh_key_id] : (
+    var.ssh_key_name != "" ? [data.digitalocean_ssh_key.existing[0].id] : []
+  )
 
   # User data for cloud-init (optional)
   user_data = var.user_data != "" ? var.user_data : null
 
   # Tags
   tags = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = var.name != "" && var.region != "" && var.size != "" && var.image != ""
+      error_message = "name, region, size, and image are required when destroy=false"
+    }
+  }
 }
 
 # For destroy operations, import the existing droplet
@@ -55,6 +64,13 @@ resource "digitalocean_droplet" "this" {
   region   = "nyc3"
   size     = "s-1vcpu-1gb"
   image    = "ubuntu-24-04-x64"
+
+  lifecycle {
+    precondition {
+      condition     = var.droplet_id != ""
+      error_message = "droplet_id is required when destroy=true"
+    }
+  }
 }
 
 # Create a project and assign the droplet (optional, only for provisioning)

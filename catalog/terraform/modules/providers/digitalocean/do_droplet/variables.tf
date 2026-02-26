@@ -10,11 +10,6 @@ variable "droplet_id" {
   description = "ID of existing droplet to destroy (required when destroy=true)"
   type        = string
   default     = ""
-
-  validation {
-    condition = var.destroy ? var.droplet_id != "" : true
-    error_message = "droplet_id is required when destroy=true"
-  }
 }
 
 # Variables required only for provisioning (when destroy=false)
@@ -22,44 +17,24 @@ variable "name" {
   description = "Name of the droplet (required when destroy=false)"
   type        = string
   default     = ""
-
-  validation {
-    condition = var.destroy || var.name != ""
-    error_message = "name is required when destroy=false"
-  }
 }
 
 variable "region" {
   description = "DigitalOcean region (required when destroy=false)"
   type        = string
   default     = ""
-
-  validation {
-    condition = var.destroy || var.region != ""
-    error_message = "region is required when destroy=false"
-  }
 }
 
 variable "size" {
   description = "Droplet size (required when destroy=false)"
   type        = string
   default     = ""
-
-  validation {
-    condition = var.destroy || var.size != ""
-    error_message = "size is required when destroy=false"
-  }
 }
 
 variable "image" {
   description = "Operating system image (required when destroy=false)"
   type        = string
   default     = ""
-
-  validation {
-    condition = var.destroy || var.image != ""
-    error_message = "image is required when destroy=false"
-  }
 }
 
 variable "ssh_key_name" {
