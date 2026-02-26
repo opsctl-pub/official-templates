@@ -12,7 +12,7 @@
   tasks:
     - name: OPERATION_STEP remove:start
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"container_name":"%s","router_name":"%s"}}\n' "{{ container_name }}" "{{ router_name }}"
+        printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"container_name":{{ container_name | to_json }},"router_name":{{ router_name | to_json }}}}\n'
       args:
         executable: /bin/sh
 
@@ -26,7 +26,7 @@
 
     - name: OPERATION_STEP remove:complete when missing
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":"%s","removed":false,"reason":"not_found"}}\n' "{{ container_name }}"
+        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":{{ container_name | to_json }},"removed":false,"reason":"not_found"}}\n'
       args:
         executable: /bin/sh
       when: container_inspect.rc != 0
@@ -43,7 +43,7 @@
 
     - name: OPERATION_STEP remove:fail label mismatch
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:fail","status":"failed","metadata":{"container_name":"%s","reason":"label_mismatch"}}\n' "{{ container_name }}"
+        printf 'OPERATION_STEP={"name":"remove:fail","status":"failed","metadata":{"container_name":{{ container_name | to_json }},"reason":"label_mismatch"}}\n'
       args:
         executable: /bin/sh
       when:
@@ -65,7 +65,7 @@
 
     - name: OPERATION_STEP remove:complete
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":"%s","removed":true}}\n' "{{ container_name }}"
+        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"container_name":{{ container_name | to_json }},"removed":true,"router_name":{{ router_name | to_json }}}}\n'
       args:
         executable: /bin/sh
       when:
