@@ -158,14 +158,13 @@
                 "docker",
                 "ps",
                 "-a",
+                "-q",
                 "--filter",
                 "label=com.opsctl.managed=true",
                 "--filter",
                 f"label=com.opsctl.org_id={target_org}",
                 "--filter",
                 f"label=com.opsctl.app={target_app}",
-                "--format",
-                "{{json .}}",
             ]
             if require_project:
                 ps_command.extend([
@@ -180,15 +179,7 @@
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(item, dict):
-                        continue
-                    name = item.get("Names") or item.get("ID")
-                    if isinstance(name, str) and name:
-                        candidate_names.append(name)
+                    candidate_names.append(line)
 
             ordered_candidates = list(dict.fromkeys(candidate_names))
             if len(ordered_candidates) == 1:
