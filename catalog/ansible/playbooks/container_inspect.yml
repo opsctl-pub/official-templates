@@ -1,0 +1,236 @@
+---
+- name: Inspect OpsCtl-managed deployment container
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('app') }}"
+    expected_org_id: "{{ app_org_id | default('') }}"
+    expected_project_id: "{{ app_project_id | default('') }}"
+    expected_app_slug: "{{ app_slug | default(container_name) }}"
+  tasks:
+    - name: OPERATION_STEP inspect:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"inspect:start","status":"running","metadata":{"container_name":{{ container_name | to_json }}}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Collect deployment inspection metadata
+      shell: |
+        python3 - <<'PY'
+        import json
+        import subprocess
+        import time
+
+        target_container = {{ container_name | to_json }}
+        target_org = {{ expected_org_id | to_json }}
+        target_project = {{ expected_project_id | to_json }}
+        target_app = {{ expected_app_slug | to_json }}
+        require_project = bool(target_project)
+
+        inspect_started = time.monotonic()
+
+        def run_cmd(args):
+            return subprocess.run(args, capture_output=True, text=True)
+
+        def parse_inspect_payload(stdout):
+            try:
+                payload = json.loads(stdout or "[]")
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, list) or not payload:
+                return None
+            if not isinstance(payload[0], dict):
+                return None
+            return payload[0]
+
+        def labels_for(container_payload):
+            return ((container_payload.get("Config") or {}).get("Labels") or {})
+
+        def is_owned(labels):
+            if labels.get("com.opsctl.managed") != "true":
+                return False
+            if labels.get("com.opsctl.org_id") != target_org:
+                return False
+            if labels.get("com.opsctl.app") != target_app:
+                return False
+            if require_project and labels.get("com.opsctl.project_id") != target_project:
+                return False
+            return True
+
+        def image_digest_for(container_payload):
+            digest = None
+            repo_digests = container_payload.get("RepoDigests") or []
+            if isinstance(repo_digests, list):
+                for entry in repo_digests:
+                    if not isinstance(entry, str):
+                        continue
+                    if "@sha256:" not in entry:
+                        continue
+                    digest = entry.split("@", 1)[1].strip()
+                    break
+            if not digest:
+                image_id = container_payload.get("Image")
+                if isinstance(image_id, str) and image_id.startswith("sha256:"):
+                    digest = image_id
+            if isinstance(digest, str) and digest.startswith("sha256:"):
+                return digest
+            return None
+
+        def ports_for(container_payload):
+            ports = []
+            raw_ports = ((container_payload.get("NetworkSettings") or {}).get("Ports") or {})
+            if not isinstance(raw_ports, dict):
+                return ports
+
+            for container_binding, host_bindings in raw_ports.items():
+                if not isinstance(container_binding, str):
+                    continue
+                container_token = container_binding.split("/", 1)[0]
+                try:
+                    container_port = int(container_token)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(host_bindings, list):
+                    continue
+                for binding in host_bindings:
+                    if not isinstance(binding, dict):
+                        continue
+                    host_value = binding.get("HostPort")
+                    try:
+                        host_port = int(str(host_value))
+                    except (TypeError, ValueError):
+                        continue
+                    if not (1 <= host_port <= 65535 and 1 <= container_port <= 65535):
+                        continue
+                    ports.append({"host": host_port, "container": container_port})
+
+            unique = {}
+            for entry in ports:
+                unique[(entry["host"], entry["container"])] = entry
+            return [unique[key] for key in sorted(unique.keys())]
+
+        def health_status_for(container_payload):
+            state = container_payload.get("State") or {}
+            health = state.get("Health") or {}
+            status = health.get("Status")
+            if status == "healthy":
+                return "healthy"
+            if status == "unhealthy":
+                return "unhealthy"
+            return "none"
+
+        def running_for(container_payload):
+            state = container_payload.get("State") or {}
+            return bool(state.get("Running"))
+
+        def observed_from_payload(container_payload):
+            image_ref = ((container_payload.get("Config") or {}).get("Image"))
+            if not isinstance(image_ref, str) or not image_ref.strip():
+                image_ref = None
+            container_id = container_payload.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                container_id = None
+
+            return {
+                "container_id": container_id,
+                "image_ref": image_ref,
+                "image_digest": image_digest_for(container_payload),
+                "ports": ports_for(container_payload),
+                "health_status": health_status_for(container_payload),
+                "running": running_for(container_payload),
+            }
+
+        identity_match = "missing"
+        selected_payload = None
+
+        stable_inspect = run_cmd(["docker", "inspect", target_container])
+        if stable_inspect.returncode == 0:
+            stable_payload = parse_inspect_payload(stable_inspect.stdout)
+            if stable_payload is not None:
+                selected_payload = stable_payload
+                if is_owned(labels_for(stable_payload)):
+                    identity_match = "stable_name"
+                else:
+                    identity_match = "label_mismatch"
+        else:
+            ps_command = [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "label=com.opsctl.managed=true",
+                "--filter",
+                f"label=com.opsctl.org_id={target_org}",
+                "--filter",
+                f"label=com.opsctl.app={target_app}",
+                "--format",
+                "{{json .}}",
+            ]
+            if require_project:
+                ps_command.extend([
+                    "--filter",
+                    f"label=com.opsctl.project_id={target_project}",
+                ])
+
+            filtered_ps = run_cmd(ps_command)
+            candidate_names = []
+            if filtered_ps.returncode == 0:
+                for line in (filtered_ps.stdout or "").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("Names") or item.get("ID")
+                    if isinstance(name, str) and name:
+                        candidate_names.append(name)
+
+            ordered_candidates = list(dict.fromkeys(candidate_names))
+            if len(ordered_candidates) == 1:
+                fallback_inspect = run_cmd(["docker", "inspect", ordered_candidates[0]])
+                if fallback_inspect.returncode == 0:
+                    fallback_payload = parse_inspect_payload(fallback_inspect.stdout)
+                    if fallback_payload is not None:
+                        selected_payload = fallback_payload
+                        identity_match = "labels_only"
+            elif len(ordered_candidates) > 1:
+                identity_match = "multiple_candidates"
+
+        duration_ms = max(0, int((time.monotonic() - inspect_started) * 1000))
+        result = {
+            "container_id": None,
+            "image_ref": None,
+            "image_digest": None,
+            "ports": [],
+            "health_status": "none",
+            "running": False,
+            "identity_match": identity_match,
+            "inspect_duration_ms": duration_ms,
+        }
+        if selected_payload is not None:
+            result.update(observed_from_payload(selected_payload))
+            result["identity_match"] = identity_match
+            result["inspect_duration_ms"] = duration_ms
+
+        print(json.dumps(result))
+        PY
+      args:
+        executable: /bin/bash
+      register: inspect_result_raw
+      changed_when: false
+      failed_when: inspect_result_raw.rc != 0
+
+    - name: Parse inspect metadata payload
+      set_fact:
+        inspect_result: "{{ inspect_result_raw.stdout | from_json }}"
+
+    - name: OPERATION_STEP inspect:result
+      shell: |
+        printf 'OPERATION_STEP={"name":"inspect:result","status":"completed","metadata":%s}\n' '{{ inspect_result | to_json }}'
+      args:
+        executable: /bin/sh
