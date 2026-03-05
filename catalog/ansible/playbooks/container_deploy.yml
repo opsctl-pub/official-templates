@@ -723,9 +723,9 @@
         env: "{{ app_env | default({}) }}"
         labels: "{{ final_label_map }}"
 
-    - name: OPERATION_STEP container:running
+    - name: OPERATION_STEP container:prepare complete
       shell: |
-        printf 'OPERATION_STEP={"name":"container:running","status":"completed","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"completed","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
       args:
         executable: /bin/sh
 
