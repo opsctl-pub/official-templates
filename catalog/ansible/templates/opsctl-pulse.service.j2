@@ -1,0 +1,17 @@
+[Unit]
+Description=OpsCtl Pulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/opsctl/pulse.conf
+ExecStart=/usr/local/bin/opsctl-pulse
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

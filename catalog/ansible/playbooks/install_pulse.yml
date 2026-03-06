@@ -1,0 +1,118 @@
+---
+- name: Install OpsCtl Pulse
+  hosts: all
+  gather_facts: false
+  become: true
+
+  pre_tasks:
+    - name: Skip pulse install when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
+    - name: Wait for SSH availability
+      wait_for_connection:
+        timeout: "{{ ssh_wait_timeout | default(60) }}"
+        sleep: 5
+        connect_timeout: 5
+
+  tasks:
+    - name: OPERATION_STEP pulse:download start
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:download","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Ensure OpsCtl config directory exists
+      file:
+        path: /etc/opsctl
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download opsctl-pulse binary
+      get_url:
+        url: "{{ pulse_download_url }}"
+        dest: /usr/local/bin/opsctl-pulse
+        owner: root
+        group: root
+        mode: "0755"
+        checksum: "sha256:{{ pulse_download_sha256 }}"
+
+    - name: OPERATION_STEP pulse:download completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:download","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP pulse:configure start
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:configure","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Render pulse environment file
+      template:
+        src: "{{ playbook_dir }}/../templates/pulse.conf.j2"
+        dest: /etc/opsctl/pulse.conf
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Render opsctl-pulse systemd service
+      template:
+        src: "{{ playbook_dir }}/../templates/opsctl-pulse.service.j2"
+        dest: /etc/systemd/system/opsctl-pulse.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: OPERATION_STEP pulse:configure completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:configure","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP pulse:enable start
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:enable","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Reload systemd and enable opsctl-pulse
+      systemd_service:
+        name: opsctl-pulse.service
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: OPERATION_STEP pulse:enable completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:enable","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP pulse:verify start
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:verify","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Verify opsctl-pulse service is active
+      command: systemctl is-active opsctl-pulse.service
+      register: pulse_service_status
+      changed_when: false
+      failed_when: pulse_service_status.rc != 0 or pulse_service_status.stdout.strip() != "active"
+
+    - name: OPERATION_STEP pulse:verify completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:verify","status":"completed"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: OPERATION_STEP pulse:complete completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"pulse:complete","status":"completed"}\n'
+      args:
+        executable: /bin/sh
