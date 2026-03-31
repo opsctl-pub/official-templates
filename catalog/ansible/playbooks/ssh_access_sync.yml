@@ -15,244 +15,250 @@
       when: simulate | default(false)
 
   tasks:
-    - name: OPERATION_STEP ssh-access:start
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:start","status":"running"}\n'
-      args:
-        executable: /bin/sh
+    - name: Converge SSH access state
+      block:
+        - name: OPERATION_STEP ssh-access:start
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:start","status":"running"}\n'
+          args:
+            executable: /bin/sh
 
-    - name: Detect SSH service unit name
-      shell: |
-        if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
-          printf 'ssh'
-        elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
-          printf 'sshd'
-        else
-          printf 'ssh'
-        fi
-      args:
-        executable: /bin/sh
-      register: ssh_service_name_result
-      changed_when: false
+        - name: Detect SSH service unit name
+          shell: |
+            if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+              printf 'ssh'
+            elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+              printf 'sshd'
+            else
+              printf 'ssh'
+            fi
+          args:
+            executable: /bin/sh
+          register: ssh_service_name_result
+          changed_when: false
 
-    - name: OPERATION_STEP ssh-access:sshd-config
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"running"}\n'
-      args:
-        executable: /bin/sh
+        - name: OPERATION_STEP ssh-access:sshd-config
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"running"}\n'
+          args:
+            executable: /bin/sh
 
-    - name: Ensure sshd AuthorizedKeysFile includes OpsCtl managed file
-      lineinfile:
-        path: "{{ sshd_config_path }}"
-        regexp: '^#?AuthorizedKeysFile\s+'
-        line: 'AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys_opsctl'
-        state: present
-      register: opsctl_sshd_authorized_keys_line
+        - name: Ensure sshd AuthorizedKeysFile includes OpsCtl managed file
+          lineinfile:
+            path: "{{ sshd_config_path }}"
+            regexp: '^#?AuthorizedKeysFile\s+'
+            line: 'AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys_opsctl'
+            state: present
+          register: opsctl_sshd_authorized_keys_line
 
-    - name: Validate sshd configuration after AuthorizedKeysFile update
-      shell: |
-        if command -v sshd >/dev/null 2>&1; then
-          sshd -t
-        else
-          /usr/sbin/sshd -t
-        fi
-      args:
-        executable: /bin/sh
-      changed_when: false
-      when: opsctl_sshd_authorized_keys_line.changed
+        - name: Validate sshd configuration after AuthorizedKeysFile update
+          shell: |
+            if command -v sshd >/dev/null 2>&1; then
+              sshd -t
+            else
+              /usr/sbin/sshd -t
+            fi
+          args:
+            executable: /bin/sh
+          changed_when: false
+          when: opsctl_sshd_authorized_keys_line.changed
 
-    - name: Reload sshd after AuthorizedKeysFile change
-      service:
-        name: "{{ ssh_service_name_result.stdout | trim }}"
-        state: reloaded
-      when: opsctl_sshd_authorized_keys_line.changed
+        - name: Reload sshd after AuthorizedKeysFile change
+          service:
+            name: "{{ ssh_service_name_result.stdout | trim }}"
+            state: reloaded
+          when: opsctl_sshd_authorized_keys_line.changed
 
-    - name: OPERATION_STEP ssh-access:sshd-config complete
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"completed"}\n'
-      args:
-        executable: /bin/sh
+        - name: OPERATION_STEP ssh-access:sshd-config complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"completed"}\n'
+          args:
+            executable: /bin/sh
 
-    - name: Initialize managed SSH state map
-      set_fact:
-        opsctl_ssh_user_map: {}
+        - name: Initialize managed SSH state map
+          set_fact:
+            opsctl_ssh_user_map: {}
 
-    - name: Build desired SSH access state by username
-      set_fact:
-        opsctl_ssh_user_map: >-
-          {{
-            opsctl_ssh_user_map | combine(
-              {
-                item.username: {
-                  'username': item.username,
-                  'state': item.state,
-                  'public_keys': (
-                    (opsctl_ssh_user_map.get(item.username, {}).get('public_keys', []))
-                    + ([item.public_key] if (item.state == 'present' and (item.public_key | default('') | string | length) > 0) else [])
-                  )
-                }
-              },
-              recursive=True
-            )
-          }}
-      loop: "{{ ssh_users | default([]) }}"
-      loop_control:
-        label: "{{ item.username }}:{{ item.state }}"
-
-    - name: Split present and absent SSH usernames
-      set_fact:
-        opsctl_ssh_present_users: "{{ opsctl_ssh_user_map | dict2items | selectattr('value.state', 'equalto', 'present') | list }}"
-        opsctl_ssh_absent_users: "{{ opsctl_ssh_user_map | dict2items | rejectattr('value.state', 'equalto', 'present') | list }}"
-
-    - name: OPERATION_STEP ssh-access:users
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:users","status":"running","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
-        '{{ opsctl_ssh_present_users | length | to_json }}' \
-        '{{ opsctl_ssh_absent_users | length | to_json }}'
-      args:
-        executable: /bin/sh
-
-    - name: Ensure Linux users exist for managed SSH access
-      user:
-        name: "{{ item.key }}"
-        state: present
-        create_home: true
-      loop: "{{ opsctl_ssh_present_users }}"
-      loop_control:
-        label: "{{ item.key }}"
-
-    - name: Resolve home directories for managed SSH usernames
-      command: "getent passwd {{ item.key }}"
-      register: opsctl_ssh_passwd_lookup
-      changed_when: false
-      failed_when: false
-      loop: "{{ opsctl_ssh_present_users + opsctl_ssh_absent_users }}"
-      loop_control:
-        label: "{{ item.key }}"
-
-    - name: Initialize managed SSH user info map
-      set_fact:
-        opsctl_ssh_user_info_map: {}
-
-    - name: Record resolved managed SSH user info
-      set_fact:
-        opsctl_ssh_user_info_map: >-
-          {{
-            opsctl_ssh_user_info_map | combine(
-              {
-                item.item.key: {
-                  'home': item.stdout.split(':')[5],
-                  'gid': item.stdout.split(':')[3]
-                }
-              },
-              recursive=True
-            )
-          }}
-      loop: "{{ opsctl_ssh_passwd_lookup.results | default([]) }}"
-      when:
-        - item.rc == 0
-        - (item.stdout.split(':') | length) > 5
-      loop_control:
-        label: "{{ item.item.key }}"
-
-    - name: Resolve primary groups for managed SSH usernames
-      command: "getent group {{ item.value.gid }}"
-      register: opsctl_ssh_group_lookup
-      changed_when: false
-      failed_when: false
-      loop: "{{ opsctl_ssh_user_info_map | dict2items }}"
-      when: item.value.gid is defined
-      loop_control:
-        label: "{{ item.key }}"
-
-    - name: Record resolved primary groups
-      set_fact:
-        opsctl_ssh_user_info_map: >-
-          {{
-            opsctl_ssh_user_info_map | combine(
-              {
-                item.item.key: (
-                  opsctl_ssh_user_info_map[item.item.key] | combine(
-                    {'group': item.stdout.split(':')[0]}
-                  )
+        - name: Build desired SSH access state by username
+          set_fact:
+            opsctl_ssh_user_map: >-
+              {{
+                opsctl_ssh_user_map | combine(
+                  {
+                    item.username: {
+                      'username': item.username,
+                      'state': item.state,
+                      'public_keys': (
+                        (opsctl_ssh_user_map.get(item.username, {}).get('public_keys', []))
+                        + ([item.public_key] if (item.state == 'present' and (item.public_key | default('') | string | length) > 0) else [])
+                      )
+                    }
+                  },
+                  recursive=True
                 )
-              },
-              recursive=True
-            )
-          }}
-      loop: "{{ opsctl_ssh_group_lookup.results | default([]) }}"
-      when:
-        - item.rc == 0
-        - (item.stdout.split(':') | length) > 0
-      loop_control:
-        label: "{{ item.item.key }}"
+              }}
+          loop: "{{ ssh_users | default([]) }}"
+          loop_control:
+            label: "{{ item.username }}:{{ item.state }}"
 
-    - name: Ensure ~/.ssh exists for managed users
-      file:
-        path: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh"
-        state: directory
-        owner: "{{ item.key }}"
-        group: "{{ opsctl_ssh_user_info_map[item.key].group }}"
-        mode: "0700"
-      loop: "{{ opsctl_ssh_present_users }}"
-      when:
-        - opsctl_ssh_user_info_map[item.key] is defined
-        - opsctl_ssh_user_info_map[item.key].home is defined
-        - opsctl_ssh_user_info_map[item.key].group is defined
-      loop_control:
-        label: "{{ item.key }}"
+        - name: Split present and absent SSH usernames
+          set_fact:
+            opsctl_ssh_present_users: "{{ opsctl_ssh_user_map | dict2items | selectattr('value.state', 'equalto', 'present') | list }}"
+            opsctl_ssh_absent_users: "{{ opsctl_ssh_user_map | dict2items | rejectattr('value.state', 'equalto', 'present') | list }}"
 
-    - name: Write complete managed authorized_keys_opsctl files
-      copy:
-        dest: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh/{{ opsctl_authorized_keys_file }}"
-        owner: "{{ item.key }}"
-        group: "{{ opsctl_ssh_user_info_map[item.key].group }}"
-        mode: "0600"
-        content: |
-          {{ opsctl_managed_key_header }}
-          {% for public_key in item.value.public_keys %}
-          {{ public_key }}
-          {% endfor %}
-      loop: "{{ opsctl_ssh_present_users }}"
-      when:
-        - opsctl_ssh_user_info_map[item.key] is defined
-        - opsctl_ssh_user_info_map[item.key].home is defined
-        - opsctl_ssh_user_info_map[item.key].group is defined
-      loop_control:
-        label: "{{ item.key }}"
+        - name: OPERATION_STEP ssh-access:users
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"running","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
+            '{{ opsctl_ssh_present_users | length | to_json }}' \
+            '{{ opsctl_ssh_absent_users | length | to_json }}'
+          args:
+            executable: /bin/sh
 
-    - name: Delete managed authorized_keys_opsctl when no active keys remain
-      file:
-        path: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh/{{ opsctl_authorized_keys_file }}"
-        state: absent
-      loop: "{{ opsctl_ssh_absent_users }}"
-      when:
-        - opsctl_ssh_user_info_map[item.key] is defined
-        - opsctl_ssh_user_info_map[item.key].home is defined
-      loop_control:
-        label: "{{ item.key }}"
+        - name: Ensure Linux users exist for managed SSH access
+          user:
+            name: "{{ item.key }}"
+            state: present
+            create_home: true
+          loop: "{{ opsctl_ssh_present_users }}"
+          loop_control:
+            label: "{{ item.key }}"
 
-    - name: OPERATION_STEP ssh-access:users complete
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:users","status":"completed","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
-        '{{ opsctl_ssh_present_users | length | to_json }}' \
-        '{{ opsctl_ssh_absent_users | length | to_json }}'
-      args:
-        executable: /bin/sh
+        - name: Resolve home directories for managed SSH usernames
+          command: "getent passwd {{ item.key }}"
+          register: opsctl_ssh_passwd_lookup
+          changed_when: false
+          failed_when: false
+          loop: "{{ opsctl_ssh_present_users + opsctl_ssh_absent_users }}"
+          loop_control:
+            label: "{{ item.key }}"
 
-    - name: OPERATION_STEP ssh-access:complete
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:complete","status":"completed"}\n'
-      args:
-        executable: /bin/sh
+        - name: Initialize managed SSH user info map
+          set_fact:
+            opsctl_ssh_user_info_map: {}
 
-  rescue:
-    - name: OPERATION_STEP ssh-access:failure
-      shell: |
-        printf 'OPERATION_STEP={"name":"ssh-access:failure","status":"failed"}\n'
-      args:
-        executable: /bin/sh
+        - name: Record resolved managed SSH user info
+          set_fact:
+            opsctl_ssh_user_info_map: >-
+              {{
+                opsctl_ssh_user_info_map | combine(
+                  {
+                    item.item.key: {
+                      'home': item.stdout.split(':')[5],
+                      'gid': item.stdout.split(':')[3]
+                    }
+                  },
+                  recursive=True
+                )
+              }}
+          loop: "{{ opsctl_ssh_passwd_lookup.results | default([]) }}"
+          when:
+            - item.rc == 0
+            - (item.stdout.split(':') | length) > 5
+          loop_control:
+            label: "{{ item.item.key }}"
 
-    - name: Fail SSH access sync
-      fail:
-        msg: "SSH access sync failed"
+        - name: Resolve primary groups for managed SSH usernames
+          command: "getent group {{ item.value.gid }}"
+          register: opsctl_ssh_group_lookup
+          changed_when: false
+          failed_when: false
+          loop: "{{ opsctl_ssh_user_info_map | dict2items }}"
+          when: item.value.gid is defined
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: Record resolved primary groups
+          set_fact:
+            opsctl_ssh_user_info_map: >-
+              {{
+                opsctl_ssh_user_info_map | combine(
+                  {
+                    item.item.key: (
+                      opsctl_ssh_user_info_map[item.item.key] | combine(
+                        {'group': item.stdout.split(':')[0]}
+                      )
+                    )
+                  },
+                  recursive=True
+                )
+              }}
+          loop: "{{ opsctl_ssh_group_lookup.results | default([]) }}"
+          when:
+            - item.rc == 0
+            - (item.stdout.split(':') | length) > 0
+          loop_control:
+            label: "{{ item.item.key }}"
+
+        - name: Ensure ~/.ssh exists for managed users
+          file:
+            path: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh"
+            state: directory
+            owner: "{{ item.key }}"
+            group: "{{ opsctl_ssh_user_info_map[item.key].group }}"
+            mode: "0700"
+          loop: "{{ opsctl_ssh_present_users }}"
+          when:
+            - opsctl_ssh_user_info_map[item.key] is defined
+            - opsctl_ssh_user_info_map[item.key].home is defined
+            - opsctl_ssh_user_info_map[item.key].group is defined
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: Write complete managed authorized_keys_opsctl files
+          copy:
+            dest: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh/{{ opsctl_authorized_keys_file }}"
+            owner: "{{ item.key }}"
+            group: "{{ opsctl_ssh_user_info_map[item.key].group }}"
+            mode: "0600"
+            content: |
+              {{ opsctl_managed_key_header }}
+              {% for public_key in item.value.public_keys %}
+              {{ public_key }}
+              {% endfor %}
+          loop: "{{ opsctl_ssh_present_users }}"
+          when:
+            - opsctl_ssh_user_info_map[item.key] is defined
+            - opsctl_ssh_user_info_map[item.key].home is defined
+            - opsctl_ssh_user_info_map[item.key].group is defined
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: Delete managed authorized_keys_opsctl when no active keys remain
+          file:
+            path: "{{ opsctl_ssh_user_info_map[item.key].home }}/.ssh/{{ opsctl_authorized_keys_file }}"
+            state: absent
+          loop: "{{ opsctl_ssh_absent_users }}"
+          when:
+            - opsctl_ssh_user_info_map[item.key] is defined
+            - opsctl_ssh_user_info_map[item.key].home is defined
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: OPERATION_STEP ssh-access:users complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"completed","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
+            '{{ opsctl_ssh_present_users | length | to_json }}' \
+            '{{ opsctl_ssh_absent_users | length | to_json }}'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP ssh-access:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:complete","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+      rescue:
+        - name: OPERATION_STEP ssh-access:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"ssh-access:failure","status":"failed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Fail SSH access sync
+          fail:
+            msg: >-
+              SSH access sync failed: {{ ansible_failed_result.msg
+              | default(ansible_failed_result.stderr)
+              | default(ansible_failed_result.stdout)
+              | default('unknown error') }}
