@@ -1,0 +1,219 @@
+---
+- name: Ensure per-deployment WireGuard overlay
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    wireguard_base_dir: "/etc/wireguard"
+    wireguard_state: "{{ wireguard_state | default('present') }}"
+    wireguard_listen_port: "{{ wireguard_listen_port | default(51820) }}"
+    short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
+    wireguard_interface_name: "wg-{{ short_deployment_id }}"
+    wireguard_private_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.key"
+    wireguard_public_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.pub"
+    wireguard_config_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.conf"
+    wireguard_service_name: "wg-quick@{{ wireguard_interface_name }}"
+    wireguard_peers: "{{ wireguard_peers | default([]) }}"
+  pre_tasks:
+    - name: Skip WireGuard ensure when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
+  tasks:
+    - name: OPERATION_STEP wireguard:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"wireguard:start","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Converge WireGuard overlay state
+      block:
+        - name: Ensure WireGuard packages present
+          apt:
+            name:
+              - wireguard
+            state: present
+            update_cache: true
+
+        - name: Ensure WireGuard base directory exists
+          file:
+            path: "{{ wireguard_base_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Remove WireGuard overlay when absent requested
+          block:
+            - name: Stop WireGuard service
+              systemd:
+                name: "{{ wireguard_service_name }}"
+                state: stopped
+                enabled: false
+              failed_when: false
+
+            - name: Delete WireGuard interface
+              command: "ip link delete dev {{ wireguard_interface_name }}"
+              failed_when: false
+              changed_when: false
+
+            - name: Remove WireGuard files
+              file:
+                path: "{{ item }}"
+                state: absent
+              loop:
+                - "{{ wireguard_config_path }}"
+                - "{{ wireguard_private_key_path }}"
+                - "{{ wireguard_public_key_path }}"
+
+            - name: OPERATION_STEP wireguard:complete absent
+              shell: |
+                printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed"}\n'
+              args:
+                executable: /bin/sh
+
+            - name: End play after WireGuard cleanup
+              meta: end_play
+          when: wireguard_state == "absent"
+
+        - name: Validate required WireGuard variables
+          assert:
+            that:
+              - deployment_id is defined
+              - overlay_cidr is defined
+              - wireguard_ip is defined
+              - (overlay_cidr | string | length) > 0
+              - (wireguard_ip | string | length) > 0
+            fail_msg: "deployment_id, overlay_cidr, and wireguard_ip are required for WireGuard overlay setup"
+
+        - name: Derive WireGuard interface address
+          set_fact:
+            wireguard_interface_address: "{{ wireguard_ip if ('/' in (wireguard_ip | string)) else (wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
+
+        - name: Check for existing private key
+          stat:
+            path: "{{ wireguard_private_key_path }}"
+          register: wireguard_private_key_stat
+
+        - name: Generate WireGuard private/public keypair on node
+          shell: |
+            umask 077
+            wg genkey | tee "{{ wireguard_private_key_path }}" | wg pubkey > "{{ wireguard_public_key_path }}"
+          args:
+            executable: /bin/sh
+          when: not wireguard_private_key_stat.stat.exists
+
+        - name: Read WireGuard private key
+          command: "cat {{ wireguard_private_key_path }}"
+          register: wireguard_private_key_result
+          changed_when: false
+          no_log: true
+
+        - name: Read WireGuard public key
+          command: "cat {{ wireguard_public_key_path }}"
+          register: wireguard_public_key_result
+          changed_when: false
+
+        - name: Write WireGuard interface config
+          copy:
+            dest: "{{ wireguard_config_path }}"
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              [Interface]
+              Address = {{ wireguard_interface_address }}
+              ListenPort = {{ wireguard_listen_port }}
+              PrivateKey = {{ wireguard_private_key_result.stdout | trim }}
+              PostUp = iptables -C INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT || iptables -I INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT
+              PostDown = iptables -D INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT || true
+              {% for peer in wireguard_peers %}
+
+              [Peer]
+              PublicKey = {{ peer.public_key }}
+              AllowedIPs = {{ peer.allowed_ips }}
+              {% if peer.endpoint is defined and peer.endpoint %}
+              Endpoint = {{ peer.endpoint }}
+              {% endif %}
+              {% if peer.persistent_keepalive is defined and peer.persistent_keepalive %}
+              PersistentKeepalive = {{ peer.persistent_keepalive }}
+              {% endif %}
+              {% endfor %}
+          no_log: true
+
+        - name: Ensure WireGuard service enabled and restarted
+          systemd:
+            name: "{{ wireguard_service_name }}"
+            enabled: true
+            state: restarted
+
+        - name: Verify WireGuard service is active
+          systemd:
+            name: "{{ wireguard_service_name }}"
+          register: wireguard_service_status
+
+        - name: Verify WireGuard interface responds
+          command: "wg show {{ wireguard_interface_name }}"
+          register: wireguard_show_result
+          changed_when: false
+
+        - name: Assert WireGuard overlay is ready
+          assert:
+            that:
+              - wireguard_service_status.status.ActiveState == "active"
+              - wireguard_show_result.rc == 0
+            fail_msg: "WireGuard overlay did not converge to a ready state"
+
+        - name: Emit WireGuard structured outputs
+          shell: |
+            printf 'TEMPLATE_OUTPUT_JSON=%s\n' "{{ wireguard_output_payload | to_json | replace('\"', '\\\"') }}"
+          args:
+            executable: /bin/sh
+          vars:
+            wireguard_output_payload:
+              wireguard_public_key: "{{ wireguard_public_key_result.stdout | trim }}"
+              wireguard_ip: "{{ wireguard_ip }}"
+
+        - name: OPERATION_STEP wireguard:ready
+          shell: |
+            printf 'OPERATION_STEP={"name":"wireguard:ready","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP wireguard:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Stop WireGuard service after failure
+          systemd:
+            name: "{{ wireguard_service_name }}"
+            state: stopped
+            enabled: false
+          failed_when: false
+
+        - name: Delete WireGuard interface after failure
+          command: "ip link delete dev {{ wireguard_interface_name }}"
+          failed_when: false
+          changed_when: false
+
+        - name: Remove partial WireGuard files after failure
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ wireguard_config_path }}"
+            - "{{ wireguard_private_key_path }}"
+            - "{{ wireguard_public_key_path }}"
+          failed_when: false
+
+        - name: OPERATION_STEP wireguard:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"wireguard:failure","status":"failed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Fail WireGuard overlay ensure
+          fail:
+            msg: "WireGuard overlay ensure failed"

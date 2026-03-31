@@ -1,0 +1,216 @@
+---
+- name: Converge canonical managed Caddy proxy
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    caddy_proxy_state_dir: "/etc/opsctl"
+    caddy_proxy_state_file: "/etc/opsctl/caddy-proxy.json"
+    nginx_proxy_state_file: "/etc/opsctl/nginx-proxy.json"
+    caddy_route_dir: "/etc/caddy/opsctl-routes"
+    caddy_config_file: "/etc/caddy/Caddyfile"
+    caddy_acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+  pre_tasks:
+    - name: Skip Caddy proxy when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: OPERATION_STEP caddy:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"caddy:start","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Converge managed Caddy proxy
+      block:
+        - name: Validate required organization context
+          assert:
+            that:
+              - org_id is defined
+              - (org_id | string | length) > 0
+              - caddy_acme_email is defined
+              - (caddy_acme_email | string | length) > 0
+            fail_msg: "org_id and caddy_acme_email are required to manage the Caddy proxy"
+
+        - name: Ensure managed proxy state directory exists
+          file:
+            path: "{{ caddy_proxy_state_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Check for existing managed Caddy proxy state
+          stat:
+            path: "{{ caddy_proxy_state_file }}"
+          register: caddy_proxy_state_stat
+
+        - name: Load existing managed Caddy proxy state
+          slurp:
+            path: "{{ caddy_proxy_state_file }}"
+          register: caddy_proxy_state_raw
+          when: caddy_proxy_state_stat.stat.exists
+
+        - name: Decode existing managed Caddy proxy state
+          set_fact:
+            caddy_proxy_state: "{{ (caddy_proxy_state_raw.content | b64decode | from_json) if caddy_proxy_state_stat.stat.exists else {} }}"
+
+        - name: Reject non-Caddy managed proxy state
+          fail:
+            msg: "Existing managed proxy state does not belong to caddy; refusing to switch engines"
+          when:
+            - caddy_proxy_state_stat.stat.exists
+            - (caddy_proxy_state.engine | default('')) != 'caddy'
+
+        - name: Check for existing managed Nginx proxy state
+          stat:
+            path: "{{ nginx_proxy_state_file }}"
+          register: nginx_proxy_state_stat
+
+        - name: Reject managed Nginx engine switching
+          fail:
+            msg: "Server is already managed by Nginx; switching to caddy is not supported in Slice C"
+          when:
+            - not caddy_proxy_state_stat.stat.exists
+            - nginx_proxy_state_stat.stat.exists
+
+        - name: Inspect existing Traefik container state
+          shell: |
+            python3 - <<'PY'
+            import json
+            import subprocess
+
+            inspect = subprocess.run(
+                ["docker", "inspect", "traefik"],
+                capture_output=True,
+                text=True,
+            )
+            if inspect.returncode != 0:
+                print(json.dumps({"exists": False, "managed_traefik": False}))
+                raise SystemExit(0)
+
+            try:
+                payload = json.loads(inspect.stdout)
+            except json.JSONDecodeError:
+                print(json.dumps({"exists": True, "managed_traefik": False}))
+                raise SystemExit(0)
+
+            container = payload[0] if payload else {}
+            labels = ((container.get("Config") or {}).get("Labels") or {})
+            managed = (
+                labels.get("com.opsctl.managed") == "true"
+                and labels.get("com.opsctl.component") == "traefik_gateway"
+            )
+            print(json.dumps({"exists": True, "managed_traefik": managed}))
+            PY
+          args:
+            executable: /bin/bash
+          register: traefik_proxy_state
+          changed_when: false
+
+        - name: Parse existing Traefik container state
+          set_fact:
+            traefik_proxy_state_json: "{{ traefik_proxy_state.stdout | from_json }}"
+
+        - name: Reject managed Traefik engine switching
+          fail:
+            msg: "Server is already managed by Traefik; switching to caddy is not supported in Slice C"
+          when:
+            - traefik_proxy_state_json.managed_traefik | default(false)
+
+        - name: Detect existing listeners on ports 80 and 443
+          shell: |
+            ss -H -ltn '( sport = :80 or sport = :443 )' || true
+          args:
+            executable: /bin/sh
+          register: caddy_listener_check
+          changed_when: false
+
+        - name: Reject unmanaged listeners on ports 80 and 443
+          fail:
+            msg: "Detected existing unmanaged listener on port 80 or 443; refusing to replace it"
+          when:
+            - not caddy_proxy_state_stat.stat.exists
+            - (caddy_listener_check.stdout | trim | length) > 0
+
+        - name: OPERATION_STEP caddy:packages
+          shell: |
+            printf 'OPERATION_STEP={"name":"caddy:packages","status":"running"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Ensure Caddy package present
+          apt:
+            name:
+              - caddy
+            state: present
+            update_cache: true
+
+        - name: Ensure Caddy route directory exists
+          file:
+            path: "{{ caddy_route_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Write canonical Caddy configuration
+          copy:
+            dest: "{{ caddy_config_file }}"
+            mode: "0644"
+            content: |
+              {
+                email {{ caddy_acme_email }}
+              {% if (caddy_acme_server | default('staging')) == 'staging' %}
+                acme_ca {{ caddy_acme_staging_url }}
+              {% endif %}
+              }
+
+              import {{ caddy_route_dir }}/*.caddy
+
+        - name: Persist managed Caddy proxy state
+          copy:
+            dest: "{{ caddy_proxy_state_file }}"
+            mode: "0644"
+            content: |
+              {
+                "engine": "caddy",
+                "managed": true,
+                "org_id": "{{ org_id }}",
+                "email": "{{ caddy_acme_email }}",
+                "acme_server": "{{ caddy_acme_server | default('staging') }}"
+              }
+
+        - name: Validate Caddy configuration
+          command: caddy validate --config "{{ caddy_config_file }}" --adapter caddyfile
+          changed_when: false
+
+        - name: Restart Caddy after validated config/state update
+          service:
+            name: caddy
+            state: restarted
+            enabled: true
+
+        - name: OPERATION_STEP caddy:packages complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"caddy:packages","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP caddy:ready
+          shell: |
+            printf 'OPERATION_STEP={"name":"caddy:ready","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP caddy:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"caddy:complete","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP caddy:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"caddy:failure","status":"failed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Fail Caddy proxy converge
+          fail:
+            msg: "Caddy proxy converge failed"

@@ -1,0 +1,31 @@
+{% set effective_route_hosts = route_hosts | default([], true) %}
+{% if (effective_route_hosts | length) == 0 and route_host is defined and (route_host | string | length) > 0 %}
+{%   set effective_route_hosts = [route_host] %}
+{% endif %}
+http:
+  routers:
+    deployment-{{ deployment_id }}:
+      rule: 'Host({% for host in effective_route_hosts %}`{{ host }}`{% if not loop.last %},{% endif %}{% endfor %})'
+      priority: 1000
+      entryPoints:
+{% if route_https | default(true) %}
+        - websecure
+      tls: {}
+{% else %}
+        - web
+{% endif %}
+{% if route_middlewares | default([]) | length > 0 %}
+      middlewares:
+{% for middleware in route_middlewares %}
+        - {{ middleware }}
+{% endfor %}
+{% endif %}
+      service: deployment-{{ deployment_id }}
+  services:
+    deployment-{{ deployment_id }}:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+{% for backend in traefik_backends %}
+          - url: {{ backend.url | to_json }}
+{% endfor %}

@@ -1,10 +1,125 @@
----
-- name: Attach backend to load balancer (official)
-  hosts: localhost
+- name: Attach deployment backends through managed Traefik
+  hosts: all
   gather_facts: false
+  become: true
   vars:
-    pool: default
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
+    wireguard_interface_name: "wg-{{ short_deployment_id }}"
+    wireguard_private_key_path: "/etc/wireguard/{{ wireguard_interface_name }}.key"
+    wireguard_config_path: "/etc/wireguard/{{ wireguard_interface_name }}.conf"
+    wireguard_service_name: "wg-quick@{{ wireguard_interface_name }}"
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    gateway_wireguard_address: "{{ gateway_wireguard_ip if ('/' in (gateway_wireguard_ip | string)) else (gateway_wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
+    effective_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+  pre_tasks:
+    - name: Skip attach when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
   tasks:
-    - name: Placeholder attach action
-      debug:
-        msg: "Attach {{ container_name | default('container') }} on {{ server_id | default('server') }} to LB {{ lb_id | default('lb') }} in pool {{ pool }}"
+    - name: Attach deployment backends
+      block:
+        - name: OPERATION_STEP attach:start
+          shell: |
+            printf 'OPERATION_STEP={"name":"attach:start","status":"running","metadata":{"deployment_id":"%s","route_hosts":%s}}\n' "{{ deployment_id }}" '{{ effective_route_hosts | to_json }}'
+          args:
+            executable: /bin/sh
+
+        - name: Validate attach inputs
+          assert:
+            that:
+              - route_port is defined
+              - (effective_route_hosts | length) > 0
+              - (traefik_backends | default([]) | length) > 0
+            fail_msg: "Traefik attach requires route_hosts, route_port, and at least one backend"
+
+        - name: Ensure Traefik dynamic directory exists
+          file:
+            path: "{{ traefik_dynamic_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Read gateway private key
+          command: "cat {{ wireguard_private_key_path }}"
+          register: gateway_private_key_result
+          changed_when: false
+          no_log: true
+
+        - name: Update gateway WireGuard config
+          copy:
+            dest: "{{ wireguard_config_path }}"
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              [Interface]
+              Address = {{ gateway_wireguard_address }}
+              ListenPort = 51820
+              PrivateKey = {{ gateway_private_key_result.stdout | trim }}
+              PostUp = iptables -C INPUT -p udp --dport 51820 -j ACCEPT || iptables -I INPUT -p udp --dport 51820 -j ACCEPT
+              PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT || true
+              {% for peer in wireguard_peers | default([]) %}
+
+              [Peer]
+              PublicKey = {{ peer.public_key }}
+              AllowedIPs = {{ peer.allowed_ips }}
+              {% if peer.endpoint is defined and peer.endpoint %}
+              Endpoint = {{ peer.endpoint }}
+              {% endif %}
+              {% if peer.persistent_keepalive is defined and peer.persistent_keepalive %}
+              PersistentKeepalive = {{ peer.persistent_keepalive }}
+              {% endif %}
+              {% endfor %}
+          no_log: true
+          register: gateway_wireguard_config_write
+
+        - name: Restart gateway WireGuard service when peers changed
+          systemd:
+            name: "{{ wireguard_service_name }}"
+            enabled: true
+            state: restarted
+          when: gateway_wireguard_config_write.changed
+
+        - name: Render deterministic deployment route file
+          template:
+            src: "{{ playbook_dir }}/../templates/traefik_deployment_route.yml.j2"
+            dest: "{{ route_file_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Verify route file exists
+          stat:
+            path: "{{ route_file_path }}"
+          register: route_file_stat
+
+        - name: Assert route file rendered
+          assert:
+            that:
+              - route_file_stat.stat.exists
+            fail_msg: "Traefik route file was not written"
+
+        - name: OPERATION_STEP attach:ready
+          shell: |
+            printf 'OPERATION_STEP={"name":"attach:ready","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP attach:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"attach:complete","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP attach:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"attach:failure","status":"failed","metadata":{"deployment_id":"%s"}}\n' "{{ deployment_id }}"
+          args:
+            executable: /bin/sh
+
+        - name: Fail attach operation
+          fail:
+            msg: "Traefik backend attach failed"

@@ -1,0 +1,203 @@
+---
+- name: Converge canonical managed Nginx proxy
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    nginx_proxy_state_dir: "/etc/opsctl"
+    nginx_proxy_state_file: "/etc/opsctl/nginx-proxy.json"
+    nginx_route_dir: "/etc/nginx/conf.d/opsctl"
+    nginx_acme_webroot: "/var/www/opsctl-acme"
+  pre_tasks:
+    - name: Skip Nginx proxy when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: OPERATION_STEP nginx:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"nginx:start","status":"running"}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Converge managed Nginx proxy
+      block:
+        - name: Validate required organization context
+          assert:
+            that:
+              - org_id is defined
+              - (org_id | string | length) > 0
+              - nginx_acme_email is defined
+              - (nginx_acme_email | string | length) > 0
+            fail_msg: "org_id and nginx_acme_email are required to manage the Nginx proxy"
+
+        - name: Ensure managed proxy state directory exists
+          file:
+            path: "{{ nginx_proxy_state_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Check for existing managed Nginx proxy state
+          stat:
+            path: "{{ nginx_proxy_state_file }}"
+          register: nginx_proxy_state_stat
+
+        - name: Load existing managed Nginx proxy state
+          slurp:
+            path: "{{ nginx_proxy_state_file }}"
+          register: nginx_proxy_state_raw
+          when: nginx_proxy_state_stat.stat.exists
+
+        - name: Decode existing managed Nginx proxy state
+          set_fact:
+            nginx_proxy_state: "{{ (nginx_proxy_state_raw.content | b64decode | from_json) if nginx_proxy_state_stat.stat.exists else {} }}"
+
+        - name: Reject non-Nginx managed proxy state
+          fail:
+            msg: "Existing managed proxy state does not belong to nginx; refusing to switch engines"
+          when:
+            - nginx_proxy_state_stat.stat.exists
+            - (nginx_proxy_state.engine | default('')) != 'nginx'
+
+        - name: Inspect existing Traefik container state
+          shell: |
+            python3 - <<'PY'
+            import json
+            import subprocess
+
+            inspect = subprocess.run(
+                ["docker", "inspect", "traefik"],
+                capture_output=True,
+                text=True,
+            )
+            if inspect.returncode != 0:
+                print(json.dumps({"exists": False, "managed_traefik": False}))
+                raise SystemExit(0)
+
+            try:
+                payload = json.loads(inspect.stdout)
+            except json.JSONDecodeError:
+                print(json.dumps({"exists": True, "managed_traefik": False}))
+                raise SystemExit(0)
+
+            container = payload[0] if payload else {}
+            labels = ((container.get("Config") or {}).get("Labels") or {})
+            managed = (
+                labels.get("com.opsctl.managed") == "true"
+                and labels.get("com.opsctl.component") == "traefik_gateway"
+            )
+            print(json.dumps({"exists": True, "managed_traefik": managed}))
+            PY
+          args:
+            executable: /bin/bash
+          register: traefik_proxy_state
+          changed_when: false
+
+        - name: Parse existing Traefik container state
+          set_fact:
+            traefik_proxy_state_json: "{{ traefik_proxy_state.stdout | from_json }}"
+
+        - name: Reject managed Traefik engine switching
+          fail:
+            msg: "Server is already managed by Traefik; switching to nginx is not supported in Slice B"
+          when:
+            - traefik_proxy_state_json.managed_traefik | default(false)
+
+        - name: Detect existing listeners on ports 80 and 443
+          shell: |
+            ss -H -ltn '( sport = :80 or sport = :443 )' || true
+          args:
+            executable: /bin/sh
+          register: nginx_listener_check
+          changed_when: false
+
+        - name: Reject unmanaged listeners on ports 80 and 443
+          fail:
+            msg: "Detected existing unmanaged listener on port 80 or 443; refusing to replace it"
+          when:
+            - not nginx_proxy_state_stat.stat.exists
+            - (nginx_listener_check.stdout | trim | length) > 0
+
+        - name: OPERATION_STEP nginx:packages
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx:packages","status":"running"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Ensure Nginx and ACME packages present
+          apt:
+            name:
+              - nginx
+              - certbot
+            state: present
+            update_cache: true
+
+        - name: Ensure ACME webroot exists
+          file:
+            path: "{{ nginx_acme_webroot }}"
+            state: directory
+            mode: "0755"
+
+        - name: Ensure Nginx route directory exists
+          file:
+            path: "{{ nginx_route_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Remove default Debian Nginx site when present
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/nginx/sites-enabled/default
+            - /etc/nginx/sites-available/default
+
+        - name: Persist managed Nginx proxy state
+          copy:
+            dest: "{{ nginx_proxy_state_file }}"
+            mode: "0644"
+            content: |
+              {
+                "engine": "nginx",
+                "managed": true,
+                "org_id": "{{ org_id }}",
+                "email": "{{ nginx_acme_email }}",
+                "acme_server": "{{ nginx_acme_server | default('staging') }}"
+              }
+
+        - name: Ensure Nginx service running
+          service:
+            name: nginx
+            state: started
+            enabled: true
+
+        - name: Validate Nginx configuration
+          command: nginx -t
+          changed_when: false
+
+        - name: OPERATION_STEP nginx:packages complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx:packages","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP nginx:ready
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx:ready","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP nginx:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx:complete","status":"completed"}\n'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP nginx:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx:failure","status":"failed"}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Fail Nginx proxy converge
+          fail:
+            msg: "Nginx proxy converge failed"

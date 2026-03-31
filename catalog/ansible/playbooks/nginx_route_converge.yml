@@ -1,0 +1,222 @@
+---
+- name: Converge routed Nginx config for one deployment
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    nginx_proxy_state_file: "/etc/opsctl/nginx-proxy.json"
+    nginx_route_dir: "/etc/nginx/conf.d/opsctl"
+    nginx_acme_webroot: "/var/www/opsctl-acme"
+    acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+    primary_route_host: "{{ resolved_route_hosts[0] }}"
+    nginx_route_config_file: "{{ nginx_route_dir }}/{{ app_slug }}.conf"
+  pre_tasks:
+    - name: Skip Nginx route converge when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: OPERATION_STEP nginx-route:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"nginx-route:start","status":"running","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+        '{{ resolved_route_hosts | to_json }}' \
+        '{{ route_port | to_json }}' \
+        '{{ "true" if (route_https | default(true) | bool) else "false" }}'
+      args:
+        executable: /bin/sh
+
+    - name: Converge Nginx route
+      block:
+        - name: Validate required route inputs
+          assert:
+            that:
+              - app_slug is defined
+              - (app_slug | string | length) > 0
+              - app_container_name is defined
+              - (app_container_name | string | length) > 0
+              - resolved_route_hosts | length > 0
+              - route_port is defined
+              - (route_port | int) > 0
+            fail_msg: "app_slug, app_container_name, route_host(s), and route_port are required"
+
+        - name: Verify managed Nginx proxy state exists
+          stat:
+            path: "{{ nginx_proxy_state_file }}"
+          register: nginx_proxy_state_stat
+
+        - name: Reject missing managed Nginx proxy state
+          fail:
+            msg: "Managed nginx proxy state not found; run /setup proxy --engine=nginx first"
+          when: not nginx_proxy_state_stat.stat.exists
+
+        - name: Load managed Nginx proxy state
+          slurp:
+            path: "{{ nginx_proxy_state_file }}"
+          register: nginx_proxy_state_raw
+
+        - name: Decode managed Nginx proxy state
+          set_fact:
+            nginx_proxy_state: "{{ nginx_proxy_state_raw.content | b64decode | from_json }}"
+
+        - name: Validate managed Nginx proxy state
+          assert:
+            that:
+              - (nginx_proxy_state.engine | default('')) == 'nginx'
+            fail_msg: "Managed proxy state is not nginx; refusing to converge deployment route"
+
+        - name: Ensure route directories exist
+          file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ nginx_route_dir }}"
+            - "{{ nginx_acme_webroot }}"
+
+        - name: Stage temporary HTTP Nginx route config
+          copy:
+            dest: "{{ nginx_route_config_file }}"
+            mode: "0644"
+            content: |
+              server {
+                listen 80;
+                listen [::]:80;
+                server_name {{ resolved_route_hosts | join(' ') }};
+
+                location /.well-known/acme-challenge/ {
+                  root {{ nginx_acme_webroot }};
+                }
+
+                location / {
+                  proxy_pass http://127.0.0.1:{{ route_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                }
+              }
+
+        - name: Validate temporary Nginx config
+          command: nginx -t
+          changed_when: false
+
+        - name: Reload Nginx with temporary route config
+          service:
+            name: nginx
+            state: reloaded
+
+        - name: Request or renew ACME certificate for managed HTTPS
+          shell: |
+            certbot certonly \
+              --webroot \
+              --webroot-path "{{ nginx_acme_webroot }}" \
+              --agree-tos \
+              --non-interactive \
+              --keep-until-expiring \
+              --email "{{ nginx_proxy_state.email }}" \
+              {% if (nginx_proxy_state.acme_server | default('staging')) == 'staging' %}
+              --server "{{ acme_staging_url }}" \
+              {% endif %}
+              {% for host in resolved_route_hosts %}
+              -d "{{ host }}" \
+              {% endfor %}
+          
+          args:
+            executable: /bin/bash
+          when: route_https | default(true) | bool
+          changed_when: false
+
+        - name: Write final HTTP-only route config
+          copy:
+            dest: "{{ nginx_route_config_file }}"
+            mode: "0644"
+            content: |
+              server {
+                listen 80;
+                listen [::]:80;
+                server_name {{ resolved_route_hosts | join(' ') }};
+
+                location /.well-known/acme-challenge/ {
+                  root {{ nginx_acme_webroot }};
+                }
+
+                location / {
+                  proxy_pass http://127.0.0.1:{{ route_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                }
+              }
+          when: not (route_https | default(true) | bool)
+
+        - name: Write final HTTPS route config
+          copy:
+            dest: "{{ nginx_route_config_file }}"
+            mode: "0644"
+            content: |
+              server {
+                listen 80;
+                listen [::]:80;
+                server_name {{ resolved_route_hosts | join(' ') }};
+
+                location /.well-known/acme-challenge/ {
+                  root {{ nginx_acme_webroot }};
+                }
+
+                location / {
+                  return 301 https://$host$request_uri;
+                }
+              }
+
+              server {
+                listen 443 ssl http2;
+                listen [::]:443 ssl http2;
+                server_name {{ resolved_route_hosts | join(' ') }};
+
+                ssl_certificate /etc/letsencrypt/live/{{ primary_route_host }}/fullchain.pem;
+                ssl_certificate_key /etc/letsencrypt/live/{{ primary_route_host }}/privkey.pem;
+
+                location / {
+                  proxy_pass http://127.0.0.1:{{ route_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                }
+              }
+          when: route_https | default(true) | bool
+
+        - name: Validate final Nginx route config
+          command: nginx -t
+          changed_when: false
+
+        - name: Reload Nginx with final route config
+          service:
+            name: nginx
+            state: reloaded
+
+        - name: OPERATION_STEP nginx-route:ready
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx-route:ready","status":"completed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | to_json }}'
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP nginx-route:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx-route:complete","status":"completed","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+            '{{ resolved_route_hosts | to_json }}' \
+            '{{ route_port | to_json }}' \
+            '{{ "true" if (route_https | default(true) | bool) else "false" }}'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP nginx-route:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"nginx-route:failure","status":"failed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | default([]) | to_json }}'
+          args:
+            executable: /bin/sh
+
+        - name: Fail Nginx route converge
+          fail:
+            msg: "Nginx route converge failed"

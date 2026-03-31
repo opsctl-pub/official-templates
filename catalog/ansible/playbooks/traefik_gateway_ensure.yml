@@ -1,33 +1,44 @@
 ---
-- name: Converge canonical managed Traefik reverse proxy
+- name: Ensure canonical managed Traefik gateway
   hosts: all
   gather_facts: false
   become: true
   vars:
     traefik_container_name: "traefik"
-    traefik_dashboard_router: "traefik-dashboard"
     traefik_image: "traefik:2.11"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     traefik_acme_dir: "/var/lib/traefik"
-    acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    traefik_managed_labels:
+      com.opsctl.managed: "true"
+      com.opsctl.component: "traefik_gateway"
+      com.opsctl.org_id: "{{ org_id }}"
+    traefik_command_args:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik/dynamic/opsctl"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
   pre_tasks:
-    - name: Skip Traefik proxy when running in simulate mode
+    - name: Skip Traefik ensure when running in simulate mode
       meta: end_play
       when: simulate | default(false)
+
   tasks:
     - name: OPERATION_STEP traefik:start
       shell: |
         printf 'OPERATION_STEP={"name":"traefik:start","status":"running"}\n'
       args:
         executable: /bin/sh
-    - name: Converge managed Traefik proxy
+
+    - name: Converge managed Traefik gateway
       block:
         - name: Validate required organization context
           assert:
             that:
               - org_id is defined
               - (org_id | string | length) > 0
-            fail_msg: "org_id is required to manage the Traefik proxy"
+            fail_msg: "org_id is required to manage the Traefik gateway"
 
         - name: Ensure Docker packages present
           apt:
@@ -84,6 +95,25 @@
                 and existing_traefik_labels.get('com.opsctl.component') == 'traefik_gateway'
               }}
 
+        - name: Derive existing Traefik readiness state
+          set_fact:
+            existing_traefik_cmd: "{{ existing_traefik.Config.Cmd | default([]) if existing_traefik else [] }}"
+            existing_traefik_mount_destinations: "{{ existing_traefik.Mounts | default([]) | map(attribute='Destination') | list if existing_traefik else [] }}"
+            managed_traefik_ready: >-
+              {{
+                managed_traefik_present
+                and existing_traefik is not none
+                and existing_traefik.State.Status == 'running'
+                and existing_traefik.HostConfig.NetworkMode == 'host'
+                and existing_traefik_labels.get('com.opsctl.org_id') == (org_id | string)
+                and '/var/run/docker.sock' in existing_traefik_mount_destinations
+                and traefik_dynamic_dir in existing_traefik_mount_destinations
+                and traefik_acme_dir in existing_traefik_mount_destinations
+                and (
+                  (traefik_command_args | difference(existing_traefik_cmd)) | length == 0
+                )
+              }}
+
         - name: Fail on unmanaged Traefik container conflict
           fail:
             msg: "Existing traefik container is not OpsCtl-managed; refusing to mutate unknown state"
@@ -106,90 +136,6 @@
             - not managed_traefik_present
             - (traefik_listener_check.stdout | trim | length) > 0
 
-        - name: Build Traefik command arguments
-          set_fact:
-            traefik_command_args: >-
-              {{
-                [
-                  '--providers.docker=true',
-                  '--providers.docker.exposedbydefault=false',
-                  '--providers.file.directory=/etc/traefik/dynamic/opsctl',
-                  '--providers.file.watch=true',
-                  '--entrypoints.web.address=:80',
-                  '--entrypoints.websecure.address=:443',
-                  '--entrypoints.web.http.redirections.entrypoint.to=websecure',
-                  '--entrypoints.web.http.redirections.entrypoint.scheme=https',
-                  '--entrypoints.web.http.redirections.entrypoint.permanent=true'
-                ]
-                + (
-                  [
-                    '--certificatesresolvers.letsencrypt.acme.email=' ~ (traefik_email | string),
-                    '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json',
-                    '--certificatesresolvers.letsencrypt.acme.httpchallenge=true',
-                    '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
-                  ]
-                  if (traefik_email is defined) and ((traefik_email | string | length) > 0)
-                  else []
-                )
-                + (
-                  ['--certificatesresolvers.letsencrypt.acme.caserver=' ~ acme_staging_url]
-                  if (
-                    (traefik_email is defined)
-                    and ((traefik_email | string | length) > 0)
-                    and ((traefik_acme_server | default('staging')) == 'staging')
-                  )
-                  else []
-                )
-                + (
-                  ['--api.dashboard=true']
-                  if (traefik_dashboard_enabled | default(false))
-                  else []
-                )
-              }}
-
-        - name: Build Traefik labels
-          set_fact:
-            traefik_labels: >-
-              {{
-                {
-                  'com.opsctl.managed': 'true',
-                  'com.opsctl.component': 'traefik_gateway',
-                  'com.opsctl.org_id': (org_id | string)
-                }
-                | combine(
-                    (
-                      (traefik_dashboard_enabled | default(false))
-                      and ((traefik_dashboard_host | default('')) | length > 0)
-                      and (traefik_email is defined)
-                      and ((traefik_email | string | length) > 0)
-                    )
-                    | ternary(
-                        {
-                          'traefik.enable': 'true',
-                          'traefik.http.routers.' + traefik_dashboard_router + '.rule': 'Host("' ~ traefik_dashboard_host ~ '")',
-                          'traefik.http.routers.' + traefik_dashboard_router + '.entrypoints': 'websecure',
-                          'traefik.http.routers.' + traefik_dashboard_router + '.tls.certresolver': 'letsencrypt'
-                        },
-                        {}
-                      )
-                  )
-                | combine(
-                    (
-                      (traefik_dashboard_enabled | default(false))
-                      and (traefik_dashboard_auth is defined)
-                      and ((traefik_dashboard_auth | string | length) > 0)
-                    )
-                    | ternary(
-                        {
-                          'traefik.http.routers.' + traefik_dashboard_router + '.middlewares': 'traefik-dashboard-auth',
-                          'traefik.http.middlewares.traefik-dashboard-auth.basicauth.users': traefik_dashboard_auth
-                        },
-                        {}
-                      )
-                  )
-              }}
-          no_log: "{{ (traefik_dashboard_enabled | default(false)) and (traefik_dashboard_auth | default('') | length > 0) }}"
-
         - name: Ensure canonical managed Traefik container is running
           community.docker.docker_container:
             name: "{{ traefik_container_name }}"
@@ -204,11 +150,11 @@
               - "{{ traefik_dynamic_dir }}:/etc/traefik/dynamic/opsctl"
               - "{{ traefik_acme_dir }}:/var/lib/traefik"
             command: "{{ traefik_command_args }}"
-            labels: "{{ traefik_labels }}"
+            labels: "{{ traefik_managed_labels }}"
             pull: false
-          no_log: "{{ (traefik_dashboard_enabled | default(false)) and (traefik_dashboard_auth | default('') | length > 0) }}"
+          when: not managed_traefik_ready
 
-        - name: Re-inspect Traefik container
+        - name: Re-inspect managed Traefik container
           community.docker.docker_container_info:
             name: "{{ traefik_container_name }}"
           register: traefik_container_ready
@@ -231,7 +177,7 @@
               - traefik_container_details.Config.Labels.get('com.opsctl.managed') == 'true'
               - traefik_container_details.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
               - traefik_container_details.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
-            fail_msg: "Traefik proxy did not converge to the canonical managed layout"
+            fail_msg: "Traefik gateway did not converge to the canonical managed layout"
 
         - name: OPERATION_STEP traefik:ready
           shell: |
@@ -251,6 +197,6 @@
           args:
             executable: /bin/sh
 
-        - name: Fail Traefik proxy converge
+        - name: Fail Traefik gateway ensure
           fail:
-            msg: "Traefik proxy converge failed"
+            msg: "Traefik gateway ensure failed"

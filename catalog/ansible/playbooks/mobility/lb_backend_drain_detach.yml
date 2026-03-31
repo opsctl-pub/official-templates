@@ -1,10 +1,76 @@
 ---
-- name: Drain and detach backend from load balancer (official)
-  hosts: localhost
+- name: Drain and detach deployment backends through managed Traefik
+  hosts: all
   gather_facts: false
+  become: true
   vars:
-    timeout_s: 60
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_template_path: "{{ playbook_dir }}/../../templates/traefik_deployment_route.yml.j2"
+    timeout_s: "{{ timeout_s | default(60) | int }}"
+    traefik_backends: "{{ traefik_backends | default([]) }}"
+    effective_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+  pre_tasks:
+    - name: Skip drain/detach when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
   tasks:
-    - name: Placeholder drain/detach action
-      debug:
-        msg: "Drain+detach {{ container_name | default('container') }} from LB {{ lb_id | default('lb') }}"
+    - name: Drain and detach deployment backends
+      block:
+        - name: OPERATION_STEP drain_detach:start
+          shell: |
+            printf 'OPERATION_STEP={"name":"drain_detach:start","status":"running","metadata":{"deployment_id":"%s","backend_count":%s,"timeout_s":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}" "{{ timeout_s }}"
+          args:
+            executable: /bin/sh
+
+        - name: Validate drain/detach inputs
+          assert:
+            that:
+              - deployment_id is defined
+              - (deployment_id | string | length) > 0
+              - timeout_s >= 1
+              - (traefik_backends | length) > 0
+            fail_msg: "deployment_id, timeout_s, and at least one remaining backend are required for drain/detach"
+
+        - name: Ensure Traefik dynamic directory exists
+          file:
+            path: "{{ traefik_dynamic_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Render route file with remaining backends
+          template:
+            src: "{{ route_template_path }}"
+            dest: "{{ route_file_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Wait for drain timeout
+          pause:
+            seconds: "{{ timeout_s }}"
+
+        - name: OPERATION_STEP drain_detach:drained
+          shell: |
+            printf 'OPERATION_STEP={"name":"drain_detach:drained","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s,"timeout_s":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}" "{{ timeout_s }}"
+          args:
+            executable: /bin/sh
+
+        - name: OPERATION_STEP drain_detach:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"drain_detach:complete","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP drain_detach:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"drain_detach:failure","status":"failed","metadata":{"deployment_id":"%s"}}\n' "{{ deployment_id }}"
+          args:
+            executable: /bin/sh
+
+        - name: Fail drain/detach operation
+          fail:
+            msg: "Traefik backend drain/detach failed"

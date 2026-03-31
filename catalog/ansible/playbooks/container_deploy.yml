@@ -9,6 +9,14 @@
     health_path: "{{ app_health_path | default('/health') }}"
     host_health_port: "{{ app_health_port | default(app_ports[0]) }}"
     traefik_enabled: "{{ app_traefik_enabled | default(false) | bool }}"
+    traefik_hosts: "{{ app_traefik_hosts | default(([app_traefik_host] if (app_traefik_host is defined and (app_traefik_host | string | length) > 0) else []), true) }}"
+    traefik_rule: "{{ 'Host(' ~ (traefik_hosts | map('regex_replace', '^(.*)$', '`\\1`') | join(',')) ~ ')' }}"
+    backend_exposure_mode: "{{ backend_exposure_mode | default('host') }}"
+    wireguard_backend_enabled: "{{ backend_exposure_mode == 'wireguard' }}"
+    backend_wireguard_ip: "{{ wireguard_ip | default('') }}"
+    backend_route_port: "{{ route_port | default(None, true) }}"
+    backend_container_port: "{{ container_port | default(None, true) }}"
+    effective_backend_container_port: "{{ backend_container_port if backend_container_port is not none else ((app_container_ports[0]) if (app_container_ports is defined and (app_container_ports | length > 0)) else backend_route_port) }}"
     # IMPORTANT: Variables used in task conditionals MUST use single-line Jinja2 expressions.
     # NEVER use YAML folding (>-) with if/elif/else blocks for variables used in when: conditions.
     # Reason: YAML folding injects whitespace that breaks string comparisons (e.g., " host " != "host").
@@ -19,22 +27,7 @@
     health_container_path: "{{ app_health_container_path | default(health_path) }}"
     health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
     health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
-    published_ports: >-
-      {{
-        traefik_enabled
-        | ternary(
-            [],
-            (
-              (
-                app_container_ports is defined and (app_container_ports | length > 0)
-              )
-              | ternary(
-                  app_ports | zip(app_container_ports) | map('join', ':') | list,
-                  app_ports | map('regex_replace', '^(.*)$', '\\1:\\1') | list
-              )
-            )
-        )
-      }}
+    published_ports: []
     traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
     traefik_label_map: {}
     opsctl_label_map:
@@ -53,6 +46,44 @@
         - container_health_port is none
         - app_container_ports is defined
         - (app_container_ports | length) > 0
+
+    - name: Validate WireGuard backend exposure inputs
+      assert:
+        that:
+          - backend_wireguard_ip | string | length > 0
+          - backend_route_port is not none
+          - effective_backend_container_port is not none
+        fail_msg: "wireguard_ip, route_port, and container_port are required for backend_exposure_mode=wireguard"
+      when: wireguard_backend_enabled
+
+    - name: Derive published ports for WireGuard backend exposure
+      set_fact:
+        published_ports:
+          - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
+      when: wireguard_backend_enabled
+
+    - name: Derive published ports for Traefik-routed deploy
+      set_fact:
+        published_ports: []
+      when:
+        - not wireguard_backend_enabled
+        - traefik_enabled
+
+    - name: Derive published ports for direct host exposure
+      set_fact:
+        published_ports: >-
+          {{
+            (
+              app_container_ports is defined and (app_container_ports | length > 0)
+            )
+            | ternary(
+                app_ports | zip(app_container_ports) | map('join', ':') | list,
+                app_ports | map('regex_replace', '^(.*)$', '\\1:\\1') | list
+            )
+          }}
+      when:
+        - not wireguard_backend_enabled
+        - not traefik_enabled
 
     - name: OPERATION_STEP start
       shell: |
@@ -90,6 +121,7 @@
         deploy_host_ports: "{{ published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (published_ports | length) > 0
 
     - name: OPERATION_STEP preflight:ports start
@@ -99,6 +131,7 @@
         executable: /bin/sh
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Detect host port conflicts
@@ -177,6 +210,7 @@
       failed_when: port_conflicts_result.rc != 0
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Parse port conflict results
@@ -184,6 +218,7 @@
         port_conflict_entries: "{{ port_conflicts_result.stdout | default('[]') | from_json }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Initialize post-conflict list
@@ -191,6 +226,7 @@
         port_conflict_entries_post: "{{ port_conflict_entries | default([]) }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Record conflicting container names
@@ -198,6 +234,7 @@
         port_conflict_names: "{{ port_conflict_entries | map(attribute='name') | list }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Fail on port conflicts without override
@@ -212,6 +249,7 @@
             msg: "port_conflict"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (port_conflict_entries | length) > 0
         - not (replace_conflicts | default(false) | bool)
 
@@ -263,6 +301,7 @@
       failed_when: removable_conflicts.rc != 0
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
 
@@ -271,6 +310,7 @@
         removable_containers: "{{ removable_conflicts.stdout | default('[]') | from_json }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
 
@@ -279,6 +319,7 @@
       loop: "{{ removable_containers | default([]) }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (removable_containers | default([]) | length) > 0
 
@@ -289,6 +330,7 @@
         executable: /bin/sh
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (removable_containers | default([]) | length) > 0
 
@@ -368,6 +410,7 @@
       failed_when: port_conflicts_retry_result.rc != 0
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
 
@@ -376,6 +419,7 @@
         port_conflict_entries_post: "{{ port_conflicts_retry_result.stdout | default('[]') | from_json }}"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
 
@@ -391,6 +435,7 @@
             msg: "port_conflict"
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries_post | default([]) | length) > 0
 
@@ -401,6 +446,7 @@
         executable: /bin/sh
       when:
         - not traefik_enabled
+        - not wireguard_backend_enabled
         - (deploy_host_ports | length) > 0
         - (
             (port_conflict_entries | length == 0)
@@ -585,7 +631,7 @@
           {{
             {
               'traefik.enable': 'true',
-              ('traefik.http.routers.' ~ router_name ~ '.rule'): 'Host("' ~ app_traefik_host ~ '")',
+              ('traefik.http.routers.' ~ router_name ~ '.rule'): traefik_rule,
               ('traefik.http.routers.' ~ router_name ~ '.entrypoints'): 'websecure'
             }
             | combine(
