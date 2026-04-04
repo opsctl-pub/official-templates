@@ -7,8 +7,8 @@
     sshd_config_path: "/etc/ssh/sshd_config"
     opsctl_authorized_keys_file: "authorized_keys_opsctl"
     opsctl_managed_key_header: |
-      # Managed by OpsCtl - do not edit manually
-      # Changes to this file will be overwritten
+      # This file is managed by OpsCtl.
+      # Do not edit manually. Changes will be overwritten.
   pre_tasks:
     - name: Skip SSH access sync when running in simulate mode
       meta: end_play
