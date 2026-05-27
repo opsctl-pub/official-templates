@@ -104,6 +104,6 @@
 
     - name: OPERATION_STEP baseline:complete
       shell: |
-        printf 'OPERATION_STEP={"name":"baseline:complete","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"baseline:complete","status":"completed","metadata":{"display_name":"Baseline complete"}}\n'
       args:
         executable: /bin/sh

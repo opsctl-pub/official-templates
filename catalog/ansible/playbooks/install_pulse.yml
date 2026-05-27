@@ -18,7 +18,7 @@
   tasks:
     - name: OPERATION_STEP pulse:download start
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:download","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:download","status":"running","metadata":{"display_name":"Download Pulse"}}\n'
       args:
         executable: /bin/sh
 
@@ -41,13 +41,13 @@
 
     - name: OPERATION_STEP pulse:download completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:download","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:download","status":"completed","metadata":{"display_name":"Download Pulse"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP pulse:configure start
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:configure","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:configure","status":"running","metadata":{"display_name":"Configure Pulse"}}\n'
       args:
         executable: /bin/sh
 
@@ -70,13 +70,13 @@
 
     - name: OPERATION_STEP pulse:configure completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:configure","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:configure","status":"completed","metadata":{"display_name":"Configure Pulse"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP pulse:enable start
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:enable","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:enable","status":"running","metadata":{"display_name":"Enable Pulse"}}\n'
       args:
         executable: /bin/sh
 
@@ -89,13 +89,13 @@
 
     - name: OPERATION_STEP pulse:enable completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:enable","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:enable","status":"completed","metadata":{"display_name":"Enable Pulse"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP pulse:verify start
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:verify","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:verify","status":"running","metadata":{"display_name":"Verify Pulse"}}\n'
       args:
         executable: /bin/sh
 
@@ -107,12 +107,12 @@
 
     - name: OPERATION_STEP pulse:verify completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:verify","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:verify","status":"completed","metadata":{"display_name":"Verify Pulse"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP pulse:complete completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:complete","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"pulse:complete","status":"completed","metadata":{"display_name":"Pulse installed"}}\n'
       args:
         executable: /bin/sh

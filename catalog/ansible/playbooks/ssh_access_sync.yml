@@ -19,7 +19,7 @@
       block:
         - name: OPERATION_STEP ssh-access:start
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:start","status":"running"}\n'
+            printf 'OPERATION_STEP={"name":"ssh-access:start","status":"running","metadata":{"display_name":"Sync SSH access"}}\n'
           args:
             executable: /bin/sh
 
@@ -39,7 +39,7 @@
 
         - name: OPERATION_STEP ssh-access:sshd-config
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"running"}\n'
+            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"running","metadata":{"display_name":"Configure SSHD"}}\n'
           args:
             executable: /bin/sh
 
@@ -71,7 +71,7 @@
 
         - name: OPERATION_STEP ssh-access:sshd-config complete
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"ssh-access:sshd-config","status":"completed","metadata":{"display_name":"Configure SSHD"}}\n'
           args:
             executable: /bin/sh
 
@@ -108,7 +108,7 @@
 
         - name: OPERATION_STEP ssh-access:users
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"running","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
+            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"running","metadata":{"display_name":"Sync SSH users","present_user_count":%s,"absent_user_count":%s}}\n' \
             '{{ opsctl_ssh_present_users | length | to_json }}' \
             '{{ opsctl_ssh_absent_users | length | to_json }}'
           args:
@@ -236,7 +236,7 @@
 
         - name: OPERATION_STEP ssh-access:users complete
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"completed","metadata":{"present_user_count":%s,"absent_user_count":%s}}\n' \
+            printf 'OPERATION_STEP={"name":"ssh-access:users","status":"completed","metadata":{"display_name":"Sync SSH users","present_user_count":%s,"absent_user_count":%s}}\n' \
             '{{ opsctl_ssh_present_users | length | to_json }}' \
             '{{ opsctl_ssh_absent_users | length | to_json }}'
           args:
@@ -244,14 +244,14 @@
 
         - name: OPERATION_STEP ssh-access:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:complete","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"ssh-access:complete","status":"completed","metadata":{"display_name":"SSH access synced"}}\n'
           args:
             executable: /bin/sh
 
       rescue:
         - name: OPERATION_STEP ssh-access:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"ssh-access:failure","status":"failed"}\n'
+            printf 'OPERATION_STEP={"name":"ssh-access:failure","status":"failed","metadata":{"display_name":"SSH access sync failed"}}\n'
           args:
             executable: /bin/sh
 

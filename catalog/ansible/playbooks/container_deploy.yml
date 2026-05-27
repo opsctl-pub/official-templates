@@ -87,13 +87,13 @@
 
     - name: OPERATION_STEP start
       shell: |
-        printf 'OPERATION_STEP={"name":"deploy:start","status":"running","metadata":{"phase":"init"}}\n'
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"running","metadata":{"display_name":"Deploy container","phase":"init"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP docker:install
       shell: |
-        printf 'OPERATION_STEP={"name":"docker:install","status":"running","metadata":{}}\n'
+        printf 'OPERATION_STEP={"name":"docker:install","status":"running","metadata":{"display_name":"Install Docker"}}\n'
       args:
         executable: /bin/sh
 
@@ -112,7 +112,7 @@
 
     - name: OPERATION_STEP docker:ready
       shell: |
-        printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{}}\n'
+        printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{"display_name":"Install Docker"}}\n'
       args:
         executable: /bin/sh
 
@@ -126,7 +126,7 @@
 
     - name: OPERATION_STEP preflight:ports start
       shell: |
-        printf 'OPERATION_STEP={"name":"preflight:ports","status":"running","metadata":{"ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"running","metadata":{"display_name":"Check ports","ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
       args:
         executable: /bin/sh
       when:
@@ -241,7 +241,7 @@
       block:
         - name: OPERATION_STEP preflight:ports failed
           shell: |
-            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"ports":%s,"conflicts":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_names | default([]) | to_json }}'
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"display_name":"Check ports","ports":%s,"conflicts":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_names | default([]) | to_json }}'
           args:
             executable: /bin/sh
         - name: Abort due to port conflict
@@ -325,7 +325,7 @@
 
     - name: OPERATION_STEP replace:complete
       shell: |
-        printf 'OPERATION_STEP={"name":"replace:complete","status":"completed","metadata":{"removed":%s}}\n' '{{ removable_containers | default([]) | to_json }}'
+        printf 'OPERATION_STEP={"name":"replace:complete","status":"completed","metadata":{"display_name":"Remove conflicting containers","removed":%s}}\n' '{{ removable_containers | default([]) | to_json }}'
       args:
         executable: /bin/sh
       when:
@@ -427,7 +427,7 @@
       block:
         - name: OPERATION_STEP preflight:ports failed after override
           shell: |
-            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"ports":%s,"conflicts_remaining":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_entries_post | map(attribute="name") | list | to_json }}'
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"display_name":"Check ports","ports":%s,"conflicts_remaining":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_entries_post | map(attribute="name") | list | to_json }}'
           args:
             executable: /bin/sh
         - name: Abort due to remaining port conflicts
@@ -441,7 +441,7 @@
 
     - name: OPERATION_STEP preflight:ports complete
       shell: |
-        printf 'OPERATION_STEP={"name":"preflight:ports","status":"completed","metadata":{"ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"completed","metadata":{"display_name":"Check ports","ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
       args:
         executable: /bin/sh
       when:
@@ -459,7 +459,7 @@
 
     - name: OPERATION_STEP creds:check
       shell: |
-        printf 'OPERATION_STEP={"name":"creds:check","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"creds:check","status":"running","metadata":{"display_name":"Check registry credentials"}}\n'
       args:
         executable: /bin/sh
 
@@ -490,13 +490,13 @@
 
     - name: OPERATION_STEP creds:check complete
       shell: |
-        printf 'OPERATION_STEP={"name":"creds:check","status":"completed"}\n'
+        printf 'OPERATION_STEP={"name":"creds:check","status":"completed","metadata":{"display_name":"Check registry credentials"}}\n'
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP auth:start
       shell: |
-        printf 'OPERATION_STEP={"name":"auth:start","status":"running","metadata":{"host":"%s"}}\n' "{{ auth.host | default('') }}"
+        printf 'OPERATION_STEP={"name":"auth:start","status":"running","metadata":{"display_name":"Authenticate registry","host":"%s"}}\n' "{{ auth.host | default('') }}"
       args:
         executable: /bin/sh
       when: auth_is_mapping | default(false)
@@ -547,7 +547,7 @@
 
     - name: OPERATION_STEP auth:start complete
       shell: |
-        printf 'OPERATION_STEP={"name":"auth:start","status":"%s","metadata":{"host":"%s","exit_code":%d}}\n' \
+        printf 'OPERATION_STEP={"name":"auth:start","status":"%s","metadata":{"display_name":"Authenticate registry","host":"%s","exit_code":%d}}\n' \
         "{{ 'completed' if ((auth_exit_code | default(1)) | int) == 0 else 'failed' }}" \
         "{{ auth.host | default('') }}" \
         {{ (auth_exit_code | default(1)) | int }}
@@ -571,7 +571,7 @@
 
     - name: OPERATION_STEP image:check
       shell: |
-        printf 'OPERATION_STEP={"name":"image:check","status":"running","metadata":{"image":"{{ app_image }}"}}\n'
+        printf 'OPERATION_STEP={"name":"image:check","status":"running","metadata":{"display_name":"Check container image","image":"{{ app_image }}"}}\n'
       args:
         executable: /bin/sh
 
@@ -585,14 +585,14 @@
 
     - name: OPERATION_STEP image:check complete
       shell: |
-        printf 'OPERATION_STEP={"name":"image:check","status":"completed","metadata":{"image":"{{ app_image }}","exists":%s}}\n' \
+        printf 'OPERATION_STEP={"name":"image:check","status":"completed","metadata":{"display_name":"Check container image","image":"{{ app_image }}","exists":%s}}\n' \
         "{{ 'true' if inspect_result.rc == 0 else 'false' }}"
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP image:pull
       shell: |
-        printf 'OPERATION_STEP={"name":"image:pull","status":"running","metadata":{"image":"{{ app_image }}"}}\n'
+        printf 'OPERATION_STEP={"name":"image:pull","status":"running","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n'
       args:
         executable: /bin/sh
       when: inspect_result.rc != 0
@@ -608,7 +608,7 @@
 
     - name: OPERATION_STEP image:pull complete
       shell: |
-        printf 'OPERATION_STEP={"name":"image:pull","status":"%s","metadata":{"image":"{{ app_image }}"}}\n' \
+        printf 'OPERATION_STEP={"name":"image:pull","status":"%s","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n' \
         "{{ 'completed' if (inspect_result.rc == 0 and (pull_result is not defined or pull_result.rc == 0)) else 'failed' }}"
       args:
         executable: /bin/sh
@@ -663,7 +663,7 @@
 
     - name: OPERATION_STEP container:prepare
       shell: |
-        printf 'OPERATION_STEP={"name":"container:prepare","status":"running","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"running","metadata":{"display_name":"Prepare container","container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
       args:
         executable: /bin/sh
 
@@ -750,7 +750,7 @@
 
     - name: OPERATION_STEP replace:legacy_cleanup complete
       shell: |
-        printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
+        printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"display_name":"Remove legacy containers","removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
       args:
         executable: /bin/sh
       when: (legacy_opsctl_containers | default([]) | length) > 0
@@ -771,7 +771,7 @@
 
     - name: OPERATION_STEP container:prepare complete
       shell: |
-        printf 'OPERATION_STEP={"name":"container:prepare","status":"completed","metadata":{"container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"completed","metadata":{"display_name":"Prepare container","container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
       args:
         executable: /bin/sh
 
@@ -792,7 +792,7 @@
 
     - name: OPERATION_STEP health:check
       shell: |
-        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
+        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
       args:
         executable: /bin/sh
 
@@ -837,12 +837,12 @@
 
     - name: OPERATION_STEP health:check complete
       shell: |
-        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
+        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
       args:
         executable: /bin/sh
 
     - name: OPERATION_STEP deploy:start complete
       shell: |
-        printf 'OPERATION_STEP={"name":"deploy:start","status":"completed","metadata":{"container":"{{ container_name }}"}}\n'
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"completed","metadata":{"display_name":"Deploy container","container":"{{ container_name }}"}}\n'
       args:
         executable: /bin/sh
