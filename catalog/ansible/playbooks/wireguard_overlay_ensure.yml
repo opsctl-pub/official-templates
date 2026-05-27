@@ -22,7 +22,7 @@
   tasks:
     - name: OPERATION_STEP wireguard:start
       shell: |
-        printf 'OPERATION_STEP={"name":"wireguard:start","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"wireguard:start","status":"running","metadata":{"display_name":"Configure WireGuard overlay"}}\n'
       args:
         executable: /bin/sh
 
@@ -68,7 +68,7 @@
 
             - name: OPERATION_STEP wireguard:complete absent
               shell: |
-                printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed"}\n'
+                printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed","metadata":{"display_name":"WireGuard overlay removed"}}\n'
               args:
                 executable: /bin/sh
 
@@ -176,13 +176,13 @@
 
         - name: OPERATION_STEP wireguard:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"wireguard:ready","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"wireguard:ready","status":"completed","metadata":{"display_name":"Verify WireGuard overlay"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP wireguard:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"wireguard:complete","status":"completed","metadata":{"display_name":"WireGuard overlay ready"}}\n'
           args:
             executable: /bin/sh
       rescue:
@@ -210,7 +210,7 @@
 
         - name: OPERATION_STEP wireguard:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"wireguard:failure","status":"failed"}\n'
+            printf 'OPERATION_STEP={"name":"wireguard:failure","status":"failed","metadata":{"display_name":"WireGuard overlay failed"}}\n'
           args:
             executable: /bin/sh
 

@@ -17,7 +17,7 @@
   tasks:
     - name: OPERATION_STEP traefik:start
       shell: |
-        printf 'OPERATION_STEP={"name":"traefik:start","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"traefik:start","status":"running","metadata":{"display_name":"Configure Traefik proxy"}}\n'
       args:
         executable: /bin/sh
     - name: Converge managed Traefik proxy
@@ -235,19 +235,19 @@
 
         - name: OPERATION_STEP traefik:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"traefik:ready","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"traefik:ready","status":"completed","metadata":{"display_name":"Verify Traefik proxy"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP traefik:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"traefik:complete","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"traefik:complete","status":"completed","metadata":{"display_name":"Traefik proxy ready"}}\n'
           args:
             executable: /bin/sh
       rescue:
         - name: OPERATION_STEP traefik:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"traefik:failure","status":"failed"}\n'
+            printf 'OPERATION_STEP={"name":"traefik:failure","status":"failed","metadata":{"display_name":"Traefik proxy failed"}}\n'
           args:
             executable: /bin/sh
 

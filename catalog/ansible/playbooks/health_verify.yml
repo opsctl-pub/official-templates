@@ -16,7 +16,7 @@
       block:
         - name: OPERATION_STEP health:start http
           shell: |
-            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"mode":"http","url":"%s"}}\n' "{{ health_url }}"
+            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"http","url":"%s"}}\n' "{{ health_url }}"
           args:
             executable: /bin/sh
           when: resolved_health_mode == 'http'
@@ -37,14 +37,14 @@
 
         - name: OPERATION_STEP health:complete http
           shell: |
-            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"mode":"http","url":"%s"}}\n' "{{ health_url }}"
+            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"display_name":"Health check passed","mode":"http","url":"%s"}}\n' "{{ health_url }}"
           args:
             executable: /bin/sh
           when: resolved_health_mode == 'http'
 
         - name: OPERATION_STEP health:start tcp
           shell: |
-            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
           args:
             executable: /bin/sh
           when: resolved_health_mode == 'tcp_connect'
@@ -60,7 +60,7 @@
 
         - name: OPERATION_STEP health:complete tcp
           shell: |
-            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"display_name":"Health check passed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
           args:
             executable: /bin/sh
           when: resolved_health_mode == 'tcp_connect'
@@ -68,9 +68,9 @@
         - name: OPERATION_STEP health:failure
           shell: |
             if [ "{{ resolved_health_mode }}" = "tcp_connect" ]; then
-              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
             else
-              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"mode":"http","url":"%s"}}\n' "{{ health_url }}"
+              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"http","url":"%s"}}\n' "{{ health_url }}"
             fi
           args:
             executable: /bin/sh

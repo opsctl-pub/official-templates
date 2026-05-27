@@ -11,7 +11,7 @@
   tasks:
     - name: OPERATION_STEP inspect:start
       shell: |
-        printf 'OPERATION_STEP={"name":"inspect:start","status":"running","metadata":{"container_name":{{ container_name | to_json }}}}\n'
+        printf 'OPERATION_STEP={"name":"inspect:start","status":"running","metadata":{"display_name":"Inspect container","container_name":{{ container_name | to_json }}}}\n'
       args:
         executable: /bin/sh
 
@@ -222,6 +222,6 @@
 
     - name: OPERATION_STEP inspect:result
       shell: |
-        printf 'OPERATION_STEP={"name":"inspect:result","status":"completed","metadata":%s}\n' '{{ inspect_result | to_json }}'
+        printf 'OPERATION_STEP={"name":"inspect:result","status":"completed","metadata":%s}\n' '{{ inspect_result | combine({"display_name": "Inspection complete"}) | to_json }}'
       args:
         executable: /bin/sh

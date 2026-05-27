@@ -15,7 +15,7 @@
   tasks:
     - name: OPERATION_STEP nginx:start
       shell: |
-        printf 'OPERATION_STEP={"name":"nginx:start","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"nginx:start","status":"running","metadata":{"display_name":"Configure Nginx proxy"}}\n'
       args:
         executable: /bin/sh
 
@@ -119,7 +119,7 @@
 
         - name: OPERATION_STEP nginx:packages
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx:packages","status":"running"}\n'
+            printf 'OPERATION_STEP={"name":"nginx:packages","status":"running","metadata":{"display_name":"Install Nginx packages"}}\n'
           args:
             executable: /bin/sh
 
@@ -176,25 +176,25 @@
 
         - name: OPERATION_STEP nginx:packages complete
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx:packages","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"nginx:packages","status":"completed","metadata":{"display_name":"Install Nginx packages"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP nginx:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx:ready","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"nginx:ready","status":"completed","metadata":{"display_name":"Verify Nginx proxy"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP nginx:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx:complete","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"nginx:complete","status":"completed","metadata":{"display_name":"Nginx proxy ready"}}\n'
           args:
             executable: /bin/sh
       rescue:
         - name: OPERATION_STEP nginx:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx:failure","status":"failed"}\n'
+            printf 'OPERATION_STEP={"name":"nginx:failure","status":"failed","metadata":{"display_name":"Nginx proxy failed"}}\n'
           args:
             executable: /bin/sh
 

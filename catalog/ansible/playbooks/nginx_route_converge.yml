@@ -18,7 +18,7 @@
   tasks:
     - name: OPERATION_STEP nginx-route:start
       shell: |
-        printf 'OPERATION_STEP={"name":"nginx-route:start","status":"running","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+        printf 'OPERATION_STEP={"name":"nginx-route:start","status":"running","metadata":{"display_name":"Configure Nginx route","hosts":%s,"route_port":%s,"https":%s}}\n' \
         '{{ resolved_route_hosts | to_json }}' \
         '{{ route_port | to_json }}' \
         '{{ "true" if (route_https | default(true) | bool) else "false" }}'
@@ -198,13 +198,13 @@
 
         - name: OPERATION_STEP nginx-route:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx-route:ready","status":"completed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | to_json }}'
+            printf 'OPERATION_STEP={"name":"nginx-route:ready","status":"completed","metadata":{"display_name":"Verify Nginx route","hosts":%s}}\n' '{{ resolved_route_hosts | to_json }}'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP nginx-route:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx-route:complete","status":"completed","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+            printf 'OPERATION_STEP={"name":"nginx-route:complete","status":"completed","metadata":{"display_name":"Nginx route ready","hosts":%s,"route_port":%s,"https":%s}}\n' \
             '{{ resolved_route_hosts | to_json }}' \
             '{{ route_port | to_json }}' \
             '{{ "true" if (route_https | default(true) | bool) else "false" }}'
@@ -213,7 +213,7 @@
       rescue:
         - name: OPERATION_STEP nginx-route:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"nginx-route:failure","status":"failed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | default([]) | to_json }}'
+            printf 'OPERATION_STEP={"name":"nginx-route:failure","status":"failed","metadata":{"display_name":"Nginx route failed","hosts":%s}}\n' '{{ resolved_route_hosts | default([]) | to_json }}'
           args:
             executable: /bin/sh
 

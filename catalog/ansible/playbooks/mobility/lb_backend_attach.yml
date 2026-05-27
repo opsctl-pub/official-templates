@@ -22,7 +22,7 @@
       block:
         - name: OPERATION_STEP attach:start
           shell: |
-            printf 'OPERATION_STEP={"name":"attach:start","status":"running","metadata":{"deployment_id":"%s","route_hosts":%s}}\n' "{{ deployment_id }}" '{{ effective_route_hosts | to_json }}'
+            printf 'OPERATION_STEP={"name":"attach:start","status":"running","metadata":{"display_name":"Attach load balancer backends","deployment_id":"%s","route_hosts":%s}}\n' "{{ deployment_id }}" '{{ effective_route_hosts | to_json }}'
           args:
             executable: /bin/sh
 
@@ -104,19 +104,19 @@
 
         - name: OPERATION_STEP attach:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"attach:ready","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
+            printf 'OPERATION_STEP={"name":"attach:ready","status":"completed","metadata":{"display_name":"Verify backend attachment","deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP attach:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"attach:complete","status":"completed","metadata":{"deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
+            printf 'OPERATION_STEP={"name":"attach:complete","status":"completed","metadata":{"display_name":"Backends attached","deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
           args:
             executable: /bin/sh
       rescue:
         - name: OPERATION_STEP attach:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"attach:failure","status":"failed","metadata":{"deployment_id":"%s"}}\n' "{{ deployment_id }}"
+            printf 'OPERATION_STEP={"name":"attach:failure","status":"failed","metadata":{"display_name":"Backend attachment failed","deployment_id":"%s"}}\n' "{{ deployment_id }}"
           args:
             executable: /bin/sh
 

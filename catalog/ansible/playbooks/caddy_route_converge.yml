@@ -22,7 +22,7 @@
   tasks:
     - name: OPERATION_STEP caddy-route:start
       shell: |
-        printf 'OPERATION_STEP={"name":"caddy-route:start","status":"running","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+        printf 'OPERATION_STEP={"name":"caddy-route:start","status":"running","metadata":{"display_name":"Configure Caddy route","hosts":%s,"route_port":%s,"https":%s}}\n' \
         '{{ resolved_route_hosts | to_json }}' \
         '{{ route_port | to_json }}' \
         '{{ "true" if (route_https | default(true) | bool) else "false" }}'
@@ -94,13 +94,13 @@
 
         - name: OPERATION_STEP caddy-route:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy-route:ready","status":"completed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | to_json }}'
+            printf 'OPERATION_STEP={"name":"caddy-route:ready","status":"completed","metadata":{"display_name":"Verify Caddy route","hosts":%s}}\n' '{{ resolved_route_hosts | to_json }}'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP caddy-route:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy-route:complete","status":"completed","metadata":{"hosts":%s,"route_port":%s,"https":%s}}\n' \
+            printf 'OPERATION_STEP={"name":"caddy-route:complete","status":"completed","metadata":{"display_name":"Caddy route ready","hosts":%s,"route_port":%s,"https":%s}}\n' \
             '{{ resolved_route_hosts | to_json }}' \
             '{{ route_port | to_json }}' \
             '{{ "true" if (route_https | default(true) | bool) else "false" }}'
@@ -109,7 +109,7 @@
       rescue:
         - name: OPERATION_STEP caddy-route:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy-route:failure","status":"failed","metadata":{"hosts":%s}}\n' '{{ resolved_route_hosts | default([]) | to_json }}'
+            printf 'OPERATION_STEP={"name":"caddy-route:failure","status":"failed","metadata":{"display_name":"Caddy route failed","hosts":%s}}\n' '{{ resolved_route_hosts | default([]) | to_json }}'
           args:
             executable: /bin/sh
 

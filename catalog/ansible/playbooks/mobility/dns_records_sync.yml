@@ -16,7 +16,7 @@
       block:
         - name: OPERATION_STEP dns_sync:start
           shell: |
-            printf 'OPERATION_STEP={"name":"dns_sync:start","status":"running","metadata":{"provider":"%s","zone_name":"%s","change_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_changes | length }}"
+            printf 'OPERATION_STEP={"name":"dns_sync:start","status":"running","metadata":{"display_name":"Sync DNS records","provider":"%s","zone_name":"%s","change_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_changes | length }}"
           args:
             executable: /bin/sh
 
@@ -143,7 +143,7 @@
 
         - name: OPERATION_STEP dns_sync:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"dns_sync:complete","status":"completed","metadata":{"provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_sync_applied_changes | length }}"
+            printf 'OPERATION_STEP={"name":"dns_sync:complete","status":"completed","metadata":{"display_name":"DNS records synced","provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_sync_applied_changes | length }}"
           args:
             executable: /bin/sh
       rescue:
@@ -155,7 +155,7 @@
 
         - name: OPERATION_STEP dns_sync:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"dns_sync:failure","status":"failed","metadata":{"provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ (dns_sync_applied_changes | default([])) | length }}"
+            printf 'OPERATION_STEP={"name":"dns_sync:failure","status":"failed","metadata":{"display_name":"DNS sync failed","provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ (dns_sync_applied_changes | default([])) | length }}"
           args:
             executable: /bin/sh
 

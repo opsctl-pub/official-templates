@@ -17,7 +17,7 @@
   tasks:
     - name: OPERATION_STEP caddy:start
       shell: |
-        printf 'OPERATION_STEP={"name":"caddy:start","status":"running"}\n'
+        printf 'OPERATION_STEP={"name":"caddy:start","status":"running","metadata":{"display_name":"Configure Caddy proxy"}}\n'
       args:
         executable: /bin/sh
 
@@ -133,7 +133,7 @@
 
         - name: OPERATION_STEP caddy:packages
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy:packages","status":"running"}\n'
+            printf 'OPERATION_STEP={"name":"caddy:packages","status":"running","metadata":{"display_name":"Install Caddy packages"}}\n'
           args:
             executable: /bin/sh
 
@@ -189,25 +189,25 @@
 
         - name: OPERATION_STEP caddy:packages complete
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy:packages","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"caddy:packages","status":"completed","metadata":{"display_name":"Install Caddy packages"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP caddy:ready
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy:ready","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"caddy:ready","status":"completed","metadata":{"display_name":"Verify Caddy proxy"}}\n'
           args:
             executable: /bin/sh
 
         - name: OPERATION_STEP caddy:complete
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy:complete","status":"completed"}\n'
+            printf 'OPERATION_STEP={"name":"caddy:complete","status":"completed","metadata":{"display_name":"Caddy proxy ready"}}\n'
           args:
             executable: /bin/sh
       rescue:
         - name: OPERATION_STEP caddy:failure
           shell: |
-            printf 'OPERATION_STEP={"name":"caddy:failure","status":"failed"}\n'
+            printf 'OPERATION_STEP={"name":"caddy:failure","status":"failed","metadata":{"display_name":"Caddy proxy failed"}}\n'
           args:
             executable: /bin/sh
 
