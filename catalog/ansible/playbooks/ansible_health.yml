@@ -5,7 +5,7 @@
   tasks:
     - name: Emit ansible:health:start
       shell: |
-        printf 'OPERATION_STEP={"name":"ansible:health:start","status":"running","metadata":{"engine":"ansible"}}\n'
+        printf 'OPERATION_STEP={"name":"ansible:health:start","status":"running","metadata":{"display_name":"Check Ansible health","engine":"ansible"}}\n'
 
     - name: Verify ansible execution
       debug:
@@ -13,4 +13,4 @@
 
     - name: Emit ansible:health:done
       shell: |
-        printf 'OPERATION_STEP={"name":"ansible:health:done","status":"completed","metadata":{"engine":"ansible","duration_ms":1}}\n'
+        printf 'OPERATION_STEP={"name":"ansible:health:done","status":"completed","metadata":{"display_name":"Ansible health check complete","engine":"ansible","duration_ms":1}}\n'
