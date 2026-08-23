@@ -1,0 +1,7 @@
+---
+baseline_managed_architecture: amd64
+baseline_docker_package_manager: apt
+baseline_docker_packages:
+  - docker.io
+baseline_docker_update_cache: true
+baseline_docker_service_name: docker

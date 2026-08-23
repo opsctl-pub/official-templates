@@ -1,0 +1,6 @@
+---
+baseline_managed_architecture: amd64
+baseline_docker_package_manager: dnf
+baseline_docker_packages:
+  - docker
+baseline_docker_service_name: docker
