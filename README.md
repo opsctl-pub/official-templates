@@ -8,7 +8,7 @@ Automation assets for the OpsControl platform:
 
 ## Structure
 
-- `catalog/ansible/playbooks/` — Deployment and operational playbooks
-- `catalog/ansible/inventory/` — Dynamic inventory script
-- `catalog/terraform/modules/` — Infrastructure modules
-- `catalog/packages/` — Template and blueprint manifests
+- `catalog/ansible/playbooks/`: Deployment and operational playbooks
+- `catalog/ansible/inventory/`: Dynamic inventory script
+- `catalog/terraform/modules/`: Infrastructure modules
+- `catalog/packages/`: Template and blueprint manifests
