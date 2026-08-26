@@ -107,7 +107,7 @@
 
     - name: OPERATION_STEP pulse:verify completed
       shell: |
-        printf 'OPERATION_STEP={"name":"pulse:verify","status":"completed","metadata":{"display_name":"Verify Pulse"}}\n'
+        printf 'OPERATION_STEP={"name":"pulse:verify","status":"completed","metadata":{"display_name":"Verify Pulse","certification_evidence":{"schema":"opsctl.managed-lifecycle/v1","assertions":{"service_active":true}}}}\n'
       args:
         executable: /bin/sh
 

@@ -128,7 +128,7 @@
 
 - name: OPERATION_STEP docker:install completed
   shell: |
-    printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{"step_key":"docker_install","display_name":"Install Docker"}}\n'
+    printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{"step_key":"docker_install","display_name":"Install Docker","certification_evidence":{"schema":"opsctl.managed-lifecycle/v1","assertions":{"package_manager":{{ baseline_docker_package_manager | to_json }},"packages_installed":true,"service_active":true,"daemon_responsive":true}}}}\n'
   args:
     executable: /bin/sh
 
