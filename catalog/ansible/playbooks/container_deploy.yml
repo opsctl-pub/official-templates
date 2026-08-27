@@ -461,11 +461,13 @@
     - name: Load registry auth content
       set_fact:
         auth_content_raw: "{{ lookup('file', '/secrets/registry-auth.json', errors='ignore') | default('', true) | trim }}"
+      no_log: true
 
     - name: Normalize registry auth when already parsed
       set_fact:
         auth: "{{ auth_content_raw }}"
         auth_is_mapping: true
+      no_log: true
       when:
         - auth_content_raw is mapping
 
@@ -473,6 +475,7 @@
       set_fact:
         auth: "{{ auth_content_raw | from_json }}"
         auth_is_mapping: true
+      no_log: true
       when:
         - auth_content_raw is string
         - auth_content_raw | length > 0
