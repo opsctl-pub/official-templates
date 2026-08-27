@@ -150,7 +150,7 @@ resource "aws_instance" "this" {
 }
 
 resource "aws_security_group" "destroy" {
-  count = var.destroy ? 1 : 0
+  count = var.destroy && var.destroy_security_group ? 1 : 0
 
   name        = "opsctl-destroy-placeholder"
   description = "OpsControl destroy import placeholder"
@@ -158,7 +158,7 @@ resource "aws_security_group" "destroy" {
   lifecycle {
     precondition {
       condition     = trimspace(var.security_group_id) != ""
-      error_message = "security_group_id is required when destroy=true."
+      error_message = "security_group_id is required when destroy_security_group=true."
     }
   }
 }

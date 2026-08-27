@@ -16,6 +16,12 @@ variable "security_group_id" {
   default     = ""
 }
 
+variable "destroy_security_group" {
+  description = "Whether to destroy the exact provision-owned security group"
+  type        = bool
+  default     = true
+}
+
 variable "destroy_ami_id" {
   description = "AMI ID from the imported EC2 instance state (required when destroy=true)"
   type        = string
