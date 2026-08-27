@@ -72,13 +72,9 @@
       set_fact:
         published_ports: >-
           {{
-            (
-              app_container_ports is defined and (app_container_ports | length > 0)
-            )
-            | ternary(
-                app_ports | zip(app_container_ports) | map('join', ':') | list,
-                app_ports | map('regex_replace', '^(.*)$', '\\1:\\1') | list
-            )
+            (app_ports | zip(app_container_ports) | map('join', ':') | list)
+            if (app_container_ports is defined and (app_container_ports | length > 0))
+            else (app_ports | zip(app_ports) | map('join', ':') | list)
           }}
       when:
         - not wireguard_backend_enabled
