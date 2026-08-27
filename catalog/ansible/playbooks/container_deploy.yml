@@ -604,7 +604,7 @@
     - name: OPERATION_STEP image:pull complete
       shell: |
         printf 'OPERATION_STEP={"name":"image:pull","status":"%s","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n' \
-        "{{ 'completed' if (inspect_result.rc == 0 and (pull_result is not defined or pull_result.rc == 0)) else 'failed' }}"
+        "{{ 'completed' if (pull_result is defined and pull_result.rc == 0) else 'failed' }}"
       args:
         executable: /bin/sh
       when: inspect_result.rc != 0
