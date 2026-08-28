@@ -595,21 +595,31 @@
         executable: /bin/sh
       when: inspect_result.rc != 0
 
-    - name: Pull image "{{ app_image }}" from registry
-      shell: docker pull "{{ app_image }}"
-      register: pull_result
-      changed_when: true
-      failed_when: pull_result.rc != 0
-      args:
-        executable: /bin/sh
-      when: inspect_result.rc != 0
+    - name: Pull missing container image
+      block:
+        - name: Pull image "{{ app_image }}" from registry
+          shell: docker pull "{{ app_image }}"
+          register: pull_result
+          changed_when: true
+          failed_when: pull_result.rc != 0
+          args:
+            executable: /bin/sh
 
-    - name: OPERATION_STEP image:pull complete
-      shell: |
-        printf 'OPERATION_STEP={"name":"image:pull","status":"%s","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n' \
-        "{{ 'completed' if (pull_result is defined and pull_result.rc == 0) else 'failed' }}"
-      args:
-        executable: /bin/sh
+        - name: OPERATION_STEP image:pull complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"image:pull","status":"completed","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: OPERATION_STEP image:pull failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"image:pull","status":"failed","metadata":{"display_name":"Pull container image","reason_code":"image_pull_failed"}}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Abort after container image pull failure
+          fail:
+            msg: "Container image pull failed."
       when: inspect_result.rc != 0
 
     - name: Docker logout from "{{ auth.host }}"
@@ -753,19 +763,34 @@
         executable: /bin/sh
       when: (legacy_opsctl_containers | default([]) | length) > 0
 
-    - name: Start container "{{ container_name }}"
-      community.docker.docker_container:
-        name: "{{ container_name }}"
-        image: "{{ app_image }}"
-        command: "{{ app_run_command | default(omit) }}"
-        state: started
-        recreate: true
-        restart_policy: unless-stopped
-        detach: true
-        pull: false
-        published_ports: "{{ published_ports }}"
-        env: "{{ app_env | default({}) }}"
-        labels: "{{ final_label_map }}"
+    - name: Start target container
+      block:
+        - name: Start container "{{ container_name }}"
+          community.docker.docker_container:
+            name: "{{ container_name }}"
+            image: "{{ app_image }}"
+            command: "{{ app_run_command | default(omit) }}"
+            state: started
+            recreate: true
+            restart_policy: unless-stopped
+            detach: true
+            pull: false
+            published_ports: "{{ published_ports }}"
+            env: "{{ app_env | default({}) }}"
+            labels: "{{ final_label_map }}"
+      rescue:
+        - name: Collect container startup diagnostics
+          include_tasks: ../tasks/container_failure_diagnostics.yml
+
+        - name: OPERATION_STEP container:prepare failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"container:prepare","status":"failed","metadata":{"display_name":"Prepare container","reason_code":"container_start_failed"}}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Abort after container startup failure
+          fail:
+            msg: "Container startup failed."
 
     - name: OPERATION_STEP container:prepare complete
       shell: |
@@ -794,50 +819,65 @@
       args:
         executable: /bin/sh
 
-    - name: Verify health endpoint at {{ health_url_local }}
-      uri:
-        url: "{{ health_url_local }}"
-        method: GET
-        status_code: 200
-        timeout: 20
-      register: health_result_host
-      retries: 10
-      delay: 3
-      until: health_result_host.status == 200
-      when: effective_health_mode == 'host'
+    - name: Verify target container health
+      block:
+        - name: Verify health endpoint at {{ health_url_local }}
+          uri:
+            url: "{{ health_url_local }}"
+            method: GET
+            status_code: 200
+            timeout: 20
+          register: health_result_host
+          retries: 10
+          delay: 3
+          until: health_result_host.status == 200
+          when: effective_health_mode == 'host'
 
-    - name: Wait for Docker HEALTHCHECK status on "{{ container_name }}"
-      shell: |
-        docker inspect --format '{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{end}}{% endraw %}' "{{ container_name }}"
-      args:
-        executable: /bin/sh
-      register: docker_health_status
-      retries: 20
-      delay: 3
-      until: docker_health_status.stdout.strip() == "healthy"
-      when:
-        - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
-        - (docker_health_support.stdout | default('') | trim) == "yes"
+        - name: Wait for Docker HEALTHCHECK status on "{{ container_name }}"
+          shell: |
+            docker inspect --format '{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{end}}{% endraw %}' "{{ container_name }}"
+          args:
+            executable: /bin/sh
+          register: docker_health_status
+          retries: 20
+          delay: 3
+          until: docker_health_status.stdout.strip() == "healthy"
+          when:
+            - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
+            - (docker_health_support.stdout | default('') | trim) == "yes"
 
-    - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
-      shell: |
-        docker exec "{{ container_name }}" sh -c "wget -q --spider http://127.0.0.1:{{ container_health_port }}{{ health_container_path }}"
-      args:
-        executable: /bin/sh
-      register: container_health_exec
-      retries: 20
-      delay: 3
-      until: container_health_exec.rc == 0
-      when:
-        - effective_health_mode in ['container', 'traefik']
-        - health_mode != 'auto'
-        - (docker_health_support.stdout | default('') | trim) != "yes"
+        - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
+          shell: |
+            docker exec "{{ container_name }}" sh -c "wget -q --spider http://127.0.0.1:{{ container_health_port }}{{ health_container_path }}"
+          args:
+            executable: /bin/sh
+          register: container_health_exec
+          retries: 20
+          delay: 3
+          until: container_health_exec.rc == 0
+          when:
+            - effective_health_mode in ['container', 'traefik']
+            - health_mode != 'auto'
+            - (docker_health_support.stdout | default('') | trim) != "yes"
 
-    - name: OPERATION_STEP health:check complete
-      shell: |
-        printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
-      args:
-        executable: /bin/sh
+        - name: OPERATION_STEP health:check complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Collect container health diagnostics
+          include_tasks: ../tasks/container_failure_diagnostics.yml
+
+        - name: OPERATION_STEP health:check failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:check","status":"failed","metadata":{"display_name":"Check container health","reason_code":"container_health_failed"}}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Abort after container health failure
+          fail:
+            msg: "Container health verification failed."
 
     - name: OPERATION_STEP deploy:start complete
       shell: |

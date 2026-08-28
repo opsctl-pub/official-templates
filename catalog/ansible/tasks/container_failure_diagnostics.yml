@@ -1,0 +1,73 @@
+---
+- name: Collect bounded container failure diagnostics
+  shell: |
+    python3 - <<'PY'
+    import subprocess
+
+    container_name = {{ container_name | to_json }}
+    state_format = """{% raw %}status={{.State.Status}}
+    running={{.State.Running}}
+    exit_code={{.State.ExitCode}}
+    state_error={{json .State.Error}}
+    oom_killed={{.State.OOMKilled}}
+    restarting={{.State.Restarting}}
+    restart_count={{.RestartCount}}
+    health_status={{if .State.Health}}{{.State.Health.Status}}{{else}}unavailable{{end}}{% endraw %}"""
+
+    print("Container failure diagnostics:")
+    try:
+        state = subprocess.run(
+            ["docker", "inspect", "--format", state_format, container_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        state = None
+
+    if state is None or state.returncode != 0:
+        print("Container state unavailable.")
+    else:
+        print(state.stdout.strip() or "Container state unavailable.")
+
+    try:
+        logs = subprocess.run(
+            ["docker", "logs", "--tail", "100", container_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except Exception:
+        logs = None
+
+    if logs is None or logs.returncode != 0:
+        print("Container logs unavailable.")
+        raise SystemExit(0)
+
+    unique_lines = []
+    seen = set()
+    for line in logs.stdout.decode("utf-8", errors="replace").splitlines():
+        if line in seen:
+            continue
+        seen.add(line)
+        unique_lines.append(line)
+
+    if not unique_lines:
+        print("Container logs unavailable.")
+        raise SystemExit(0)
+
+    payload = "\n".join(unique_lines).encode("utf-8")
+    byte_limit = 16 * 1024
+    marker = b"\n... [truncated]"
+    if len(payload) > byte_limit:
+        payload = payload[:byte_limit - len(marker)]
+        payload = payload.decode("utf-8", errors="ignore").encode("utf-8")
+        payload = payload.rstrip(b"\r\n") + marker
+
+    print("Container log tail:")
+    print(payload.decode("utf-8", errors="replace"))
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
