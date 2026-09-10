@@ -1,0 +1,113 @@
+- name: Observe managed Traefik deployment backends
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    observed_backend_identities: []
+
+  tasks:
+    - name: Check for the managed route file
+      ansible.builtin.stat:
+        path: "/etc/traefik/dynamic/opsctl/deployment-{{ deployment_id }}.yml"
+      register: route_file
+      changed_when: false
+      no_log: true
+
+    - name: Read the managed route file
+      ansible.builtin.slurp:
+        src: "/etc/traefik/dynamic/opsctl/deployment-{{ deployment_id }}.yml"
+      register: route_file_content
+      changed_when: false
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Parse the managed route file
+      ansible.builtin.set_fact:
+        route_document: "{{ route_file_content.content | b64decode | from_yaml }}"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Validate the managed route document
+      ansible.builtin.assert:
+        that:
+          - route_document is mapping
+        fail_msg: "Managed Traefik route state is malformed"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Select the managed HTTP routes
+      ansible.builtin.set_fact:
+        route_http: "{{ route_document.get('http', {}) }}"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Validate the managed HTTP routes
+      ansible.builtin.assert:
+        that:
+          - route_http is mapping
+        fail_msg: "Managed Traefik route state is malformed"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Select the managed services
+      ansible.builtin.set_fact:
+        route_services: "{{ route_http.get('services', {}) }}"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Validate the managed services
+      ansible.builtin.assert:
+        that:
+          - route_services is mapping
+        fail_msg: "Managed Traefik route state is malformed"
+      no_log: true
+      when: route_file.stat.exists
+
+    - name: Select the exact managed service
+      ansible.builtin.set_fact:
+        route_service: >-
+          {{ route_services['deployment-' ~ deployment_id]
+             if route_file.stat.exists
+             and ('deployment-' ~ deployment_id) in route_services
+             else none }}
+      no_log: true
+
+    - name: Validate the managed service shape
+      ansible.builtin.assert:
+        that:
+          - route_service is mapping
+          - route_service.loadBalancer is mapping
+          - route_service.loadBalancer.servers is sequence
+          - route_service.loadBalancer.servers is not string
+          - route_service.loadBalancer.servers | select('mapping') | list | length == route_service.loadBalancer.servers | length
+          - route_service.loadBalancer.servers | map(attribute='url') | select('string') | list | length == route_service.loadBalancer.servers | length
+          - route_service.loadBalancer.servers | map(attribute='url') | map('trim') | reject('equalto', '') | list | length == route_service.loadBalancer.servers | length
+        fail_msg: "Managed Traefik backend state is malformed"
+      no_log: true
+      when: route_service is not none
+
+    - name: Normalize managed backend identities
+      ansible.builtin.set_fact:
+        observed_backend_identities: >-
+          {{ route_service.loadBalancer.servers
+             | map(attribute='url')
+             | map('trim')
+             | reject('equalto', '')
+             | unique
+             | sort
+             | list }}
+      no_log: true
+      when: route_service is not none
+
+    - name: Emit bounded routing observation
+      ansible.builtin.debug:
+        msg: >-
+          OPERATION_STEP={{ {
+            'name': 'routing_observation',
+            'status': 'completed',
+            'metadata': {
+              'internal': true,
+              'backend_identities': observed_backend_identities,
+              'backend_count': observed_backend_identities | length
+            }
+          } | to_json }}
