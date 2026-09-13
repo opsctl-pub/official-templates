@@ -1,0 +1,79 @@
+---
+- name: Apply one Cloudflare managed DNS change
+  uri:
+    url: >-
+      {{
+        cloudflare_api_base ~ '/zones/' ~ provider_zone_id ~ '/dns_records'
+        if dns_change.action == 'create'
+        else cloudflare_api_base ~ '/zones/' ~ provider_zone_id ~ '/dns_records/' ~ dns_change.provider_record_id
+      }}
+    method: "{{ {'create': 'POST', 'update': 'PUT', 'delete': 'DELETE'}[dns_change.action] }}"
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: >-
+      {{
+        omit
+        if dns_change.action == 'delete'
+        else {
+          'type': 'A',
+          'name': dns_change.hostname,
+          'content': dns_change.value,
+          'ttl': dns_change.ttl,
+          'proxied': false
+        }
+      }}
+    status_code: 200
+    return_content: true
+  register: dns_sync_apply_result
+  no_log: true
+
+- name: Assert the Cloudflare change succeeded
+  assert:
+    that:
+      - dns_sync_apply_result.json.success | default(false)
+    fail_msg: >-
+      {{
+        (
+          dns_sync_apply_result.json.errors[0].message
+          if (
+            dns_sync_apply_result.json.errors is defined and
+            (dns_sync_apply_result.json.errors | length) > 0 and
+            dns_sync_apply_result.json.errors[0].message is defined
+          )
+          else 'Cloudflare request failed'
+        )
+      }}
+
+- name: Accumulate the applied managed DNS change
+  set_fact:
+    dns_sync_applied_changes: >-
+      {{
+        dns_sync_applied_changes + [
+          {
+            "change_id": dns_change.change_id,
+            "action": dns_change.action,
+            "hostname": dns_change.hostname,
+            "record_type": dns_change.record_type,
+            "value": dns_change.value,
+            "ttl": dns_change.ttl,
+            "proxied": false,
+            "provider_record_id": (
+              dns_sync_apply_result.json.result.id
+              if (
+                dns_sync_apply_result.json.result is defined and
+                dns_sync_apply_result.json.result.id is defined
+              )
+              else dns_change.provider_record_id
+            ),
+            "deployment_id": dns_change.deployment_id | default(None),
+            "tracked_record_id": dns_change.tracked_record_id | default(None)
+          }
+        ]
+      }}
+
+- name: Emit cumulative structured DNS sync outputs
+  debug:
+    msg: >-
+      TEMPLATE_OUTPUT_JSON={{ {'applied_changes': dns_sync_applied_changes} | to_json }}

@@ -44,102 +44,17 @@
           set_fact:
             dns_sync_applied_changes: []
 
-        - name: Apply Cloudflare managed DNS changes
-          uri:
-            url: >-
-              {{
-                cloudflare_api_base ~ '/zones/' ~ provider_zone_id ~ '/dns_records'
-                if item.action == 'create'
-                else cloudflare_api_base ~ '/zones/' ~ provider_zone_id ~ '/dns_records/' ~ item.provider_record_id
-              }}
-            method: "{{ {'create': 'POST', 'update': 'PUT', 'delete': 'DELETE'}[item.action] }}"
-            headers:
-              Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
-              Content-Type: "application/json"
-            body_format: json
-            body: >-
-              {{
-                omit
-                if item.action == 'delete'
-                else {
-                  'type': 'A',
-                  'name': item.hostname,
-                  'content': item.value,
-                  'ttl': item.ttl,
-                  'proxied': false
-                }
-              }}
-            status_code: 200
-            return_content: true
+        - name: Apply and record Cloudflare managed DNS changes in order
+          include_tasks: dns_records_sync_change.yml
           loop: "{{ dns_changes }}"
           loop_control:
-            label: "{{ item.hostname }}:{{ item.action }}"
-          register: dns_sync_apply_results
-          no_log: true
-
-        - name: Accumulate applied managed DNS changes
-          set_fact:
-            dns_sync_applied_changes: >-
-              {{
-                dns_sync_applied_changes + [
-                  {
-                    "change_id": item.item.change_id,
-                    "action": item.item.action,
-                    "hostname": item.item.hostname,
-                    "record_type": item.item.record_type,
-                    "value": item.item.value,
-                    "ttl": item.item.ttl,
-                    "proxied": false,
-                    "provider_record_id": (
-                      item.json.result.id
-                      if (item.json.result is defined and item.json.result.id is defined)
-                      else item.item.provider_record_id
-                    ),
-                    "deployment_id": item.item.deployment_id | default(None),
-                    "tracked_record_id": item.item.tracked_record_id | default(None)
-                  }
-                ]
-              }}
-          loop: "{{ dns_sync_apply_results.results | default([]) }}"
-          loop_control:
-            label: "{{ item.item.hostname }}:{{ item.item.action }}"
-          when: item.json.success | default(false)
-
-        - name: Emit cumulative structured DNS sync outputs
-          shell: |
-            printf 'TEMPLATE_OUTPUT_JSON=%s\n' "{{ {'applied_changes': dns_sync_applied_changes} | to_json | replace('\"', '\\\"') }}"
-          args:
-            executable: /bin/sh
-          loop: "{{ dns_sync_apply_results.results | default([]) }}"
-          loop_control:
-            label: "{{ item.item.hostname }}:{{ item.item.action }}"
-          when: item.json.success | default(false)
-
-        - name: Assert each Cloudflare change succeeded
-          assert:
-            that:
-              - item.json.success | default(false)
-            fail_msg: >-
-              {{
-                (
-                  item.json.errors[0].message
-                  if (
-                    item.json.errors is defined and
-                    (item.json.errors | length) > 0 and
-                    item.json.errors[0].message is defined
-                  )
-                  else 'Cloudflare request failed'
-                )
-              }}
-          loop: "{{ dns_sync_apply_results.results | default([]) }}"
-          loop_control:
-            label: "{{ item.item.hostname }}:{{ item.item.action }}"
+            loop_var: dns_change
+            label: "{{ dns_change.hostname }}:{{ dns_change.action }}"
 
         - name: Emit final structured DNS sync outputs
-          shell: |
-            printf 'TEMPLATE_OUTPUT_JSON=%s\n' "{{ {'applied_changes': dns_sync_applied_changes} | to_json | replace('\"', '\\\"') }}"
-          args:
-            executable: /bin/sh
+          debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'applied_changes': dns_sync_applied_changes} | to_json }}
 
         - name: OPERATION_STEP dns_sync:complete
           shell: |
@@ -148,10 +63,9 @@
             executable: /bin/sh
       rescue:
         - name: Emit partial structured DNS sync outputs after failure
-          shell: |
-            printf 'TEMPLATE_OUTPUT_JSON=%s\n' "{{ {'applied_changes': dns_sync_applied_changes | default([])} | to_json | replace('\"', '\\\"') }}"
-          args:
-            executable: /bin/sh
+          debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'applied_changes': dns_sync_applied_changes | default([])} | to_json }}
 
         - name: OPERATION_STEP dns_sync:failure
           shell: |
