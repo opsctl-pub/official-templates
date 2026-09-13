@@ -35,10 +35,10 @@
               - (item.action | string) in ["create", "update", "delete"]
               - (item.record_type | string | upper) == "A"
               - not (item.proxied | default(false) | bool)
+            fail_msg: "F-1 supports Cloudflare A records in DNS-only mode only"
           loop: "{{ dns_changes }}"
           loop_control:
             label: "{{ item.hostname }}:{{ item.action }}"
-          fail_msg: "F-1 supports Cloudflare A records in DNS-only mode only"
 
         - name: Initialize applied changes accumulator
           set_fact:
