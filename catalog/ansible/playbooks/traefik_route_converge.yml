@@ -7,7 +7,9 @@
     traefik_container_name: "traefik"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_key: "deployment-{{ deployment_id }}"
     route_tls_cert_resolver: "letsencrypt"
+    resolved_route_state: "{{ route_state | default('present', true) }}"
     resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
     resolved_route_middlewares: "{{ route_middlewares | default([], true) }}"
     traefik_backends:
@@ -41,10 +43,12 @@
           - route_port > 0
           - route_port <= 65535
           - route_https is boolean
+          - resolved_route_state in ['present', 'absent']
           - route_tls_cert_resolver == 'letsencrypt'
           - resolved_route_hosts is sequence
           - resolved_route_hosts is not string
-          - (resolved_route_hosts | length) > 0
+          - (resolved_route_state == 'absent') or ((resolved_route_hosts | length) > 0)
+          - (resolved_route_state == 'present') or ((resolved_route_hosts | length) == 0)
           - (resolved_route_hosts | length) <= 100
           - (resolved_route_hosts | unique | list | length) == (resolved_route_hosts | length)
           - resolved_route_middlewares is sequence
@@ -52,6 +56,16 @@
           - (resolved_route_middlewares | length) <= 50
           - (resolved_route_middlewares | unique | list | length) == (resolved_route_middlewares | length)
         fail_msg: "Traefik route identity is missing or malformed"
+
+    - name: Validate optional route comparison evidence
+      assert:
+        that:
+          - expected_route_observation is mapping
+          - expected_route_observation.keys() | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'route_port']
+          - expected_route_observation.presence in ['present', 'absent']
+          - expected_route_observation.digest is match('^[0-9a-f]{64}$')
+        fail_msg: "Traefik route comparison evidence is invalid"
+      when: expected_route_observation is defined
 
     - name: Validate normalized route hostnames before mutation
       assert:
@@ -64,6 +78,7 @@
       loop: "{{ resolved_route_hosts }}"
       loop_control:
         label: "route host"
+      when: resolved_route_state == 'present'
 
     - name: Validate route middleware references before mutation
       assert:
@@ -77,13 +92,25 @@
       loop: "{{ resolved_route_middlewares }}"
       loop_control:
         label: "middleware"
+      when: resolved_route_state == 'present'
 
   tasks:
+    - name: Read normalized deployment route before mutation
+      include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
+
+    - name: Reject changed deployment route before mutation
+      assert:
+        that:
+          - route_observation == expected_route_observation
+        fail_msg: "Managed Traefik route changed before configuration"
+      no_log: true
+      when: expected_route_observation is defined
+
     - name: OPERATION_STEP traefik-route:start
       shell: |
         printf 'OPERATION_STEP={"name":"traefik-route:start","status":"running","metadata":{"display_name":"Configure Traefik route","deployment_id":"%s","host_count":%s,"route_port":%s,"https":%s}}\n' \
           "{{ deployment_id }}" \
-          "{{ resolved_route_hosts | length }}" \
+          "{{ resolved_route_hosts | length if resolved_route_state == 'present' else 0 }}" \
           "{{ route_port }}" \
           "{{ 'true' if route_https else 'false' }}"
       args:
@@ -91,42 +118,21 @@
 
     - name: Converge managed Traefik route
       block:
-        - name: Inspect existing Traefik container
-          community.docker.docker_container_info:
-            name: "{{ traefik_container_name }}"
-          register: traefik_container_info
-
-        - name: Extract existing Traefik container details
-          set_fact:
-            existing_traefik: >-
-              {{
-                (traefik_container_info.get('containers', []) | first)
-                if ((traefik_container_info.get('containers', []) | length) > 0)
-                else (traefik_container_info.get('container', None))
-              }}
-
-        - name: Validate managed watched Traefik runtime
+        - name: Validate HTTPS resolver configuration
           assert:
             that:
-              - existing_traefik is not none
-              - existing_traefik.State.Status == 'running'
-              - existing_traefik.HostConfig.NetworkMode == 'host'
-              - existing_traefik.Config.Labels.get('com.opsctl.managed') == 'true'
-              - existing_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
-              - existing_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
-              - traefik_dynamic_dir in (existing_traefik.Mounts | default([]) | map(attribute='Destination') | list)
-              - "'--providers.file.directory=/etc/traefik/dynamic/opsctl' in (existing_traefik.Config.Cmd | default([]))"
-              - "'--providers.file.watch=true' in (existing_traefik.Config.Cmd | default([]))"
               - "(not route_https) or ((existing_traefik.Config.Cmd | default([]) | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.email=.+$') | list | length) == 1)"
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json' in (existing_traefik.Config.Cmd | default([])))"
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in (existing_traefik.Config.Cmd | default([])))"
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in (existing_traefik.Config.Cmd | default([])))"
             fail_msg: "Managed Traefik gateway is not ready for this organization"
+          no_log: true
 
         - name: Verify watched dynamic directory exists
           stat:
             path: "{{ traefik_dynamic_dir }}"
           register: traefik_dynamic_dir_stat
+          no_log: true
 
         - name: Reject missing watched dynamic directory
           assert:
@@ -134,6 +140,14 @@
               - traefik_dynamic_dir_stat.stat.exists
               - traefik_dynamic_dir_stat.stat.isdir
             fail_msg: "Managed Traefik route directory is unavailable"
+          no_log: true
+
+        - name: Remove exact deployment route
+          file:
+            path: "{{ route_file_path }}"
+            state: absent
+          when: resolved_route_state == 'absent'
+          no_log: true
 
         - name: Create unique staged route file
           tempfile:
@@ -142,6 +156,8 @@
             prefix: ".deployment-{{ deployment_id }}."
             suffix: ".yml"
           register: staged_route_file
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: Stage deterministic deployment route content
           template:
@@ -150,15 +166,21 @@
             owner: root
             group: root
             mode: "0644"
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: Read staged deployment route
           slurp:
             path: "{{ staged_route_file.path }}"
           register: staged_route_content
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: Parse staged deployment route
           set_fact:
             staged_route_config: "{{ staged_route_content.content | b64decode | from_yaml }}"
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: Validate staged deployment route structure
           assert:
@@ -176,6 +198,8 @@
               - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls.certResolver == route_tls_cert_resolver
               - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
             fail_msg: "Rendered Traefik route is malformed"
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: Atomically activate deployment route
           command:
@@ -184,12 +208,14 @@
               - --
               - "{{ staged_route_file.path }}"
               - "{{ route_file_path }}"
+          when: resolved_route_state == 'present'
+          no_log: true
 
         - name: OPERATION_STEP traefik-route:complete
           shell: |
             printf 'OPERATION_STEP={"name":"traefik-route:complete","status":"completed","metadata":{"display_name":"Traefik route ready","deployment_id":"%s","host_count":%s,"route_port":%s,"https":%s}}\n' \
               "{{ deployment_id }}" \
-              "{{ resolved_route_hosts | length }}" \
+              "{{ resolved_route_hosts | length if resolved_route_state == 'present' else 0 }}" \
               "{{ route_port }}" \
               "{{ 'true' if route_https else 'false' }}"
           args:
@@ -202,6 +228,7 @@
           when:
             - staged_route_file is defined
             - staged_route_file.path is defined
+          no_log: true
 
         - name: OPERATION_STEP traefik-route:failure
           shell: |

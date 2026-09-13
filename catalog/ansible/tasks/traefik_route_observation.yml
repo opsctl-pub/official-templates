@@ -1,0 +1,153 @@
+---
+- name: Inspect managed Traefik gateway
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: traefik_container_info
+  no_log: true
+
+- name: Read managed Traefik gateway identity
+  set_fact:
+    existing_traefik: >-
+      {{
+        (traefik_container_info.get('containers', []) | first)
+        if ((traefik_container_info.get('containers', []) | length) > 0)
+        else (traefik_container_info.get('container', None))
+      }}
+  no_log: true
+
+- name: Validate managed watched Traefik runtime
+  assert:
+    that:
+      - existing_traefik is not none
+      - existing_traefik.State.Status == 'running'
+      - existing_traefik.HostConfig.NetworkMode == 'host'
+      - existing_traefik.Config.Labels.get('com.opsctl.managed') == 'true'
+      - existing_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+      - existing_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
+      - traefik_dynamic_dir in (existing_traefik.Mounts | default([]) | map(attribute='Destination') | list)
+      - "'--providers.file.directory=/etc/traefik/dynamic/opsctl' in (existing_traefik.Config.Cmd | default([]))"
+      - "'--providers.file.watch=true' in (existing_traefik.Config.Cmd | default([]))"
+    fail_msg: "Managed Traefik gateway is unavailable"
+  no_log: true
+
+- name: Inspect exact deployment route file
+  stat:
+    path: "{{ route_file_path }}"
+  register: route_file
+  no_log: true
+
+- name: Set absent route observation
+  set_fact:
+    route_observation_base:
+      presence: absent
+      hosts: []
+      route_port: null
+      https: null
+      middlewares: []
+      backend_identity_class: null
+  when: not route_file.stat.exists
+  no_log: true
+
+- name: Read and normalize present deployment route
+  when: route_file.stat.exists
+  no_log: true
+  block:
+    - name: Validate exact deployment route file type
+      assert:
+        that:
+          - route_file.stat.isreg
+          - not route_file.stat.islnk
+        fail_msg: "Managed Traefik route is not a regular file"
+
+    - name: Read exact deployment route content
+      slurp:
+        path: "{{ route_file_path }}"
+      register: route_content
+
+    - name: Parse exact deployment route content
+      set_fact:
+        route_config: "{{ route_content.content | b64decode | from_yaml }}"
+
+    - name: Read exact router and service
+      set_fact:
+        route_router: "{{ route_config.http.routers[route_key] }}"
+        route_service: "{{ route_config.http.services[route_key] }}"
+
+    - name: Read normalized route host candidates
+      set_fact:
+        observed_route_hosts: "{{ route_router.rule | regex_findall('`([^`]+)`') | sort }}"
+
+    - name: Validate exact managed route structure
+      assert:
+        that:
+          - route_config is mapping
+          - route_config.keys() | list == ['http']
+          - route_config.http is mapping
+          - route_config.http.keys() | sort == ['routers', 'services']
+          - route_config.http.routers is mapping
+          - route_config.http.services is mapping
+          - route_config.http.routers.keys() | list == [route_key]
+          - route_config.http.services.keys() | list == [route_key]
+          - route_router is mapping
+          - (route_router.keys() | difference(['entryPoints', 'middlewares', 'priority', 'rule', 'service', 'tls']) | length) == 0
+          - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
+          - route_router.service == route_key
+          - route_router.rule is string
+          - route_router.rule is match('^Host\(`[^`]+`(?:,`[^`]+`)*\)$')
+          - (observed_route_hosts | length) > 0
+          - (observed_route_hosts | unique | list | length) == (observed_route_hosts | length)
+          - (observed_route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (observed_route_hosts | length)
+          - route_router.priority == 1000
+          - route_router.entryPoints in [['web'], ['websecure']]
+          - (route_router.entryPoints == ['websecure']) == ('tls' in route_router)
+          - ('tls' not in route_router) or (route_router.tls is mapping)
+          - ('tls' not in route_router) or ((route_router.tls.keys() | difference(['certResolver']) | length) == 0)
+          - ('tls' not in route_router) or ('certResolver' not in route_router.tls) or (route_router.tls.certResolver is string)
+          - ('tls' not in route_router) or ('certResolver' not in route_router.tls) or ((route_router.tls.certResolver | trim | length) > 0)
+          - route_service is mapping
+          - route_service.keys() | list == ['loadBalancer']
+          - route_service.loadBalancer is mapping
+          - route_service.loadBalancer.keys() | sort == ['passHostHeader', 'servers']
+          - route_service.loadBalancer.passHostHeader is sameas true
+          - route_service.loadBalancer.servers | length == 1
+          - route_service.loadBalancer.servers[0] is mapping
+          - route_service.loadBalancer.servers[0].keys() | list == ['url']
+          - route_service.loadBalancer.servers[0].url is match('^http://127\.0\.0\.1:[0-9]+$')
+          - (route_router.middlewares | default([])) is sequence
+          - (route_router.middlewares | default([])) is not string
+        fail_msg: "Managed Traefik route is malformed"
+
+    - name: Normalize exact managed route
+      set_fact:
+        route_observation_base:
+          presence: present
+          hosts: "{{ observed_route_hosts }}"
+          route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://127\\.0\\.0\\.1:', '') | int }}"
+          https: "{{ 'tls' in route_router }}"
+          middlewares: "{{ route_router.middlewares | default([]) }}"
+          backend_identity_class: loopback
+  rescue:
+    - name: Set unknown route observation
+      set_fact:
+        route_observation_base:
+          presence: unknown
+          hosts: []
+          route_port: null
+          https: null
+          middlewares: []
+          backend_identity_class: null
+
+- name: Add deterministic route observation digest
+  set_fact:
+    route_observation: >-
+      {{
+        route_observation_base
+        | combine({
+            'digest': (
+              route_observation_base
+              | to_json(sort_keys=True, separators=[',', ':'])
+              | hash('sha256')
+            )
+          })
+      }}
+  no_log: true

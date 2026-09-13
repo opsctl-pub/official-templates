@@ -1,0 +1,33 @@
+---
+- name: Observe one managed Traefik deployment route
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_key: "deployment-{{ deployment_id }}"
+  pre_tasks:
+    - name: Validate route observation identity
+      assert:
+        that:
+          - org_id is defined
+          - org_id is string
+          - org_id == (org_id | trim)
+          - (org_id | length) > 0
+          - deployment_id is defined
+          - deployment_id is string
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+        fail_msg: "Traefik route observation identity is invalid"
+
+  tasks:
+    - name: Read normalized deployment route
+      include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
+
+    - name: Emit normalized deployment route observation
+      debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{
+            {'deployment_route_observation': route_observation} | to_json
+          }}
