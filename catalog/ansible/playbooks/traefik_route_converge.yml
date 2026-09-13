@@ -17,7 +17,7 @@
       meta: end_play
       when: simulate | default(false)
 
-    - name: Validate bounded route identity before mutation
+    - name: Validate route configuration before mutation
       assert:
         that:
           - org_id is defined
@@ -73,7 +73,7 @@
           - (item | length) > 0
           - (item | length) <= 255
           - item is match('^[A-Za-z0-9_.@-]+$')
-        fail_msg: "Traefik middleware references must be normalized and bounded"
+        fail_msg: "Traefik middleware names are invalid"
       loop: "{{ resolved_route_middlewares }}"
       loop_control:
         label: "middleware"
@@ -121,7 +121,7 @@
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json' in (existing_traefik.Config.Cmd | default([])))"
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in (existing_traefik.Config.Cmd | default([])))"
               - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in (existing_traefik.Config.Cmd | default([])))"
-            fail_msg: "Canonical managed Traefik file watcher is not running for this organization"
+            fail_msg: "Managed Traefik gateway is not ready for this organization"
 
         - name: Verify watched dynamic directory exists
           stat:
@@ -133,7 +133,7 @@
             that:
               - traefik_dynamic_dir_stat.stat.exists
               - traefik_dynamic_dir_stat.stat.isdir
-            fail_msg: "Canonical Traefik dynamic directory is unavailable"
+            fail_msg: "Managed Traefik route directory is unavailable"
 
         - name: Create unique staged route file
           tempfile:
