@@ -6,6 +6,7 @@
     timeout_s: 60
     resolved_health_mode: "{{ health_mode | default('http') }}"
     resolved_expected_status: "{{ expected_status | default(200) | int }}"
+    resolved_health_validate_certs: "{{ health_validate_certs | default(true) }}"
   tasks:
     - name: Validate health verification mode
       assert:
@@ -25,20 +26,23 @@
         - name: Validate direct HTTP assertion inputs
           assert:
             that:
-              - health_url is match('^http://127\\.0\\.0\\.1:[0-9]+/.*$')
+              - health_url is match('^https?://127\\.0\\.0\\.1:[0-9]+/.*$')
               - resolved_expected_status >= 100
               - resolved_expected_status <= 599
+              - resolved_health_validate_certs is boolean
+              - health_url is match('^https://') or resolved_health_validate_certs
               - body_contains is not defined or (body_contains is string and body_contains | length > 0 and body_contains | length <= 1024)
-            fail_msg: "Direct health assertion inputs are invalid"
+            fail_msg: "HTTP health endpoint settings are invalid"
           when: resolved_health_mode == 'http'
 
-        - name: Check bounded HTTP health
+        - name: Check HTTP health endpoint
           ansible.builtin.command:
             argv:
               - python3
               - -c
               - |
                 import json
+                import ssl
                 import sys
                 import urllib.error
                 import urllib.request
@@ -47,8 +51,9 @@
                     def redirect_request(self, req, fp, code, msg, headers, newurl):
                         return None
 
-                url, expected_raw, needle, headers_raw = sys.argv[1:5]
+                url, expected_raw, needle, headers_raw, validate_raw = sys.argv[1:6]
                 expected = int(expected_raw)
+                validate_certs = validate_raw == "true"
                 result = {
                     "body_match": needle == "",
                     "error_code": "connection_failed",
@@ -59,7 +64,17 @@
                     if not isinstance(headers, dict):
                         raise ValueError("health headers must be an object")
                     request = urllib.request.Request(url, headers=headers)
-                    opener = urllib.request.build_opener(NoRedirectHandler())
+                    handlers = [NoRedirectHandler()]
+                    if url.startswith("https://") and not validate_certs:
+                        ssl_context = ssl.create_default_context()
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+                        handlers.append(
+                            urllib.request.HTTPSHandler(
+                                context=ssl_context
+                            )
+                        )
+                    opener = urllib.request.build_opener(*handlers)
                     try:
                         response = opener.open(request, timeout=6)
                     except urllib.error.HTTPError as error:
@@ -92,6 +107,7 @@
               - "{{ resolved_expected_status }}"
               - "{{ body_contains | default('') }}"
               - "{{ health_headers | default({}) | to_json }}"
+              - "{{ resolved_health_validate_certs | bool | lower }}"
           register: _resp
           changed_when: false
           no_log: true
@@ -100,7 +116,7 @@
           until: _resp.rc == 0
           when: resolved_health_mode == 'http'
 
-        - name: Project bounded HTTP health evidence
+        - name: Read HTTP health result
           ansible.builtin.set_fact:
             _health_result: "{{ _resp.stdout | from_json }}"
           when: resolved_health_mode == 'http'
@@ -135,20 +151,24 @@
             executable: /bin/sh
           when: resolved_health_mode == 'tcp_connect'
       rescue:
-        - name: Project bounded HTTP failure evidence
+        - name: Read failed HTTP health result
           ansible.builtin.set_fact:
             _health_result: "{{ _resp.stdout | default('{\"status\":0,\"body_match\":false,\"error_code\":\"probe_failed\"}') | from_json }}"
           when: resolved_health_mode == 'http'
 
-        - name: OPERATION_STEP health:failure
+        - name: OPERATION_STEP health:failure http
           shell: |
-            if [ "{{ resolved_health_mode }}" = "tcp_connect" ]; then
-              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
-            else
-              printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
-            fi
+            printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
           args:
             executable: /bin/sh
+          when: resolved_health_mode == 'http'
+
+        - name: OPERATION_STEP health:failure tcp
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'tcp_connect'
 
         - name: Fail health verification
           fail:
