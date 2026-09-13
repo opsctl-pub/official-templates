@@ -1,0 +1,309 @@
+---
+- name: Observe automatic HTTPS for one managed Traefik deployment route
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_key: "deployment-{{ deployment_id }}"
+  pre_tasks:
+    - name: Validate HTTPS observation identity
+      ansible.builtin.assert:
+        that:
+          - adapter_key == 'traefik_acme_http01'
+          - certificate_mode == 'automatic'
+          - challenge_type == 'http-01'
+          - resolver_name == 'letsencrypt'
+          - renewal_due_days == 30
+          - org_id is string
+          - org_id == (org_id | trim)
+          - (org_id | length) > 0
+          - deployment_id is string
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - gateway_id is string
+          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - server_id is string
+          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - route_hosts is sequence
+          - route_hosts is not string
+          - (route_hosts | length) > 0
+          - (route_hosts | length) <= 100
+          - route_hosts == (route_hosts | unique | sort | list)
+          - (route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (route_hosts | length)
+          - not (simulate | default(false) | bool)
+        fail_msg: "HTTPS observation identity is invalid"
+
+  tasks:
+    - name: Read managed route and resolver binding
+      no_log: true
+      block:
+        - name: Read normalized deployment route
+          ansible.builtin.include_tasks: >-
+            {{ playbook_dir }}/../tasks/traefik_route_observation.yml
+
+        - name: Read resolver command evidence
+          ansible.builtin.set_fact:
+            resolver_email_arguments: >-
+              {{
+                existing_traefik.Config.Cmd | default([])
+                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.email=.+$')
+                | list
+              }}
+            resolver_storage_arguments: >-
+              {{
+                existing_traefik.Config.Cmd | default([])
+                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.storage=.+$')
+                | list
+              }}
+            resolver_challenge_arguments: >-
+              {{
+                existing_traefik.Config.Cmd | default([])
+                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.httpchallenge=true$')
+                | list
+              }}
+            resolver_entrypoint_arguments: >-
+              {{
+                existing_traefik.Config.Cmd | default([])
+                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.httpchallenge\\.entrypoint=web$')
+                | list
+              }}
+
+        - name: Normalize resolver and route evidence
+          ansible.builtin.set_fact:
+            resolver_configured: >-
+              {{
+                (resolver_email_arguments | length) == 1
+                and resolver_storage_arguments == [
+                  '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
+                ]
+                and (resolver_challenge_arguments | length) == 1
+                and (resolver_entrypoint_arguments | length) == 1
+                and '/var/lib/traefik' in (
+                  existing_traefik.Mounts | default([])
+                  | map(attribute='Destination') | list
+                )
+              }}
+            resolver_bound: >-
+              {{
+                route_observation.presence == 'present'
+                and route_observation.hosts == route_hosts
+                and route_observation.https is sameas true
+                and route_router.tls is mapping
+                and route_router.tls.keys() | list == ['certResolver']
+                and route_router.tls.certResolver == resolver_name
+              }}
+            observation_structure_valid: true
+      rescue:
+        - name: Mark unrecognized gateway or route evidence
+          ansible.builtin.set_fact:
+            resolver_configured: false
+            resolver_bound: false
+            observation_structure_valid: false
+
+    - name: Probe exact route certificates on the loopback HTTPS listener
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import hashlib
+            import json
+            import socket
+            import ssl
+            import sys
+            from datetime import datetime, timedelta, timezone
+
+            hosts = json.loads(sys.argv[1])
+            renewal_window = timedelta(days=int(sys.argv[2]))
+            now = datetime.now(timezone.utc)
+
+            def utc_text(value):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            def connect(context, hostname):
+                with socket.create_connection(('127.0.0.1', 443), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname=hostname) as tls:
+                        return tls.getpeercert(), tls.getpeercert(binary_form=True)
+
+            observations = []
+            for hostname in hosts:
+                trusted = None
+                status = 'installation_failed'
+                verify_code = None
+                certificate_metadata = None
+                certificate_der = None
+                try:
+                    certificate_metadata, certificate_der = connect(
+                        ssl.create_default_context(),
+                        hostname,
+                    )
+                    trusted = True
+                except ssl.SSLCertVerificationError as exc:
+                    trusted = False
+                    verify_code = exc.verify_code
+                except (OSError, ssl.SSLError):
+                    pass
+
+                if certificate_der is None:
+                    try:
+                        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        _, certificate_der = connect(context, hostname)
+                    except (OSError, ssl.SSLError):
+                        certificate_der = None
+
+                fingerprint = None
+                not_before = None
+                not_after = None
+                renewal_due = None
+                if certificate_der is not None:
+                    fingerprint = hashlib.sha256(certificate_der).hexdigest()
+
+                if certificate_der is not None and trusted and certificate_metadata:
+                    certificate_not_before = datetime.fromtimestamp(
+                        ssl.cert_time_to_seconds(certificate_metadata['notBefore']),
+                        tz=timezone.utc,
+                    )
+                    certificate_not_after = datetime.fromtimestamp(
+                        ssl.cert_time_to_seconds(certificate_metadata['notAfter']),
+                        tz=timezone.utc,
+                    )
+                    not_before = utc_text(certificate_not_before)
+                    not_after = utc_text(certificate_not_after)
+                    renewal_due = certificate_not_after <= now + renewal_window
+                    status = 'renewal_due' if renewal_due else 'active'
+                elif certificate_der is not None and verify_code == 10:
+                    status = 'expired'
+                elif certificate_der is not None and verify_code == 62:
+                    status = 'hostname_mismatch'
+                elif certificate_der is not None:
+                    status = 'pending'
+
+                observations.append({
+                    'hostname': hostname,
+                    'status': status,
+                    'trusted': trusted,
+                    'fingerprint_sha256': fingerprint,
+                    'not_before': not_before,
+                    'not_after': not_after,
+                    'renewal_due': renewal_due,
+                })
+
+            print(json.dumps(observations, sort_keys=True, separators=(',', ':')))
+          - "{{ route_hosts | to_json }}"
+          - "{{ renewal_due_days | string }}"
+      register: certificate_probe
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: observation_structure_valid
+
+    - name: Read bounded certificate probe result
+      no_log: true
+      block:
+        - name: Validate certificate probe completion
+          ansible.builtin.assert:
+            that:
+              - certificate_probe.rc == 0
+              - certificate_probe.stdout is string
+              - (certificate_probe.stdout | length) <= 65536
+            fail_msg: "Certificate observation failed"
+
+        - name: Parse certificate probe result
+          ansible.builtin.set_fact:
+            certificate_hosts: "{{ certificate_probe.stdout | from_json }}"
+
+        - name: Validate certificate probe shape
+          ansible.builtin.assert:
+            that:
+              - certificate_hosts is sequence
+              - certificate_hosts is not string
+              - (certificate_hosts | length) == (route_hosts | length)
+              - (certificate_hosts | map(attribute='hostname') | list) == route_hosts
+            fail_msg: "Certificate observation result is invalid"
+      rescue:
+        - name: Mark failed certificate probe
+          ansible.builtin.set_fact:
+            observation_structure_valid: false
+            certificate_hosts: []
+      when: observation_structure_valid
+
+    - name: Build unknown per-host observations
+      ansible.builtin.set_fact:
+        certificate_hosts: >-
+          {{
+            (certificate_hosts | default([]))
+            + [{
+              'hostname': item,
+              'status': 'unknown',
+              'trusted': None,
+              'fingerprint_sha256': None,
+              'not_before': None,
+              'not_after': None,
+              'renewal_due': None
+            }]
+          }}
+      loop: "{{ route_hosts }}"
+      no_log: true
+      when: not observation_structure_valid
+
+    - name: Classify aggregate HTTPS observation
+      ansible.builtin.set_fact:
+        certificate_status: >-
+          {%- set statuses = certificate_hosts | map(attribute='status') | list -%}
+          {%- if not observation_structure_valid -%}unknown
+          {%- elif not resolver_configured -%}not_configured
+          {%- elif not resolver_bound -%}installation_failed
+          {%- elif 'expired' in statuses -%}expired
+          {%- elif 'hostname_mismatch' in statuses -%}hostname_mismatch
+          {%- elif 'installation_failed' in statuses -%}installation_failed
+          {%- elif 'renewal_failed' in statuses -%}renewal_failed
+          {%- elif 'unknown' in statuses -%}unknown
+          {%- elif 'pending' in statuses -%}pending
+          {%- elif 'renewal_due' in statuses -%}renewal_due
+          {%- elif statuses | unique | list == ['active'] -%}active
+          {%- else -%}unknown
+          {%- endif -%}
+        certificate_observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      no_log: true
+
+    - name: Build normalized HTTPS observation
+      ansible.builtin.set_fact:
+        certificate_observation_base:
+          adapter_key: "{{ adapter_key }}"
+          mode: "{{ certificate_mode }}"
+          route_hosts: "{{ route_hosts }}"
+          challenge_type: "{{ challenge_type }}"
+          resolver_configured: "{{ resolver_configured | bool }}"
+          resolver_bound: "{{ resolver_bound | bool }}"
+          status: "{{ certificate_status }}"
+          hosts: "{{ certificate_hosts }}"
+          observed_at: "{{ certificate_observed_at }}"
+      no_log: true
+
+    - name: Add deterministic HTTPS observation digest
+      ansible.builtin.set_fact:
+        certificate_observation: >-
+          {{
+            certificate_observation_base
+            | combine({
+                'digest': (
+                  certificate_observation_base
+                  | to_json(sort_keys=True, separators=[',', ':'])
+                  | hash('sha256')
+                )
+              })
+          }}
+      no_log: true
+
+    - name: Emit normalized HTTPS observation
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{
+            {'certificate_observation': certificate_observation} | to_json
+          }}
