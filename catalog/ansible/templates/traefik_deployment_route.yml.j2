@@ -10,7 +10,12 @@ http:
       entryPoints:
 {% if route_https | default(true) %}
         - websecure
+{% if route_tls_cert_resolver is defined and (route_tls_cert_resolver | string | length) > 0 %}
+      tls:
+        certResolver: {{ route_tls_cert_resolver }}
+{% else %}
       tls: {}
+{% endif %}
 {% else %}
         - web
 {% endif %}

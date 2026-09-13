@@ -8,10 +8,12 @@
     router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
     health_path: "{{ app_health_path | default('/health') }}"
     host_health_port: "{{ app_health_port | default(app_ports[0]) }}"
-    traefik_enabled: "{{ app_traefik_enabled | default(false) | bool }}"
+    exposure_mode: "{{ backend_exposure_mode | default('host') }}"
+    loopback_backend_enabled: "{{ exposure_mode == 'loopback' }}"
+    traefik_enabled: "{{ (app_traefik_enabled | default(false) | bool) and not loopback_backend_enabled }}"
     traefik_hosts: "{{ app_traefik_hosts | default(([app_traefik_host] if (app_traefik_host is defined and (app_traefik_host | string | length) > 0) else []), true) }}"
     traefik_rule: "{{ 'Host(' ~ (traefik_hosts | map('regex_replace', '^(.*)$', '`\\1`') | join(',')) ~ ')' }}"
-    wireguard_backend_enabled: "{{ (backend_exposure_mode | default('host')) == 'wireguard' }}"
+    wireguard_backend_enabled: "{{ exposure_mode == 'wireguard' }}"
     backend_wireguard_ip: "{{ wireguard_ip | default('') }}"
     backend_route_port: "{{ route_port | default(None, true) }}"
     backend_container_port: "{{ container_port | default(None, true) }}"
@@ -37,6 +39,24 @@
     final_label_map: "{{ opsctl_label_map }}"
     deploy_host_ports: []
     health_strategy: "running"
+  pre_tasks:
+    - name: Validate backend exposure mode before mutation
+      assert:
+        that:
+          - exposure_mode in ['host', 'wireguard', 'loopback']
+        fail_msg: "backend_exposure_mode must be host, wireguard, or loopback"
+
+    - name: Validate loopback backend mapping before mutation
+      assert:
+        that:
+          - backend_route_port is not none
+          - backend_container_port is not none
+          - (backend_route_port | int) > 0
+          - (backend_route_port | int) <= 65535
+          - (backend_container_port | int) > 0
+          - (backend_container_port | int) <= 65535
+        fail_msg: "route_port and container_port are required for backend_exposure_mode=loopback"
+      when: loopback_backend_enabled
   tasks:
     - name: Ensure container health port derived when missing
       set_fact:
@@ -61,11 +81,18 @@
           - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
       when: wireguard_backend_enabled
 
+    - name: Derive published port for loopback backend exposure
+      set_fact:
+        published_ports:
+          - "127.0.0.1:{{ backend_route_port }}:{{ backend_container_port }}"
+      when: loopback_backend_enabled
+
     - name: Derive published ports for Traefik-routed deploy
       set_fact:
         published_ports: []
       when:
         - not wireguard_backend_enabled
+        - not loopback_backend_enabled
         - traefik_enabled
 
     - name: Derive published ports for direct host exposure
@@ -78,6 +105,7 @@
           }}
       when:
         - not wireguard_backend_enabled
+        - not loopback_backend_enabled
         - not traefik_enabled
 
     - name: OPERATION_STEP start
@@ -113,7 +141,12 @@
 
     - name: Capture host ports for baseline preflight
       set_fact:
-        deploy_host_ports: "{{ published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list }}"
+        deploy_host_ports: >-
+          {{
+            [backend_route_port]
+            if loopback_backend_enabled
+            else (published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list)
+          }}
       when:
         - not traefik_enabled
         - not wireguard_backend_enabled
@@ -246,7 +279,7 @@
         - not traefik_enabled
         - not wireguard_backend_enabled
         - (port_conflict_entries | length) > 0
-        - not (replace_conflicts | default(false) | bool)
+        - loopback_backend_enabled or not (replace_conflicts | default(false) | bool)
 
     - name: Determine removable conflict containers
       shell: |

@@ -1,0 +1,214 @@
+---
+- name: Converge one same-server Traefik deployment route
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_tls_cert_resolver: "letsencrypt"
+    resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+    resolved_route_middlewares: "{{ route_middlewares | default([], true) }}"
+    traefik_backends:
+      - url: "http://127.0.0.1:{{ route_port }}"
+  pre_tasks:
+    - name: Skip Traefik route converge in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
+    - name: Validate bounded route identity before mutation
+      assert:
+        that:
+          - org_id is defined
+          - org_id is string
+          - (org_id | trim | length) > 0
+          - deployment_id is defined
+          - deployment_id is string
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - app_slug is defined
+          - app_slug is string
+          - app_slug == (app_slug | trim)
+          - (app_slug | trim | length) > 0
+          - (app_slug | length) <= 255
+          - app_container_name is defined
+          - app_container_name is string
+          - app_container_name == (app_container_name | trim)
+          - (app_container_name | trim | length) > 0
+          - (app_container_name | length) <= 255
+          - route_port is defined
+          - route_port is integer
+          - route_port > 0
+          - route_port <= 65535
+          - route_https is boolean
+          - route_tls_cert_resolver == 'letsencrypt'
+          - resolved_route_hosts is sequence
+          - resolved_route_hosts is not string
+          - (resolved_route_hosts | length) > 0
+          - (resolved_route_hosts | length) <= 100
+          - (resolved_route_hosts | unique | list | length) == (resolved_route_hosts | length)
+          - resolved_route_middlewares is sequence
+          - resolved_route_middlewares is not string
+          - (resolved_route_middlewares | length) <= 50
+          - (resolved_route_middlewares | unique | list | length) == (resolved_route_middlewares | length)
+        fail_msg: "Traefik route identity is missing or malformed"
+
+    - name: Validate normalized route hostnames before mutation
+      assert:
+        that:
+          - item is string
+          - item == (item | trim | lower)
+          - (item | length) <= 253
+          - item is match('^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+        fail_msg: "Traefik route hosts must be normalized DNS hostnames"
+      loop: "{{ resolved_route_hosts }}"
+      loop_control:
+        label: "route host"
+
+    - name: Validate route middleware references before mutation
+      assert:
+        that:
+          - item is string
+          - item == (item | trim)
+          - (item | length) > 0
+          - (item | length) <= 255
+          - item is match('^[A-Za-z0-9_.@-]+$')
+        fail_msg: "Traefik middleware references must be normalized and bounded"
+      loop: "{{ resolved_route_middlewares }}"
+      loop_control:
+        label: "middleware"
+
+  tasks:
+    - name: OPERATION_STEP traefik-route:start
+      shell: |
+        printf 'OPERATION_STEP={"name":"traefik-route:start","status":"running","metadata":{"display_name":"Configure Traefik route","deployment_id":"%s","host_count":%s,"route_port":%s,"https":%s}}\n' \
+          "{{ deployment_id }}" \
+          "{{ resolved_route_hosts | length }}" \
+          "{{ route_port }}" \
+          "{{ 'true' if route_https else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: Converge managed Traefik route
+      block:
+        - name: Inspect existing Traefik container
+          community.docker.docker_container_info:
+            name: "{{ traefik_container_name }}"
+          register: traefik_container_info
+
+        - name: Extract existing Traefik container details
+          set_fact:
+            existing_traefik: >-
+              {{
+                (traefik_container_info.get('containers', []) | first)
+                if ((traefik_container_info.get('containers', []) | length) > 0)
+                else (traefik_container_info.get('container', None))
+              }}
+
+        - name: Validate managed watched Traefik runtime
+          assert:
+            that:
+              - existing_traefik is not none
+              - existing_traefik.State.Status == 'running'
+              - existing_traefik.HostConfig.NetworkMode == 'host'
+              - existing_traefik.Config.Labels.get('com.opsctl.managed') == 'true'
+              - existing_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+              - existing_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
+              - traefik_dynamic_dir in (existing_traefik.Mounts | default([]) | map(attribute='Destination') | list)
+              - "'--providers.file.directory=/etc/traefik/dynamic/opsctl' in (existing_traefik.Config.Cmd | default([]))"
+              - "'--providers.file.watch=true' in (existing_traefik.Config.Cmd | default([]))"
+              - "(not route_https) or ((existing_traefik.Config.Cmd | default([]) | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.email=.+$') | list | length) == 1)"
+              - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json' in (existing_traefik.Config.Cmd | default([])))"
+              - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in (existing_traefik.Config.Cmd | default([])))"
+              - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in (existing_traefik.Config.Cmd | default([])))"
+            fail_msg: "Canonical managed Traefik file watcher is not running for this organization"
+
+        - name: Verify watched dynamic directory exists
+          stat:
+            path: "{{ traefik_dynamic_dir }}"
+          register: traefik_dynamic_dir_stat
+
+        - name: Reject missing watched dynamic directory
+          assert:
+            that:
+              - traefik_dynamic_dir_stat.stat.exists
+              - traefik_dynamic_dir_stat.stat.isdir
+            fail_msg: "Canonical Traefik dynamic directory is unavailable"
+
+        - name: Create unique staged route file
+          tempfile:
+            state: file
+            path: "{{ traefik_dynamic_dir }}"
+            prefix: ".deployment-{{ deployment_id }}."
+            suffix: ".yml"
+          register: staged_route_file
+
+        - name: Stage deterministic deployment route content
+          template:
+            src: "{{ playbook_dir }}/../templates/traefik_deployment_route.yml.j2"
+            dest: "{{ staged_route_file.path }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Read staged deployment route
+          slurp:
+            path: "{{ staged_route_file.path }}"
+          register: staged_route_content
+
+        - name: Parse staged deployment route
+          set_fact:
+            staged_route_config: "{{ staged_route_content.content | b64decode | from_yaml }}"
+
+        - name: Validate staged deployment route structure
+          assert:
+            that:
+              - staged_route_config is mapping
+              - staged_route_config.keys() | list == ['http']
+              - staged_route_config.http is mapping
+              - staged_route_config.http.routers is mapping
+              - staged_route_config.http.services is mapping
+              - ('deployment-' ~ deployment_id) in staged_route_config.http.routers
+              - ('deployment-' ~ deployment_id) in staged_route_config.http.services
+              - staged_route_config.http.routers['deployment-' ~ deployment_id].service == ('deployment-' ~ deployment_id)
+              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | length == 1
+              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers[0].url == ('http://127.0.0.1:' ~ (route_port | string))
+              - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls.certResolver == route_tls_cert_resolver
+              - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
+            fail_msg: "Rendered Traefik route is malformed"
+
+        - name: Atomically activate deployment route
+          command:
+            argv:
+              - mv
+              - --
+              - "{{ staged_route_file.path }}"
+              - "{{ route_file_path }}"
+
+        - name: OPERATION_STEP traefik-route:complete
+          shell: |
+            printf 'OPERATION_STEP={"name":"traefik-route:complete","status":"completed","metadata":{"display_name":"Traefik route ready","deployment_id":"%s","host_count":%s,"route_port":%s,"https":%s}}\n' \
+              "{{ deployment_id }}" \
+              "{{ resolved_route_hosts | length }}" \
+              "{{ route_port }}" \
+              "{{ 'true' if route_https else 'false' }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Remove incomplete staged route
+          file:
+            path: "{{ staged_route_file.path }}"
+            state: absent
+          when:
+            - staged_route_file is defined
+            - staged_route_file.path is defined
+
+        - name: OPERATION_STEP traefik-route:failure
+          shell: |
+            printf 'OPERATION_STEP={"name":"traefik-route:failure","status":"failed","metadata":{"display_name":"Traefik route failed","deployment_id":"%s"}}\n' "{{ deployment_id }}"
+          args:
+            executable: /bin/sh
+
+        - name: Fail Traefik route converge
+          fail:
+            msg: "Traefik route converge failed"
