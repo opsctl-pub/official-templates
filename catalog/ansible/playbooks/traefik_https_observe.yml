@@ -43,30 +43,28 @@
           ansible.builtin.include_tasks: >-
             {{ playbook_dir }}/../tasks/traefik_route_observation.yml
 
-        - name: Read resolver command evidence
+        - name: Validate resolver command evidence
+          ansible.builtin.assert:
+            that:
+              - existing_traefik.Config is mapping
+              - existing_traefik.Config.Cmd is sequence
+              - existing_traefik.Config.Cmd is not string
+              - >-
+                (existing_traefik.Config.Cmd | select('string') | list | length)
+                == (existing_traefik.Config.Cmd | length)
+              - existing_traefik.Mounts is sequence
+              - existing_traefik.Mounts is not string
+              - >-
+                (existing_traefik.Mounts | select('mapping') | list | length)
+                == (existing_traefik.Mounts | length)
+            fail_msg: "Managed Traefik resolver evidence is invalid"
+
+        - name: Read resolver email evidence
           ansible.builtin.set_fact:
             resolver_email_arguments: >-
               {{
                 existing_traefik.Config.Cmd | default([])
-                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.email=.+$')
-                | list
-              }}
-            resolver_storage_arguments: >-
-              {{
-                existing_traefik.Config.Cmd | default([])
-                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.storage=.+$')
-                | list
-              }}
-            resolver_challenge_arguments: >-
-              {{
-                existing_traefik.Config.Cmd | default([])
-                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.httpchallenge=true$')
-                | list
-              }}
-            resolver_entrypoint_arguments: >-
-              {{
-                existing_traefik.Config.Cmd | default([])
-                | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.httpchallenge\\.entrypoint=web$')
+                | select('match', '^--certificatesresolvers[.]letsencrypt[.]acme[.]email=.+$')
                 | list
               }}
 
@@ -75,11 +73,12 @@
             resolver_configured: >-
               {{
                 (resolver_email_arguments | length) == 1
-                and resolver_storage_arguments == [
-                  '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
-                ]
-                and (resolver_challenge_arguments | length) == 1
-                and (resolver_entrypoint_arguments | length) == 1
+                and '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
+                  in existing_traefik.Config.Cmd
+                and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
+                  in existing_traefik.Config.Cmd
+                and '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
+                  in existing_traefik.Config.Cmd
                 and '/var/lib/traefik' in (
                   existing_traefik.Mounts | default([])
                   | map(attribute='Destination') | list
