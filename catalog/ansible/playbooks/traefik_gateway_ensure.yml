@@ -93,9 +93,12 @@
                 else (traefik_container_info.get('container', None))
               }}
 
-        - name: Derive existing Traefik management state
+        - name: Extract existing Traefik labels
           set_fact:
             existing_traefik_labels: "{{ existing_traefik.Config.Labels | default({}) if existing_traefik else {} }}"
+
+        - name: Derive existing Traefik management state
+          set_fact:
             managed_traefik_present: >-
               {{
                 existing_traefik is not none
@@ -103,10 +106,13 @@
                 and existing_traefik_labels.get('com.opsctl.component') == 'traefik_gateway'
               }}
 
-        - name: Derive existing Traefik readiness state
+        - name: Extract existing Traefik runtime settings
           set_fact:
             existing_traefik_cmd: "{{ existing_traefik.Config.Cmd | default([]) if existing_traefik else [] }}"
             existing_traefik_mount_destinations: "{{ existing_traefik.Mounts | default([]) | map(attribute='Destination') | list if existing_traefik else [] }}"
+
+        - name: Derive existing Traefik readiness state
+          set_fact:
             managed_traefik_ready: >-
               {{
                 managed_traefik_present

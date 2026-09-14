@@ -74,9 +74,12 @@
                 else (traefik_container_info.get('container', None))
               }}
 
-        - name: Derive existing Traefik management state
+        - name: Extract existing Traefik labels
           set_fact:
             existing_traefik_labels: "{{ existing_traefik.Config.Labels | default({}) if existing_traefik else {} }}"
+
+        - name: Derive existing Traefik management state
+          set_fact:
             managed_traefik_present: >-
               {{
                 existing_traefik is not none
