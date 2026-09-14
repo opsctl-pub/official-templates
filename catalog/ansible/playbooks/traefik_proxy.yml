@@ -107,45 +107,16 @@
             - (traefik_listener_check.stdout | trim | length) > 0
 
         - name: Build Traefik command arguments
-          set_fact:
-            traefik_command_args: >-
+          include_tasks: ../tasks/traefik_gateway_command.yml
+          vars:
+            traefik_gateway_acme_enabled: >-
               {{
-                [
-                  '--providers.docker=true',
-                  '--providers.docker.exposedbydefault=false',
-                  '--providers.file.directory=/etc/traefik/dynamic/opsctl',
-                  '--providers.file.watch=true',
-                  '--entrypoints.web.address=:80',
-                  '--entrypoints.websecure.address=:443',
-                  '--entrypoints.web.http.redirections.entrypoint.to=websecure',
-                  '--entrypoints.web.http.redirections.entrypoint.scheme=https',
-                  '--entrypoints.web.http.redirections.entrypoint.permanent=true'
-                ]
-                + (
-                  [
-                    '--certificatesresolvers.letsencrypt.acme.email=' ~ (traefik_email | string),
-                    '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json',
-                    '--certificatesresolvers.letsencrypt.acme.httpchallenge=true',
-                    '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
-                  ]
-                  if (traefik_email is defined) and ((traefik_email | string | length) > 0)
-                  else []
-                )
-                + (
-                  ['--certificatesresolvers.letsencrypt.acme.caserver=' ~ acme_staging_url]
-                  if (
-                    (traefik_email is defined)
-                    and ((traefik_email | string | length) > 0)
-                    and ((traefik_acme_server | default('staging')) == 'staging')
-                  )
-                  else []
-                )
-                + (
-                  ['--api.dashboard=true']
-                  if (traefik_dashboard_enabled | default(false))
-                  else []
-                )
+                (traefik_email is defined)
+                and ((traefik_email | string | trim | length) > 0)
               }}
+            traefik_gateway_acme_environment: "{{ traefik_acme_server | default('staging') }}"
+            traefik_gateway_acme_staging_url: "{{ acme_staging_url }}"
+            traefik_gateway_dashboard_enabled: "{{ traefik_dashboard_enabled | default(false) }}"
 
         - name: Build Traefik labels
           set_fact:

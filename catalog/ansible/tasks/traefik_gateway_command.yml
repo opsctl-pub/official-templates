@@ -1,0 +1,47 @@
+---
+- name: Validate managed Traefik command inputs
+  assert:
+    that:
+      - traefik_gateway_acme_enabled is boolean
+      - traefik_gateway_dashboard_enabled is boolean
+      - traefik_gateway_acme_environment in ['staging', 'production']
+      - not traefik_gateway_acme_enabled or traefik_email is defined
+      - not traefik_gateway_acme_enabled or (traefik_email | string | trim | length) > 0
+    fail_msg: "Traefik gateway command inputs are invalid"
+
+- name: Build managed Traefik command arguments
+  set_fact:
+    traefik_command_args: >-
+      {{
+        [
+          '--providers.docker=true',
+          '--providers.docker.exposedbydefault=false',
+          '--providers.file.directory=/etc/traefik/dynamic/opsctl',
+          '--providers.file.watch=true',
+          '--entrypoints.web.address=:80',
+          '--entrypoints.websecure.address=:443'
+        ]
+        + (
+          [
+            '--certificatesresolvers.letsencrypt.acme.email=' ~ (traefik_email | string),
+            '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json',
+            '--certificatesresolvers.letsencrypt.acme.httpchallenge=true',
+            '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
+          ]
+          if traefik_gateway_acme_enabled
+          else []
+        )
+        + (
+          ['--certificatesresolvers.letsencrypt.acme.caserver=' ~ traefik_gateway_acme_staging_url]
+          if (
+            traefik_gateway_acme_enabled
+            and traefik_gateway_acme_environment == 'staging'
+          )
+          else []
+        )
+        + (
+          ['--api.dashboard=true']
+          if traefik_gateway_dashboard_enabled
+          else []
+        )
+      }}
