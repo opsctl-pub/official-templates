@@ -43,6 +43,9 @@
           - route_port > 0
           - route_port <= 65535
           - route_https is boolean
+          - redirect_http_to_https is defined
+          - redirect_http_to_https is boolean
+          - (not redirect_http_to_https) or route_https
           - resolved_route_state in ['present', 'absent']
           - route_tls_cert_resolver == 'letsencrypt'
           - resolved_route_hosts is sequence
@@ -61,7 +64,7 @@
       assert:
         that:
           - expected_route_observation is mapping
-          - expected_route_observation.keys() | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'route_port']
+          - expected_route_observation.keys() | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port']
           - expected_route_observation.presence in ['present', 'absent']
           - expected_route_observation.digest is match('^[0-9a-f]{64}$')
         fail_msg: "Traefik route comparison evidence is invalid"
@@ -197,6 +200,18 @@
               - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers[0].url == ('http://127.0.0.1:' ~ (route_port | string))
               - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls.certResolver == route_tls_cert_resolver
               - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
+              - (not redirect_http_to_https) or (staged_route_config.http.keys() | sort == ['middlewares', 'routers', 'services'])
+              - redirect_http_to_https or (staged_route_config.http.keys() | sort == ['routers', 'services'])
+              - (not redirect_http_to_https) or (staged_route_config.http.routers.keys() | sort == [('deployment-' ~ deployment_id), ('deployment-' ~ deployment_id ~ '-http-redirect')] | sort)
+              - redirect_http_to_https or (staged_route_config.http.routers.keys() | list == [('deployment-' ~ deployment_id)])
+              - (not redirect_http_to_https) or (staged_route_config.http.middlewares.keys() | list == [('deployment-' ~ deployment_id ~ '-https-redirect')])
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].keys() | sort == ['entryPoints', 'middlewares', 'priority', 'rule', 'service'])
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].rule == staged_route_config.http.routers['deployment-' ~ deployment_id].rule)
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].entryPoints == ['web'])
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].priority == 1000)
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].service == 'noop@internal')
+              - (not redirect_http_to_https) or (staged_route_config.http.routers['deployment-' ~ deployment_id ~ '-http-redirect'].middlewares == [('deployment-' ~ deployment_id ~ '-https-redirect')])
+              - "(not redirect_http_to_https) or (staged_route_config.http.middlewares['deployment-' ~ deployment_id ~ '-https-redirect'] == {'redirectScheme': {'scheme': 'https', 'permanent': true}})"
             fail_msg: "Rendered Traefik route is malformed"
           when: resolved_route_state == 'present'
           no_log: true

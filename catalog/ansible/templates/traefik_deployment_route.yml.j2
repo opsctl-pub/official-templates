@@ -4,6 +4,16 @@
 {% endif %}
 http:
   routers:
+{% if redirect_http_to_https %}
+    deployment-{{ deployment_id }}-http-redirect:
+      rule: 'Host({% for host in effective_route_hosts %}`{{ host }}`{% if not loop.last %},{% endif %}{% endfor %})'
+      priority: 1000
+      entryPoints:
+        - web
+      middlewares:
+        - deployment-{{ deployment_id }}-https-redirect
+      service: noop@internal
+{% endif %}
     deployment-{{ deployment_id }}:
       rule: 'Host({% for host in effective_route_hosts %}`{{ host }}`{% if not loop.last %},{% endif %}{% endfor %})'
       priority: 1000
@@ -26,6 +36,13 @@ http:
 {% endfor %}
 {% endif %}
       service: deployment-{{ deployment_id }}
+{% if redirect_http_to_https %}
+  middlewares:
+    deployment-{{ deployment_id }}-https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+{% endif %}
   services:
     deployment-{{ deployment_id }}:
       loadBalancer:

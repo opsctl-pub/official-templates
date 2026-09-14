@@ -43,6 +43,7 @@
       hosts: []
       route_port: null
       https: null
+      redirect_http_to_https: null
       middlewares: []
       backend_identity_class: null
   when: not route_file.stat.exists
@@ -73,6 +74,12 @@
         route_router: "{{ route_config.http.routers[route_key] }}"
         route_service: "{{ route_config.http.services[route_key] }}"
 
+    - name: Identify managed HTTP redirect shape
+      set_fact:
+        redirect_route_key: "{{ route_key }}-http-redirect"
+        redirect_middleware_key: "{{ route_key }}-https-redirect"
+        route_redirect_present: "{{ 'middlewares' in route_config.http }}"
+
     - name: Read normalized route host candidates
       set_fact:
         observed_route_hosts: "{{ route_router.rule | regex_findall('`([^`]+)`') | sort }}"
@@ -83,10 +90,10 @@
           - route_config is mapping
           - route_config.keys() | list == ['http']
           - route_config.http is mapping
-          - route_config.http.keys() | sort == ['routers', 'services']
+          - route_config.http.keys() | sort in [['routers', 'services'], ['middlewares', 'routers', 'services']]
           - route_config.http.routers is mapping
           - route_config.http.services is mapping
-          - route_config.http.routers.keys() | list == [route_key]
+          - route_config.http.routers.keys() | sort in [[route_key], [route_key, redirect_route_key] | sort]
           - route_config.http.services.keys() | list == [route_key]
           - route_router is mapping
           - (route_router.keys() | difference(['entryPoints', 'middlewares', 'priority', 'rule', 'service', 'tls']) | length) == 0
@@ -117,6 +124,33 @@
           - (route_router.middlewares | default([])) is not string
         fail_msg: "Managed Traefik route is malformed"
 
+    - name: Validate route without managed HTTP redirect
+      assert:
+        that:
+          - route_config.http.keys() | sort == ['routers', 'services']
+          - route_config.http.routers.keys() | list == [route_key]
+        fail_msg: "Managed Traefik route is malformed"
+      when: not route_redirect_present
+
+    - name: Validate exact managed HTTP redirect
+      assert:
+        that:
+          - route_router.entryPoints == ['websecure']
+          - "'tls' in route_router"
+          - route_config.http.routers.keys() | sort == [route_key, redirect_route_key] | sort
+          - route_config.http.middlewares is mapping
+          - route_config.http.middlewares.keys() | list == [redirect_middleware_key]
+          - route_config.http.routers[redirect_route_key] is mapping
+          - route_config.http.routers[redirect_route_key].keys() | sort == ['entryPoints', 'middlewares', 'priority', 'rule', 'service']
+          - route_config.http.routers[redirect_route_key].rule == route_router.rule
+          - route_config.http.routers[redirect_route_key].entryPoints == ['web']
+          - route_config.http.routers[redirect_route_key].priority == 1000
+          - route_config.http.routers[redirect_route_key].service == 'noop@internal'
+          - route_config.http.routers[redirect_route_key].middlewares == [redirect_middleware_key]
+          - "route_config.http.middlewares[redirect_middleware_key] == {'redirectScheme': {'scheme': 'https', 'permanent': true}}"
+        fail_msg: "Managed Traefik HTTP redirect is malformed"
+      when: route_redirect_present
+
     - name: Normalize exact managed route
       set_fact:
         route_observation_base:
@@ -124,6 +158,7 @@
           hosts: "{{ observed_route_hosts }}"
           route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://127\\.0\\.0\\.1:', '') | int }}"
           https: "{{ 'tls' in route_router }}"
+          redirect_http_to_https: "{{ route_redirect_present }}"
           middlewares: "{{ route_router.middlewares | default([]) }}"
           backend_identity_class: loopback
   rescue:
@@ -134,6 +169,7 @@
           hosts: []
           route_port: null
           https: null
+          redirect_http_to_https: null
           middlewares: []
           backend_identity_class: null
 
