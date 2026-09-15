@@ -1,0 +1,51 @@
+---
+- name: Observe one Deployment custom certificate on managed Traefik
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    binding_file: "{{ traefik_dynamic_dir }}/certificate-{{ deployment_id }}.yml"
+  pre_tasks:
+    - name: Validate custom certificate observation identity
+      ansible.builtin.assert:
+        that:
+          - adapter_key == 'traefik_custom_file'
+          - certificate_mode == 'custom'
+          - not (simulate | default(false) | bool)
+          - org_id is string
+          - org_id == (org_id | trim)
+          - (org_id | length) > 0
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - material_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - revision_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - metadata_digest is match('^[0-9a-f]{64}$')
+          - content_digest is match('^[0-9a-f]{64}$')
+          - leaf_fingerprint_sha256 is match('^[0-9a-f]{64}$')
+          - route_hosts is sequence
+          - route_hosts is not string
+          - (route_hosts | length) > 0
+          - (route_hosts | length) <= 100
+          - route_hosts == (route_hosts | unique | sort | list)
+          - (route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (route_hosts | length)
+          - target_server is string
+          - target_server == (target_server | trim)
+          - (target_server | length) > 0
+        fail_msg: "Custom certificate observation identity is invalid"
+
+  tasks:
+    - name: Read normalized custom certificate observation
+      ansible.builtin.include_tasks:
+        file: ../tasks/traefik_custom_certificate_observation.yml
+
+    - name: Emit normalized custom certificate observation
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{
+            {'custom_certificate_observation': custom_certificate_observation}
+            | to_json
+          }}

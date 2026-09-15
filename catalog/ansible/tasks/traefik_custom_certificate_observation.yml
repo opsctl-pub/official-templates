@@ -1,0 +1,283 @@
+---
+    - name: Inspect custom certificate binding
+      no_log: true
+      block:
+        - name: Inspect managed Traefik container
+          community.docker.docker_container_info:
+            name: "{{ traefik_container_name }}"
+          register: traefik_container_info
+
+        - name: Read managed Traefik container
+          ansible.builtin.set_fact:
+            observed_traefik: >-
+              {{
+                (traefik_container_info.get('containers', []) | first)
+                if ((traefik_container_info.get('containers', []) | length) > 0)
+                else (traefik_container_info.get('container', None))
+              }}
+
+        - name: Require managed certificate mount
+          ansible.builtin.assert:
+            that:
+              - observed_traefik is not none
+              - observed_traefik.Config.Labels.get('com.opsctl.managed') == 'true'
+              - observed_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+              - observed_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
+              - >-
+                (observed_traefik.Mounts
+                | selectattr('Destination', 'equalto', traefik_certificate_dir)
+                | selectattr('Source', 'equalto', traefik_certificate_dir)
+                | selectattr('RW', 'sameas', false)
+                | list | length) == 1
+            fail_msg: "Managed Traefik certificate mount is invalid"
+
+        - name: Inspect Deployment certificate binding
+          ansible.builtin.stat:
+            path: "{{ binding_file }}"
+          register: binding_stat
+
+        - name: Mark absent Deployment certificate binding
+          ansible.builtin.set_fact:
+            binding_valid: true
+            binding_present: false
+            observed_material_id: null
+            observed_revision_id: null
+            observed_route_hosts: []
+            observed_binding_count: 0
+            observed_certificate_hosts: []
+            observed_content_digest: null
+            observed_leaf_fingerprint: null
+          when: not binding_stat.stat.exists
+
+        - name: Read Deployment certificate binding
+          ansible.builtin.slurp:
+            path: "{{ binding_file }}"
+          register: binding_content
+          when: binding_stat.stat.exists
+
+        - name: Parse Deployment certificate binding
+          ansible.builtin.set_fact:
+            parsed_binding: "{{ binding_content.content | b64decode | from_yaml }}"
+          when: binding_stat.stat.exists
+
+        - name: Validate Deployment certificate binding
+          ansible.builtin.assert:
+            that:
+              - parsed_binding.keys() | list == ['tls']
+              - parsed_binding.tls.keys() | list == ['certificates']
+              - parsed_binding.tls.certificates is sequence
+              - parsed_binding.tls.certificates is not string
+              - (parsed_binding.tls.certificates | length) == 1
+              - parsed_binding.tls.certificates[0].keys() | sort == ['certFile', 'keyFile']
+              - parsed_binding.tls.certificates[0].certFile is match('^/etc/traefik/certificates/opsctl/material-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/revision-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/tls[.]crt$')
+              - parsed_binding.tls.certificates[0].keyFile is match('^/etc/traefik/certificates/opsctl/material-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/revision-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/tls[.]key$')
+            fail_msg: "Deployment custom certificate binding is invalid"
+          when: binding_stat.stat.exists
+
+        - name: Extract bound certificate identities
+          ansible.builtin.set_fact:
+            observed_material_id: "{{ parsed_binding.tls.certificates[0].certFile | regex_replace('^.*/material-([0-9a-f-]{36})/.*$', '\\1') }}"
+            observed_revision_id: "{{ parsed_binding.tls.certificates[0].certFile | regex_replace('^.*/revision-([0-9a-f-]{36})/.*$', '\\1') }}"
+            observed_certificate_file: "{{ parsed_binding.tls.certificates[0].certFile }}"
+            observed_private_key_file: "{{ parsed_binding.tls.certificates[0].keyFile }}"
+          when: binding_stat.stat.exists
+
+        - name: Require matching certificate and key identities
+          ansible.builtin.assert:
+            that:
+              - observed_private_key_file == (traefik_certificate_dir ~ '/material-' ~ observed_material_id ~ '/revision-' ~ observed_revision_id ~ '/tls.key')
+            fail_msg: "Deployment custom certificate files conflict"
+          when: binding_stat.stat.exists
+
+        - name: Read normalized bound material evidence
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import hashlib
+                import json
+                import re
+                import ssl
+                import sys
+                files = {'tls.crt': open(sys.argv[1], 'rb').read(), 'tls.key': open(sys.argv[2], 'rb').read()}
+                digest = hashlib.sha256()
+                digest.update(b'opsctl-file-secret:1\0')
+                for name in sorted(files):
+                    encoded_name = name.encode('ascii')
+                    value = files[name]
+                    digest.update(len(encoded_name).to_bytes(2, 'big'))
+                    digest.update(encoded_name)
+                    digest.update(len(value).to_bytes(8, 'big'))
+                    digest.update(value)
+                match = re.search(br'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', files['tls.crt'], re.DOTALL)
+                if match is None:
+                    raise SystemExit(3)
+                der = ssl.PEM_cert_to_DER_cert(match.group().decode('ascii'))
+                fingerprint = hashlib.sha256(der).hexdigest()
+                print(json.dumps({'content_digest': digest.hexdigest(), 'leaf_fingerprint_sha256': fingerprint}, sort_keys=True, separators=(',', ':')))
+              - "{{ observed_certificate_file }}"
+              - "{{ observed_private_key_file }}"
+          register: bound_material_evidence
+          changed_when: false
+          when: binding_stat.stat.exists
+
+        - name: Parse normalized bound material evidence
+          ansible.builtin.set_fact:
+            parsed_material_evidence: "{{ bound_material_evidence.stdout | from_json }}"
+          when: binding_stat.stat.exists
+
+        - name: Probe served custom certificates
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import hashlib
+                import json
+                import socket
+                import ssl
+                import sys
+                from datetime import datetime, timezone
+                hosts = json.loads(sys.argv[1])
+                now = datetime.now(timezone.utc)
+                observed = []
+                for host in hosts:
+                    status = 'unknown'
+                    trusted = None
+                    fingerprint = None
+                    not_before = None
+                    not_after = None
+                    try:
+                        context = ssl.create_default_context()
+                        with socket.create_connection(('127.0.0.1', 443), timeout=5) as sock:
+                            with context.wrap_socket(sock, server_hostname=host) as tls:
+                                metadata = tls.getpeercert()
+                                der = tls.getpeercert(binary_form=True)
+                        trusted = True
+                        fingerprint = hashlib.sha256(der).hexdigest()
+                        before = datetime.fromtimestamp(ssl.cert_time_to_seconds(metadata['notBefore']), timezone.utc)
+                        after = datetime.fromtimestamp(ssl.cert_time_to_seconds(metadata['notAfter']), timezone.utc)
+                        not_before = before.strftime('%Y-%m-%dT%H:%M:%SZ')
+                        not_after = after.strftime('%Y-%m-%dT%H:%M:%SZ')
+                        status = 'active' if before <= now < after else 'expired'
+                    except ssl.SSLCertVerificationError as exc:
+                        trusted = False
+                        status = 'expired' if exc.verify_code == 10 else 'untrusted'
+                    except (OSError, ssl.SSLError, KeyError, ValueError):
+                        pass
+                    if trusted is False:
+                        try:
+                            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                            with socket.create_connection(('127.0.0.1', 443), timeout=5) as sock:
+                                with context.wrap_socket(sock, server_hostname=host) as tls:
+                                    der = tls.getpeercert(binary_form=True)
+                            fingerprint = hashlib.sha256(der).hexdigest()
+                        except (OSError, ssl.SSLError, ValueError):
+                            status = 'unknown'
+                            trusted = None
+                            fingerprint = None
+                            not_before = None
+                            not_after = None
+                    observed.append({'hostname': host, 'status': status, 'trusted': trusted, 'fingerprint_sha256': fingerprint, 'not_before': not_before, 'not_after': not_after})
+                print(json.dumps(observed, sort_keys=True, separators=(',', ':')))
+              - "{{ route_hosts | to_json }}"
+          register: served_certificate_evidence
+          changed_when: false
+          failed_when: false
+          when: binding_stat.stat.exists
+
+        - name: Parse served certificate evidence
+          ansible.builtin.assert:
+            that:
+              - served_certificate_evidence.rc == 0
+              - served_certificate_evidence.stdout is string
+              - (served_certificate_evidence.stdout | length) <= 65536
+            fail_msg: "Served custom certificate observation failed"
+          when: binding_stat.stat.exists
+
+        - name: Read served certificate evidence
+          ansible.builtin.set_fact:
+            observed_certificate_hosts: "{{ served_certificate_evidence.stdout | from_json }}"
+            observed_content_digest: "{{ parsed_material_evidence.content_digest }}"
+            observed_leaf_fingerprint: "{{ parsed_material_evidence.leaf_fingerprint_sha256 }}"
+            observed_route_hosts: "{{ route_hosts }}"
+            observed_binding_count: 1
+            binding_present: true
+            binding_valid: true
+          when:
+            - binding_stat.stat.exists
+            - served_certificate_evidence.rc == 0
+
+      rescue:
+        - name: Mark unrecognized custom certificate evidence
+          ansible.builtin.set_fact:
+            binding_valid: false
+            binding_present: false
+            observed_material_id: null
+            observed_revision_id: null
+            observed_route_hosts: []
+            observed_binding_count: 0
+            observed_certificate_hosts: []
+            observed_content_digest: null
+            observed_leaf_fingerprint: null
+
+    - name: Classify custom certificate observation
+      ansible.builtin.set_fact:
+        custom_certificate_classification: >-
+          {%- if not binding_valid -%}unknown
+          {%- elif not binding_present -%}absent
+          {%- elif observed_material_id == material_id
+              and observed_revision_id == revision_id
+              and (
+                observed_content_digest != content_digest
+                or observed_leaf_fingerprint != leaf_fingerprint_sha256
+              ) -%}unknown
+          {%- elif observed_material_id == material_id
+              and observed_revision_id == revision_id
+              and observed_content_digest == content_digest
+              and observed_leaf_fingerprint == leaf_fingerprint_sha256
+              and (observed_certificate_hosts | length) == (route_hosts | length)
+              and (observed_certificate_hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
+              and (observed_certificate_hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
+              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length) -%}exact
+          {%- elif (observed_certificate_hosts | map(attribute='fingerprint_sha256') | reject('none') | unique | list | length) > 1 -%}mixed
+          {%- else -%}other
+          {%- endif -%}
+        custom_certificate_observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Build normalized custom certificate observation
+      ansible.builtin.set_fact:
+        custom_certificate_observation_base:
+          adapter_key: "{{ adapter_key }}"
+          mode: "{{ certificate_mode }}"
+          classification: "{{ custom_certificate_classification }}"
+          deployment_id: "{{ deployment_id }}"
+          material_id: "{{ observed_material_id }}"
+          revision_id: "{{ observed_revision_id }}"
+          route_hosts: "{{ observed_route_hosts }}"
+          binding_count: "{{ observed_binding_count }}"
+          host_count: "{{ observed_certificate_hosts | length }}"
+          hosts: "{{ observed_certificate_hosts }}"
+          content_digest: "{{ observed_content_digest }}"
+          leaf_fingerprint_sha256: "{{ observed_leaf_fingerprint }}"
+          observed_at: "{{ custom_certificate_observed_at }}"
+
+    - name: Add custom certificate observation digest
+      ansible.builtin.set_fact:
+        custom_certificate_observation: >-
+          {{
+            custom_certificate_observation_base
+            | combine({
+                'digest': (
+                  custom_certificate_observation_base
+                  | dict2items
+                  | rejectattr('key', 'equalto', 'observed_at')
+                  | items2dict
+                  | to_json(sort_keys=True, separators=[',', ':'])
+                  | hash('sha256')
+                )
+              })
+          }}

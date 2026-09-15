@@ -8,6 +8,7 @@
     traefik_image: "traefik:2.11"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     traefik_acme_dir: "/var/lib/traefik"
+    traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
     traefik_managed_labels:
       com.opsctl.managed: "true"
       com.opsctl.component: "traefik_gateway"
@@ -73,6 +74,14 @@
             state: directory
             mode: "0755"
 
+        - name: Ensure Traefik certificate directory exists
+          file:
+            path: "{{ traefik_certificate_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
         - name: Ensure Traefik ACME file exists
           file:
             path: "{{ traefik_acme_dir }}/acme.json"
@@ -110,6 +119,12 @@
           set_fact:
             existing_traefik_cmd: "{{ existing_traefik.Config.Cmd | default([]) if existing_traefik else [] }}"
             existing_traefik_mount_destinations: "{{ existing_traefik.Mounts | default([]) | map(attribute='Destination') | list if existing_traefik else [] }}"
+            existing_traefik_certificate_mounts: >-
+              {{
+                existing_traefik.Mounts | default([])
+                | selectattr('Destination', 'equalto', traefik_certificate_dir)
+                | list if existing_traefik else []
+              }}
 
         - name: Derive existing Traefik readiness state
           set_fact:
@@ -123,6 +138,9 @@
                 and '/var/run/docker.sock' in existing_traefik_mount_destinations
                 and traefik_dynamic_dir in existing_traefik_mount_destinations
                 and traefik_acme_dir in existing_traefik_mount_destinations
+                and (existing_traefik_certificate_mounts | length) == 1
+                and existing_traefik_certificate_mounts[0].Source == traefik_certificate_dir
+                and existing_traefik_certificate_mounts[0].RW is sameas false
                 and (
                   (traefik_command_args | difference(existing_traefik_cmd)) | length == 0
                 )
@@ -166,6 +184,7 @@
               - "/var/run/docker.sock:/var/run/docker.sock:ro"
               - "{{ traefik_dynamic_dir }}:/etc/traefik/dynamic/opsctl"
               - "{{ traefik_acme_dir }}:/var/lib/traefik"
+              - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
             command: "{{ traefik_command_args }}"
             labels: "{{ traefik_managed_labels }}"
             pull: false
@@ -194,6 +213,12 @@
               - traefik_container_details.Config.Labels.get('com.opsctl.managed') == 'true'
               - traefik_container_details.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
               - traefik_container_details.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
+              - >-
+                (traefik_container_details.Mounts
+                | selectattr('Destination', 'equalto', traefik_certificate_dir)
+                | selectattr('Source', 'equalto', traefik_certificate_dir)
+                | selectattr('RW', 'sameas', false)
+                | list | length) == 1
             fail_msg: "Traefik gateway did not converge to the canonical managed layout"
 
         - name: OPERATION_STEP traefik:ready
