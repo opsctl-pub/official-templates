@@ -1,0 +1,266 @@
+---
+- name: Validate managed Traefik runtime inputs
+  assert:
+    that:
+      - org_id is defined
+      - (org_id | string | trim | length) > 0
+      - traefik_command_args is sequence
+      - traefik_command_args is not string
+      - traefik_gateway_policy_labels is mapping
+      - >-
+        ((traefik_gateway_policy_labels.keys() | list)
+        | intersect([
+          'com.opsctl.managed',
+          'com.opsctl.component',
+          'com.opsctl.org_id'
+        ])
+        | length) == 0
+      - traefik_gateway_force_recreate is boolean
+      - traefik_gateway_sensitive is boolean
+    fail_msg: "Managed Traefik runtime inputs are invalid"
+  no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Build managed Traefik identity
+  set_fact:
+    traefik_managed_labels: >-
+      {{
+        {
+          'com.opsctl.managed': 'true',
+          'com.opsctl.component': 'traefik_gateway',
+          'com.opsctl.org_id': (org_id | string)
+        }
+        | combine(traefik_gateway_policy_labels)
+      }}
+    traefik_legacy_redirect_args:
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+  no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Ensure Docker packages present
+  apt:
+    name:
+      - docker.io
+    state: present
+    update_cache: true
+
+- name: Ensure Docker service running
+  service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Ensure Traefik dynamic config directory exists
+  file:
+    path: "{{ traefik_dynamic_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure Traefik storage directory exists
+  file:
+    path: "{{ traefik_acme_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure Traefik certificate directory exists
+  file:
+    path: "{{ traefik_certificate_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure Traefik ACME file exists
+  file:
+    path: "{{ traefik_acme_dir }}/acme.json"
+    state: touch
+    mode: "0600"
+
+- name: Inspect existing Traefik container
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: traefik_container_info
+  no_log: true
+
+- name: Read existing Traefik container
+  set_fact:
+    existing_traefik: >-
+      {{
+        (traefik_container_info.get('containers', []) | first)
+        if ((traefik_container_info.get('containers', []) | length) > 0)
+        else (traefik_container_info.get('container', None))
+      }}
+  no_log: true
+
+- name: Read existing Traefik identity
+  set_fact:
+    existing_traefik_labels: >-
+      {{ existing_traefik.Config.Labels | default({}) if existing_traefik else {} }}
+  no_log: true
+
+- name: Classify existing Traefik ownership
+  set_fact:
+    managed_traefik_present: >-
+      {{
+        existing_traefik is not none
+        and existing_traefik_labels.get('com.opsctl.managed') == 'true'
+        and existing_traefik_labels.get('com.opsctl.component') == 'traefik_gateway'
+      }}
+  no_log: true
+
+- name: Fail on unmanaged Traefik container conflict
+  fail:
+    msg: "Existing traefik container is not OpsCtl-managed; refusing to mutate unknown state"
+  when:
+    - existing_traefik is not none
+    - not managed_traefik_present
+
+- name: Detect existing listeners on ports 80 and 443
+  shell: |
+    ss -H -ltn '( sport = :80 or sport = :443 )' || true
+  args:
+    executable: /bin/sh
+  register: traefik_listener_check
+  changed_when: false
+
+- name: Fail on unmanaged port listeners
+  fail:
+    msg: "Detected existing unmanaged listener on port 80 or 443; refusing to replace it"
+  when:
+    - not managed_traefik_present
+    - (traefik_listener_check.stdout | trim | length) > 0
+
+- name: Read existing Traefik runtime settings
+  set_fact:
+    existing_traefik_cmd: >-
+      {{ existing_traefik.Config.Cmd | default([]) if existing_traefik else [] }}
+    existing_traefik_mounts: >-
+      {{ existing_traefik.Mounts | default([]) if existing_traefik else [] }}
+  no_log: true
+
+- name: Classify existing Traefik runtime
+  set_fact:
+    managed_traefik_ready: >-
+      {{
+        managed_traefik_present
+        and existing_traefik is not none
+        and existing_traefik.State.Status == 'running'
+        and existing_traefik.HostConfig.NetworkMode == 'host'
+        and existing_traefik.Config.Image == traefik_image
+        and existing_traefik_labels.get('com.opsctl.org_id') == (org_id | string)
+        and (
+          (existing_traefik_labels | combine(traefik_managed_labels))
+          == existing_traefik_labels
+        )
+        and (traefik_command_args | difference(existing_traefik_cmd) | length) == 0
+        and (traefik_legacy_redirect_args | intersect(existing_traefik_cmd) | length) == 0
+        and (
+          existing_traefik_mounts
+          | selectattr('Destination', 'equalto', '/var/run/docker.sock')
+          | selectattr('Source', 'equalto', '/var/run/docker.sock')
+          | selectattr('RW', 'sameas', false)
+          | list | length
+        ) == 1
+        and (
+          existing_traefik_mounts
+          | selectattr('Destination', 'equalto', traefik_dynamic_dir)
+          | selectattr('Source', 'equalto', traefik_dynamic_dir)
+          | selectattr('RW', 'sameas', true)
+          | list | length
+        ) == 1
+        and (
+          existing_traefik_mounts
+          | selectattr('Destination', 'equalto', traefik_acme_dir)
+          | selectattr('Source', 'equalto', traefik_acme_dir)
+          | selectattr('RW', 'sameas', true)
+          | list | length
+        ) == 1
+        and (
+          existing_traefik_mounts
+          | selectattr('Destination', 'equalto', traefik_certificate_dir)
+          | selectattr('Source', 'equalto', traefik_certificate_dir)
+          | selectattr('RW', 'sameas', false)
+          | list | length
+        ) == 1
+      }}
+  no_log: true
+
+- name: Ensure canonical managed Traefik container is running
+  community.docker.docker_container:
+    name: "{{ traefik_container_name }}"
+    image: "{{ traefik_image }}"
+    state: started
+    recreate: true
+    restart_policy: always
+    detach: true
+    network_mode: host
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "{{ traefik_dynamic_dir }}:{{ traefik_dynamic_dir }}"
+      - "{{ traefik_acme_dir }}:{{ traefik_acme_dir }}"
+      - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
+    command: "{{ traefik_command_args }}"
+    labels: "{{ traefik_managed_labels }}"
+    pull: false
+  when: traefik_gateway_force_recreate or not managed_traefik_ready
+  no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Inspect converged Traefik container
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: traefik_container_ready
+  no_log: true
+
+- name: Read converged Traefik container
+  set_fact:
+    traefik_container_details: >-
+      {{
+        (traefik_container_ready.get('containers', []) | first)
+        if ((traefik_container_ready.get('containers', []) | length) > 0)
+        else (traefik_container_ready.get('container', None))
+      }}
+  no_log: true
+
+- name: Verify canonical Traefik runtime
+  assert:
+    that:
+      - traefik_container_details is not none
+      - traefik_container_details.State.Status == 'running'
+      - traefik_container_details.HostConfig.NetworkMode == 'host'
+      - traefik_container_details.Config.Image == traefik_image
+      - traefik_container_details.Config.Labels.get('com.opsctl.managed') == 'true'
+      - traefik_container_details.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+      - traefik_container_details.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
+      - >-
+        ((traefik_container_details.Config.Labels | combine(traefik_managed_labels))
+        == traefik_container_details.Config.Labels)
+      - >-
+        ((traefik_command_args | difference(traefik_container_details.Config.Cmd))
+        | length) == 0
+      - (traefik_legacy_redirect_args | intersect(traefik_container_details.Config.Cmd) | length) == 0
+      - >-
+        (traefik_container_details.Mounts
+        | selectattr('Destination', 'equalto', '/var/run/docker.sock')
+        | selectattr('Source', 'equalto', '/var/run/docker.sock')
+        | selectattr('RW', 'sameas', false)
+        | list | length) == 1
+      - >-
+        (traefik_container_details.Mounts
+        | selectattr('Destination', 'equalto', traefik_dynamic_dir)
+        | selectattr('Source', 'equalto', traefik_dynamic_dir)
+        | selectattr('RW', 'sameas', true)
+        | list | length) == 1
+      - >-
+        (traefik_container_details.Mounts
+        | selectattr('Destination', 'equalto', traefik_acme_dir)
+        | selectattr('Source', 'equalto', traefik_acme_dir)
+        | selectattr('RW', 'sameas', true)
+        | list | length) == 1
+      - >-
+        (traefik_container_details.Mounts
+        | selectattr('Destination', 'equalto', traefik_certificate_dir)
+        | selectattr('Source', 'equalto', traefik_certificate_dir)
+        | selectattr('RW', 'sameas', false)
+        | list | length) == 1
+    fail_msg: "Traefik did not converge to the canonical managed runtime"
+  no_log: "{{ traefik_gateway_sensitive }}"
