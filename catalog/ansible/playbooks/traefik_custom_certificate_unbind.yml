@@ -47,14 +47,25 @@
       ansible.builtin.assert:
         that:
           - custom_certificate_observation.digest == expected_custom_certificate_observation.digest
-          - custom_certificate_observation.classification in ['exact', 'absent']
+          - custom_certificate_observation.classification in ['exact', 'other', 'absent']
+          - >-
+            custom_certificate_observation.classification == 'absent' or
+            (
+              custom_certificate_observation.deployment_id == deployment_id and
+              custom_certificate_observation.material_id == material_id and
+              custom_certificate_observation.revision_id == revision_id and
+              custom_certificate_observation.route_hosts == route_hosts and
+              custom_certificate_observation.binding_count == 1 and
+              custom_certificate_observation.content_digest == content_digest and
+              custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
+            )
         fail_msg: "Custom certificate state changed before unbind"
 
     - name: Remove exact Deployment custom certificate binding
       ansible.builtin.file:
         path: "{{ binding_file }}"
         state: absent
-      when: custom_certificate_observation.classification == 'exact'
+      when: custom_certificate_observation.classification in ['exact', 'other']
 
     - name: Read custom certificate observation after unbind
       ansible.builtin.include_tasks:
