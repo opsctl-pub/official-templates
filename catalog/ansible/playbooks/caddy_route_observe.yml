@@ -1,0 +1,27 @@
+---
+- name: Observe one managed Caddy Deployment route
+  hosts: all
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Validate Caddy route observation identity
+      assert:
+        that:
+          - proxy_engine == 'caddy'
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - target_server is string
+          - target_server == (target_server | trim)
+          - (target_server | length) > 0
+        fail_msg: "Caddy route observation identity is invalid"
+  tasks:
+    - name: Run canonical Caddy route observer
+      script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py observe"
+      environment:
+        OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
+        OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
+        OPSCTL_PROXY_ENGINE: "{{ proxy_engine }}"
+        OPSCTL_SERVER_ID: "{{ server_id }}"
+        OPSCTL_TARGET_SERVER: "{{ target_server }}"
+      changed_when: false

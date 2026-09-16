@@ -3,10 +3,6 @@
   hosts: all
   gather_facts: false
   become: true
-  vars:
-    caddy_proxy_state_file: "/etc/opsctl/caddy-proxy.json"
-    caddy_route_dir: "/etc/caddy/opsctl-routes"
-    caddy_config_file: "/etc/caddy/Caddyfile"
   pre_tasks:
     - name: Skip Caddy route converge when running in simulate mode
       meta: end_play
@@ -27,302 +23,36 @@
               - org_id is defined
               - server_id is defined
               - target_server is defined
-              - proxy_engine is defined
               - proxy_engine == 'caddy'
+              - execution_contract in ['deploy', 'configuration']
+              - route_state in ['present', 'absent']
+              - >-
+                (execution_contract == 'deploy' and expected_route_observation is not defined)
+                or
+                (execution_contract == 'configuration' and expected_route_observation is defined)
               - route_hosts is defined
               - route_port is defined
               - route_https is defined
               - redirect_http_to_https is defined
-              - route_middlewares is defined
               - route_middlewares == []
             fail_msg: "Managed Caddy route intent is incomplete"
 
-        - name: Stage validate activate and verify Caddy route under gateway lock
-          shell: |
-            python3 - <<'PY'
-            import fcntl
-            import hashlib
-            import json
-            import os
-            from pathlib import Path
-            import re
-            import subprocess
-            import tempfile
-            from urllib.request import urlopen
-            from uuid import UUID
-
-            state_path = Path("/etc/opsctl/caddy-proxy.json")
-            config_path = Path("/etc/caddy/Caddyfile")
-            route_dir = Path("/etc/caddy/opsctl-routes")
-            lock_path = Path("/etc/opsctl/caddy-route.lock")
-            header_prefix = b"# opsctl-managed-caddy-route-v1 "
-            hostname_pattern = re.compile(
-                r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-                r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\Z"
-            )
-
-            def canonical_uuid(value):
-                if not isinstance(value, str) or str(UUID(value)) != value:
-                    raise ValueError("Caddy route identity is invalid")
-                return value
-
-            def valid_hosts(value):
-                return (
-                    isinstance(value, list)
-                    and bool(value)
-                    and all(
-                        isinstance(host, str) and hostname_pattern.fullmatch(host)
-                        for host in value
-                    )
-                    and value == sorted(set(value))
-                )
-
-            def route_body(hosts, port, use_https, redirect):
-                address = ", ".join(hosts)
-                backend = f"reverse_proxy 127.0.0.1:{port}"
-                if not use_https:
-                    return ", ".join("http://" + host for host in hosts) + " {\n  " + backend + "\n}\n"
-                result = address + " {\n  tls force_automate\n  " + backend + "\n}\n"
-                http_address = ", ".join("http://" + host for host in hosts)
-                if redirect:
-                    return (
-                        result
-                        + http_address + " {\n"
-                        + "  @non_challenge not path /.well-known/acme-challenge/*\n"
-                        + "  redir @non_challenge https://{host}{uri} 301\n"
-                        + "}\n"
-                    )
-                return result + http_address + " {\n  " + backend + "\n}\n"
-
-            def managed_route(path):
-                if path.is_symlink() or not path.is_file():
-                    raise ValueError("Unrecognized Caddy route file")
-                raw = path.read_bytes()
-                header, separator, body = raw.partition(b"\n")
-                if not separator or not header.startswith(header_prefix):
-                    raise ValueError("Unrecognized legacy or UUID Caddy route")
-                try:
-                    identity = json.loads(header[len(header_prefix):])
-                    deployment = canonical_uuid(identity["deployment_id"])
-                    organization = canonical_uuid(identity["organization_id"])
-                    hosts = identity["route_hosts"]
-                    port = identity["route_port"]
-                    use_https = identity["route_https"]
-                    redirect = identity["redirect_http_to_https"]
-                    digest = identity["body_sha256"]
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError("Managed Caddy route identity is invalid") from exc
-                if (
-                    set(identity) != {
-                        "deployment_id", "organization_id", "route_hosts",
-                        "route_port", "route_https", "redirect_http_to_https",
-                        "body_sha256",
-                    }
-                    or path.name != f"{deployment}.caddy"
-                    or not valid_hosts(hosts)
-                    or not isinstance(port, int)
-                    or isinstance(port, bool)
-                    or not 1 <= port <= 65535
-                    or not isinstance(use_https, bool)
-                    or not isinstance(redirect, bool)
-                    or (redirect and not use_https)
-                    or not isinstance(digest, str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                    or hashlib.sha256(body).hexdigest() != digest
-                    or body != route_body(hosts, port, use_https, redirect).encode()
-                ):
-                    raise ValueError("Managed Caddy route content is invalid")
-                return identity, raw
-
-            def run_caddy(*arguments):
-                result = subprocess.run(
-                    ["caddy", *arguments], capture_output=True, text=True, timeout=30
-                )
-                if result.returncode != 0:
-                    raise RuntimeError("Caddy validation or reload failed")
-                return result.stdout
-
-            def adapted(path):
-                return json.loads(
-                    run_caddy("adapt", "--config", str(path), "--adapter", "caddyfile")
-                )
-
-            def verify_live(path):
-                expected = adapted(path)
-                with urlopen("http://127.0.0.1:2019/config/", timeout=5) as response:
-                    actual = json.load(response)
-                if actual != expected:
-                    raise RuntimeError("Running Caddy configuration differs from managed source")
-
-            deployment_id = canonical_uuid(os.environ["OPSCTL_DEPLOYMENT_ID"])
-            organization_id = canonical_uuid(os.environ["OPSCTL_ORGANIZATION_ID"])
-            canonical_uuid(os.environ["OPSCTL_SERVER_ID"])
-            if not os.environ["OPSCTL_TARGET_SERVER"].strip():
-                raise ValueError("Caddy target Server is missing")
-            if os.environ["OPSCTL_PROXY_ENGINE"] != "caddy":
-                raise ValueError("Caddy gateway engine is invalid")
-            hosts = json.loads(os.environ["OPSCTL_ROUTE_HOSTS"])
-            port = int(os.environ["OPSCTL_ROUTE_PORT"])
-            use_https = json.loads(os.environ["OPSCTL_ROUTE_HTTPS"])
-            redirect = json.loads(os.environ["OPSCTL_REDIRECT"])
-            middlewares = json.loads(os.environ["OPSCTL_MIDDLEWARES"])
-            if (
-                not valid_hosts(hosts)
-                or not 1 <= port <= 65535
-                or not isinstance(use_https, bool)
-                or not isinstance(redirect, bool)
-                or (redirect and not use_https)
-                or middlewares != []
-            ):
-                raise ValueError("Caddy route policy is invalid")
-            if (
-                state_path.is_symlink()
-                or config_path.is_symlink()
-                or route_dir.is_symlink()
-                or not state_path.is_file()
-                or not config_path.is_file()
-                or not route_dir.is_dir()
-            ):
-                raise ValueError("Managed Caddy gateway state is unavailable")
-
-            lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-                state_raw = state_path.read_bytes()
-                state = json.loads(state_raw)
-                if (
-                    not isinstance(state, dict)
-                    or state.get("engine") != "caddy"
-                    or state.get("managed") is not True
-                    or state.get("org_id") != organization_id
-                ):
-                    raise ValueError("Caddy gateway ownership differs from route intent")
-                source_config = config_path.read_text()
-                import_line = "import /etc/caddy/opsctl-routes/*.caddy"
-                if source_config.splitlines().count(import_line) != 1:
-                    raise ValueError("Managed Caddy import is missing or ambiguous")
-
-                route_files = sorted(route_dir.glob("*.caddy"))
-                known = {}
-                for path in route_files:
-                    identity, raw = managed_route(path)
-                    if identity["organization_id"] != organization_id:
-                        raise ValueError("Caddy route belongs to another organization")
-                    if path.stem != deployment_id and set(hosts) & set(identity["route_hosts"]):
-                        raise ValueError("Caddy route hostname is already owned")
-                    known[path.name] = raw
-
-                target = route_dir / f"{deployment_id}.caddy"
-                body = route_body(hosts, port, use_https, redirect).encode()
-                identity = {
-                    "deployment_id": deployment_id,
-                    "organization_id": organization_id,
-                    "route_hosts": hosts,
-                    "route_port": port,
-                    "route_https": use_https,
-                    "redirect_http_to_https": redirect,
-                    "body_sha256": hashlib.sha256(body).hexdigest(),
-                }
-                desired = (
-                    header_prefix
-                    + json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-                    + b"\n"
-                    + body
-                )
-                previous = known.get(target.name)
-                if previous == desired:
-                    verify_live(config_path)
-                    print("CADDY_ROUTE_RESULT=noop")
-                    raise SystemExit(0)
-
-                with tempfile.TemporaryDirectory(prefix=".opsctl-caddy-route-", dir="/etc/caddy") as temporary:
-                    stage = Path(temporary)
-                    stage_routes = stage / "routes"
-                    stage_routes.mkdir(mode=0o700)
-                    for name, raw in known.items():
-                        (stage_routes / name).write_bytes(raw)
-                    (stage_routes / target.name).write_bytes(desired)
-                    staged_config = stage / "Caddyfile"
-                    staged_config.write_text(
-                        source_config.replace(str(route_dir) + "/*.caddy", str(stage_routes) + "/*.caddy")
-                    )
-                    run_caddy("validate", "--config", str(staged_config), "--adapter", "caddyfile")
-                    candidate = adapted(staged_config)
-                    if state_path.read_bytes() != state_raw:
-                        raise RuntimeError("Caddy gateway state changed during route staging")
-                    if config_path.read_text() != source_config or any(
-                        not (route_dir / name).is_file()
-                        or (route_dir / name).read_bytes() != raw
-                        for name, raw in known.items()
-                    ) or {path.name for path in route_dir.glob("*.caddy")} != set(known):
-                        raise RuntimeError("Caddy route files changed during staging")
-
-                    staged_target = stage / target.name
-                    staged_target.write_bytes(desired)
-                    os.chmod(staged_target, 0o644)
-                    activated = False
-                    try:
-                        os.replace(staged_target, target)
-                        activated = True
-                        run_caddy("reload", "--config", str(config_path), "--adapter", "caddyfile")
-                        verify_live(config_path)
-                        if adapted(config_path) != candidate:
-                            raise RuntimeError("Activated Caddy route differs from staged candidate")
-                        if (
-                            state_path.read_bytes() != state_raw
-                            or config_path.read_text() != source_config
-                            or target.read_bytes() != desired
-                            or any(
-                                (route_dir / name).read_bytes() != raw
-                                for name, raw in known.items()
-                                if name != target.name
-                            )
-                        ):
-                            raise RuntimeError("Caddy route files changed after activation")
-                    except Exception:
-                        if activated:
-                            if previous is None:
-                                target.unlink(missing_ok=True)
-                            else:
-                                restore = stage / "restore.caddy.tmp"
-                                restore.write_bytes(previous)
-                                os.chmod(restore, 0o644)
-                                os.replace(restore, target)
-                            try:
-                                run_caddy("reload", "--config", str(config_path), "--adapter", "caddyfile")
-                                verify_live(config_path)
-                                if (
-                                    state_path.read_bytes() != state_raw
-                                    or config_path.read_text() != source_config
-                                    or any(
-                                        (route_dir / name).read_bytes() != raw
-                                        for name, raw in known.items()
-                                    )
-                                ):
-                                    raise RuntimeError("Other Caddy route changed during restoration")
-                            except Exception as exc:
-                                print("CADDY_ROUTE_RESULT=cleanup_liability")
-                                raise RuntimeError("Caddy route restoration is unverified") from exc
-                            print("CADDY_ROUTE_RESULT=failed_restored")
-                        raise
-                print("CADDY_ROUTE_RESULT=changed")
-            finally:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-                os.close(lock_descriptor)
-            PY
-          args:
-            executable: /bin/bash
+        - name: Run canonical Caddy route convergence
+          script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py converge"
           environment:
             OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
+            OPSCTL_EXECUTION_CONTRACT: "{{ execution_contract }}"
+            OPSCTL_EXPECTED_OBSERVATION: "{{ expected_route_observation | default(none) | to_json }}"
+            OPSCTL_MIDDLEWARES: "{{ route_middlewares | to_json }}"
             OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
+            OPSCTL_PROXY_ENGINE: "{{ proxy_engine }}"
+            OPSCTL_REDIRECT: "{{ redirect_http_to_https | to_json }}"
+            OPSCTL_ROUTE_HOSTS: "{{ route_hosts | to_json }}"
+            OPSCTL_ROUTE_HTTPS: "{{ route_https | to_json }}"
+            OPSCTL_ROUTE_PORT: "{{ route_port | string }}"
+            OPSCTL_ROUTE_STATE: "{{ route_state }}"
             OPSCTL_SERVER_ID: "{{ server_id }}"
             OPSCTL_TARGET_SERVER: "{{ target_server }}"
-            OPSCTL_PROXY_ENGINE: "{{ proxy_engine }}"
-            OPSCTL_ROUTE_HOSTS: "{{ route_hosts | to_json }}"
-            OPSCTL_ROUTE_PORT: "{{ route_port | string }}"
-            OPSCTL_ROUTE_HTTPS: "{{ route_https | to_json }}"
-            OPSCTL_REDIRECT: "{{ redirect_http_to_https | to_json }}"
-            OPSCTL_MIDDLEWARES: "{{ route_middlewares | to_json }}"
           register: caddy_route_result
           changed_when: "'CADDY_ROUTE_RESULT=changed' in caddy_route_result.stdout"
 
