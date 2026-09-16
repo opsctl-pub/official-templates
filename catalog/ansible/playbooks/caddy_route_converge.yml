@@ -34,6 +34,7 @@
               - route_port is defined
               - route_https is defined
               - redirect_http_to_https is defined
+              - route_tls_binding is defined
               - route_middlewares == []
             fail_msg: "Managed Caddy route intent is incomplete"
 
@@ -49,6 +50,7 @@
             OPSCTL_REDIRECT: "{{ redirect_http_to_https | to_json }}"
             OPSCTL_ROUTE_HOSTS: "{{ route_hosts | to_json }}"
             OPSCTL_ROUTE_HTTPS: "{{ route_https | to_json }}"
+            OPSCTL_ROUTE_TLS_BINDING: "{{ route_tls_binding | to_json }}"
             OPSCTL_ROUTE_PORT: "{{ route_port | string }}"
             OPSCTL_ROUTE_STATE: "{{ route_state }}"
             OPSCTL_SERVER_ID: "{{ server_id }}"

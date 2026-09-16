@@ -1,0 +1,45 @@
+---
+- name: Observe one Deployment custom certificate on managed Caddy
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Run canonical Caddy custom certificate observer
+      ansible.builtin.script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py observe-custom"
+      environment:
+        OPSCTL_ADAPTER_KEY: "{{ adapter_key }}"
+        OPSCTL_CERTIFICATE_MODE: "{{ certificate_mode }}"
+        OPSCTL_CONTENT_DIGEST: "{{ content_digest }}"
+        OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
+        OPSCTL_LEAF_FINGERPRINT: "{{ leaf_fingerprint_sha256 }}"
+        OPSCTL_GATEWAY_ID: "{{ gateway_id }}"
+        OPSCTL_MATERIAL_ID: "{{ material_id }}"
+        OPSCTL_METADATA_DIGEST: "{{ metadata_digest }}"
+        OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
+        OPSCTL_PROXY_ENGINE: "caddy"
+        OPSCTL_REVISION_ID: "{{ revision_id }}"
+        OPSCTL_ROUTE_HOSTS: "{{ route_hosts | to_json }}"
+        OPSCTL_SERVER_ID: "{{ server_id }}"
+        OPSCTL_TARGET_SERVER: "{{ target_server }}"
+      register: caddy_custom_observe_result
+      changed_when: false
+      no_log: true
+
+    - name: Validate sanitized Caddy custom certificate observation marker
+      assert:
+        that:
+          - caddy_custom_observe_result.stdout_lines | length == 1
+          - caddy_custom_observe_result.stdout_lines[0] is match('^TEMPLATE_OUTPUT_JSON=')
+          - "'content_digest' not in caddy_custom_observe_result.stdout"
+          - "'BEGIN CERTIFICATE' not in caddy_custom_observe_result.stdout"
+          - "'PRIVATE KEY' not in caddy_custom_observe_result.stdout"
+          - "'tls.crt' not in caddy_custom_observe_result.stdout"
+          - "'tls.key' not in caddy_custom_observe_result.stdout"
+          - "'/etc/' not in caddy_custom_observe_result.stdout"
+          - "'/var/' not in caddy_custom_observe_result.stdout"
+        fail_msg: "Caddy custom certificate observation output is invalid"
+      no_log: true
+
+    - name: Emit sanitized Caddy custom certificate observation marker
+      debug:
+        msg: "{{ caddy_custom_observe_result.stdout }}"

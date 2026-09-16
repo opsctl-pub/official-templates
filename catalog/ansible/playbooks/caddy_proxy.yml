@@ -8,6 +8,7 @@
     caddy_proxy_state_file: "/etc/opsctl/caddy-proxy.json"
     nginx_proxy_state_file: "/etc/opsctl/nginx-proxy.json"
     caddy_route_dir: "/etc/caddy/opsctl-routes"
+    caddy_certificate_dir: "/etc/caddy/opsctl-certificates"
     caddy_config_file: "/etc/caddy/Caddyfile"
     caddy_acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
   pre_tasks:
@@ -144,11 +145,50 @@
             state: present
             update_cache: true
 
+        - name: Resolve canonical Caddy service group
+          command: systemctl show --property=Group --value caddy.service
+          register: caddy_service_group_result
+          changed_when: false
+
+        - name: Validate canonical Caddy service group
+          assert:
+            that:
+              - (caddy_service_group_result.stdout | trim | length) > 0
+            fail_msg: "Caddy service group is unavailable"
+
+        - name: Resolve canonical Caddy service group account
+          getent:
+            database: group
+            key: "{{ caddy_service_group_result.stdout | trim }}"
+
         - name: Ensure Caddy route directory exists
           file:
             path: "{{ caddy_route_dir }}"
             state: directory
             mode: "0755"
+
+        - name: Ensure private Caddy certificate directory exists
+          file:
+            path: "{{ caddy_certificate_dir }}"
+            state: directory
+            owner: root
+            group: "{{ caddy_service_group_result.stdout | trim }}"
+            mode: "0710"
+
+        - name: Verify private Caddy certificate directory contract
+          stat:
+            path: "{{ caddy_certificate_dir }}"
+          register: caddy_certificate_dir_stat
+
+        - name: Require private Caddy certificate directory contract
+          assert:
+            that:
+              - caddy_certificate_dir_stat.stat.isdir
+              - not caddy_certificate_dir_stat.stat.islnk
+              - caddy_certificate_dir_stat.stat.pw_name == 'root'
+              - caddy_certificate_dir_stat.stat.gr_name == (caddy_service_group_result.stdout | trim)
+              - caddy_certificate_dir_stat.stat.mode == '0710'
+            fail_msg: "Caddy certificate directory contract is invalid"
 
         - name: Write canonical Caddy configuration
           copy:

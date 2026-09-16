@@ -1,0 +1,77 @@
+---
+- name: Install one Deployment custom certificate on managed Caddy
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    certificate_source_dir: "/var/run/opsctl/file-secret"
+  tasks:
+    - name: Create private remote certificate staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: opsctl-caddy-certificate-
+      register: caddy_certificate_stage
+      no_log: true
+
+    - name: Install and verify custom certificate material
+      block:
+        - name: Transport certificate chain
+          ansible.builtin.copy:
+            src: "{{ certificate_source_dir }}/tls.crt"
+            dest: "{{ caddy_certificate_stage.path }}/tls.crt"
+            mode: "0600"
+          no_log: true
+
+        - name: Transport certificate key
+          ansible.builtin.copy:
+            src: "{{ certificate_source_dir }}/tls.key"
+            dest: "{{ caddy_certificate_stage.path }}/tls.key"
+            mode: "0600"
+          no_log: true
+
+        - name: Run canonical Caddy custom certificate installer
+          ansible.builtin.script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py install-custom"
+          environment:
+            OPSCTL_ADAPTER_KEY: "{{ adapter_key }}"
+            OPSCTL_CERTIFICATE_MODE: "{{ certificate_mode }}"
+            OPSCTL_CONTENT_DIGEST: "{{ content_digest }}"
+            OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
+            OPSCTL_EXPECTED_OBSERVATION: "{{ expected_custom_certificate_observation | to_json }}"
+            OPSCTL_FILE_SECRET_DIR: "{{ caddy_certificate_stage.path }}"
+            OPSCTL_LEAF_FINGERPRINT: "{{ leaf_fingerprint_sha256 }}"
+            OPSCTL_GATEWAY_ID: "{{ gateway_id }}"
+            OPSCTL_MATERIAL_ID: "{{ material_id }}"
+            OPSCTL_METADATA_DIGEST: "{{ metadata_digest }}"
+            OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
+            OPSCTL_PROXY_ENGINE: "caddy"
+            OPSCTL_REVISION_ID: "{{ revision_id }}"
+            OPSCTL_ROUTE_HOSTS: "{{ route_hosts | to_json }}"
+            OPSCTL_SERVER_ID: "{{ server_id }}"
+            OPSCTL_TARGET_SERVER: "{{ target_server }}"
+          register: caddy_custom_install_result
+          no_log: true
+
+        - name: Validate sanitized Caddy custom certificate installation marker
+          assert:
+            that:
+              - caddy_custom_install_result.stdout_lines | length == 1
+              - caddy_custom_install_result.stdout_lines[0] is match('^TEMPLATE_OUTPUT_JSON=')
+              - "'content_digest' not in caddy_custom_install_result.stdout"
+              - "'BEGIN CERTIFICATE' not in caddy_custom_install_result.stdout"
+              - "'PRIVATE KEY' not in caddy_custom_install_result.stdout"
+              - "'tls.crt' not in caddy_custom_install_result.stdout"
+              - "'tls.key' not in caddy_custom_install_result.stdout"
+              - "'/etc/' not in caddy_custom_install_result.stdout"
+              - "'/var/' not in caddy_custom_install_result.stdout"
+            fail_msg: "Caddy custom certificate installation output is invalid"
+          no_log: true
+
+        - name: Emit sanitized Caddy custom certificate installation marker
+          debug:
+            msg: "{{ caddy_custom_install_result.stdout }}"
+      always:
+        - name: Remove private remote certificate staging directory
+          ansible.builtin.file:
+            path: "{{ caddy_certificate_stage.path }}"
+            state: absent
+          no_log: true
