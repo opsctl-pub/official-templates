@@ -138,12 +138,157 @@
           args:
             executable: /bin/sh
 
-        - name: Ensure Caddy package present
+        - name: Ensure official Caddy repository prerequisites
           apt:
             name:
-              - caddy
+              - apt-transport-https
+              - ca-certificates
+              - debian-archive-keyring
+              - debian-keyring
+              - gnupg
             state: present
             update_cache: true
+            cache_valid_time: 3600
+
+        - name: Fetch official stable Caddy signing key
+          get_url:
+            url: https://dl.cloudsmith.io/public/caddy/stable/gpg.key
+            dest: /usr/share/keyrings/caddy-stable-archive-keyring.asc
+            owner: root
+            group: root
+            mode: "0644"
+          register: caddy_stable_key_fetch
+
+        - name: Inspect official stable Caddy keyring
+          stat:
+            path: /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          register: caddy_stable_keyring_stat
+
+        - name: Install official stable Caddy keyring
+          command:
+            argv:
+              - gpg
+              - --batch
+              - --yes
+              - --dearmor
+              - --output
+              - /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+              - /usr/share/keyrings/caddy-stable-archive-keyring.asc
+          when: caddy_stable_key_fetch.changed or not caddy_stable_keyring_stat.stat.exists
+          register: caddy_stable_keyring_install
+
+        - name: Keep official stable Caddy keyring readable by APT
+          file:
+            path: /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            state: file
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Fetch official stable Caddy APT source
+          get_url:
+            url: https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt
+            dest: /etc/apt/sources.list.d/caddy-stable.list
+            owner: root
+            group: root
+            mode: "0644"
+          register: caddy_stable_source_fetch
+
+        - name: Read official stable Caddy APT source
+          slurp:
+            path: /etc/apt/sources.list.d/caddy-stable.list
+          register: caddy_stable_source_raw
+
+        - name: Require signed official stable Caddy APT source
+          assert:
+            that:
+              - >-
+                ((caddy_stable_source_raw.content | b64decode).splitlines()
+                | select('match', '^deb(?:-src)? ') | list) == [
+                  'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main',
+                  'deb-src [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main'
+                ]
+            fail_msg: "Official stable Caddy APT source is invalid"
+
+        - name: Refresh APT metadata for official stable Caddy source
+          apt:
+            update_cache: true
+            cache_valid_time: "{{ 0 if (caddy_stable_source_fetch.changed or caddy_stable_keyring_install.changed) else 3600 }}"
+
+        - name: Inspect selected Caddy package candidate
+          command: apt-cache policy caddy
+          register: caddy_stable_policy
+          changed_when: false
+
+        - name: Require a selected Caddy package candidate
+          assert:
+            that:
+              - caddy_stable_policy.stdout is search('(?m)^\s*Candidate:\s*\S+')
+              - caddy_stable_policy.stdout is not search('(?m)^\s*Candidate:\s*\(none\)')
+            fail_msg: "Official stable Caddy package candidate is unavailable"
+
+        - name: Bind selected Caddy package candidate
+          set_fact:
+            caddy_stable_candidate: "{{ caddy_stable_policy.stdout | regex_findall('(?m)^\\s*Candidate:\\s*(\\S+)') | first }}"
+
+        - name: Require selected candidate from signed official stable source
+          assert:
+            that:
+              - >-
+                caddy_stable_policy.stdout is search(
+                  '(?m)^\s+(?:\*\*\*\s+)?'
+                  ~ (caddy_stable_candidate | regex_escape)
+                  ~ '\s+\d+\n\s+\d+ https://dl\.cloudsmith\.io/public/caddy/stable/deb/debian\s+'
+                )
+            fail_msg: "Selected Caddy package is not from the official stable source"
+
+        - name: Require a valid Caddy package candidate version
+          assert:
+            that:
+              - caddy_stable_candidate is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+            fail_msg: "Official stable Caddy candidate version is invalid"
+
+        - name: Bind Caddy package candidate version
+          set_fact:
+            caddy_stable_candidate_semver: "{{ caddy_stable_candidate.split('.') | map('int') | list }}"
+
+        - name: Require supported Caddy package candidate
+          assert:
+            that:
+              - caddy_stable_candidate_semver[0] == 2
+              - caddy_stable_candidate_semver >= [2, 11, 1]
+            fail_msg: "Official stable Caddy candidate must be version 2.11.1 or later in the 2.x series"
+
+        - name: Ensure Caddy package present
+          apt:
+            name: caddy
+            state: latest
+            policy_rc_d: 101
+
+        - name: Read installed Caddy version
+          command: caddy version
+          register: caddy_installed_version
+          changed_when: false
+
+        - name: Require a valid installed Caddy semantic version
+          assert:
+            that:
+              - caddy_installed_version.stdout is match('^v?[0-9]+\.[0-9]+\.[0-9]+(?:\s|$)')
+            fail_msg: "Installed Caddy version is invalid"
+
+        - name: Bind installed Caddy semantic version
+          set_fact:
+            caddy_installed_semver: >-
+              {{ (caddy_installed_version.stdout
+                  | regex_search('^v?[0-9]+\.[0-9]+\.[0-9]+')
+                  | regex_replace('^v', '')).split('.') | map('int') | list }}
+
+        - name: Require supported Caddy version
+          assert:
+            that:
+              - caddy_installed_semver[0] == 2
+              - caddy_installed_semver >= [2, 11, 1]
+            fail_msg: "Installed Caddy version must be 2.11.1 or later in the 2.x series"
 
         - name: Resolve canonical Caddy service group
           command: systemctl show --property=Group --value caddy.service
