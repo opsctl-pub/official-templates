@@ -90,8 +90,12 @@
           set_fact:
             wireguard_interface_address: "{{ wireguard_ip if ('/' in (wireguard_ip | string)) else (wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
 
-        - name: Capture WireGuard service state
-          service_facts:
+        - name: Capture exact WireGuard systemd unit state
+          ansible.builtin.systemd_service:
+            name: "{{ wireguard_service_name }}.service"
+          register: wireguard_service_query
+          changed_when: false
+          failed_when: false
 
         - name: Capture existing WireGuard interface state
           command: "ip link show dev {{ wireguard_interface_name }}"
@@ -108,25 +112,51 @@
             - {name: public, path: "{{ wireguard_public_key_path }}"}
           register: wireguard_file_stats
 
-        - name: Normalize preexisting WireGuard state
+        - name: Normalize exact WireGuard systemd state
           set_fact:
-            wireguard_service_fact_key: "{{ wireguard_service_name }}.service"
-            wireguard_service_before: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}) }}"
-            wireguard_service_was_enabled: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}).get('status') == 'enabled' }}"
-            wireguard_service_was_running: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}).get('state') == 'running' }}"
+            wireguard_service_before: "{{ wireguard_service_query.status | default({}) }}"
             wireguard_interface_was_present: "{{ wireguard_interface_before.rc == 0 }}"
             wireguard_config_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'config') | list | first).stat }}"
             wireguard_private_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'private') | list | first).stat }}"
             wireguard_public_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'public') | list | first).stat }}"
             wireguard_activation_started: false
 
+        - name: Normalize WireGuard systemd status fields
+          set_fact:
+            wireguard_service_has_status: "{{ wireguard_service_before is mapping and wireguard_service_before | length > 0 }}"
+            wireguard_service_load_state: "{{ wireguard_service_before.get('LoadState', '') }}"
+            wireguard_service_active_state: "{{ wireguard_service_before.get('ActiveState', '') }}"
+            wireguard_service_sub_state: "{{ wireguard_service_before.get('SubState', '') }}"
+            wireguard_service_unit_file_state: "{{ wireguard_service_before.get('UnitFileState', '') }}"
+
+        - name: Validate exact WireGuard systemd status
+          set_fact:
+            wireguard_service_status_valid: >-
+              {{ wireguard_service_has_status
+                 and wireguard_service_load_state == 'loaded'
+                 and wireguard_service_active_state in ['active', 'inactive']
+                 and wireguard_service_sub_state is string
+                 and wireguard_service_sub_state | length > 0
+                 and wireguard_service_sub_state not in ['unknown', 'failed']
+                 and wireguard_service_unit_file_state in ['enabled', 'disabled'] }}
+            wireguard_service_was_enabled: "{{ wireguard_service_unit_file_state == 'enabled' }}"
+            wireguard_service_was_running: "{{ wireguard_service_active_state == 'active' }}"
+
         - name: Require preexisting WireGuard interface ownership
           assert:
             that:
-              - not wireguard_interface_was_present or wireguard_service_was_running
+              - >-
+                (not wireguard_interface_was_present)
+                or (
+                  wireguard_service_status_valid
+                  and wireguard_service_was_running
+                )
+              - >-
+                (not wireguard_service_has_status)
+                or wireguard_service_status_valid
             fail_msg: >-
-              A preexisting WireGuard interface must be owned by its captured running
-              service before activation can mutate its files or service state.
+              WireGuard systemd ownership is missing, malformed, inactive, failed,
+              or unsupported before activation.
 
         - name: Create private WireGuard transaction scratch
           tempfile:
