@@ -90,33 +90,126 @@
           set_fact:
             wireguard_interface_address: "{{ wireguard_ip if ('/' in (wireguard_ip | string)) else (wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
 
-        - name: Check for existing private key
-          stat:
-            path: "{{ wireguard_private_key_path }}"
-          register: wireguard_private_key_stat
+        - name: Capture WireGuard service state
+          service_facts:
 
-        - name: Generate WireGuard private/public keypair on node
+        - name: Capture existing WireGuard interface state
+          command: "ip link show dev {{ wireguard_interface_name }}"
+          register: wireguard_interface_before
+          changed_when: false
+          failed_when: false
+
+        - name: Capture existing WireGuard file state
+          stat:
+            path: "{{ item.path }}"
+          loop:
+            - {name: config, path: "{{ wireguard_config_path }}"}
+            - {name: private, path: "{{ wireguard_private_key_path }}"}
+            - {name: public, path: "{{ wireguard_public_key_path }}"}
+          register: wireguard_file_stats
+
+        - name: Normalize preexisting WireGuard state
+          set_fact:
+            wireguard_service_fact_key: "{{ wireguard_service_name }}.service"
+            wireguard_service_before: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}) }}"
+            wireguard_service_was_enabled: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}).get('status') == 'enabled' }}"
+            wireguard_service_was_running: "{{ (ansible_facts | default({})).get('services', {}).get(wireguard_service_name ~ '.service', {}).get('state') == 'running' }}"
+            wireguard_interface_was_present: "{{ wireguard_interface_before.rc == 0 }}"
+            wireguard_config_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'config') | list | first).stat }}"
+            wireguard_private_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'private') | list | first).stat }}"
+            wireguard_public_before: "{{ (wireguard_file_stats.results | selectattr('item.name', 'equalto', 'public') | list | first).stat }}"
+            wireguard_activation_started: false
+
+        - name: Require preexisting WireGuard interface ownership
+          assert:
+            that:
+              - not wireguard_interface_was_present or wireguard_service_was_running
+            fail_msg: >-
+              A preexisting WireGuard interface must be owned by its captured running
+              service before activation can mutate its files or service state.
+
+        - name: Create private WireGuard transaction scratch
+          tempfile:
+            state: directory
+            prefix: opsctl-wireguard-
+          register: wireguard_transaction_scratch
+          no_log: true
+
+        - name: Back up existing WireGuard configuration
+          copy:
+            src: "{{ wireguard_config_path }}"
+            dest: "{{ wireguard_transaction_scratch.path }}/config"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "{{ wireguard_config_before.mode }}"
+          when: wireguard_transaction_scratch is defined and wireguard_config_before is defined and wireguard_config_before.exists
+          no_log: true
+
+        - name: Back up existing WireGuard private key
+          copy:
+            src: "{{ wireguard_private_key_path }}"
+            dest: "{{ wireguard_transaction_scratch.path }}/private"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          when: wireguard_private_before.exists
+          no_log: true
+
+        - name: Back up existing WireGuard public key
+          copy:
+            src: "{{ wireguard_public_key_path }}"
+            dest: "{{ wireguard_transaction_scratch.path }}/public"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "{{ wireguard_public_before.mode }}"
+          when: wireguard_public_before.exists
+          no_log: true
+
+        - name: Build candidate WireGuard private key
           shell: |
             umask 077
-            wg genkey | tee "{{ wireguard_private_key_path }}" | wg pubkey > "{{ wireguard_public_key_path }}"
+            wg genkey > "{{ wireguard_transaction_scratch.path }}/candidate-private"
           args:
             executable: /bin/sh
-          when: not wireguard_private_key_stat.stat.exists
+          when: not wireguard_private_before.exists
+          no_log: true
 
-        - name: Read WireGuard private key
-          command: "cat {{ wireguard_private_key_path }}"
-          register: wireguard_private_key_result
+        - name: Copy existing private key into candidate
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/private"
+            dest: "{{ wireguard_transaction_scratch.path }}/candidate-private"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          when: wireguard_private_before.exists
+          no_log: true
+
+        - name: Derive candidate WireGuard public key
+          shell: |
+            umask 077
+            wg pubkey < "{{ wireguard_transaction_scratch.path }}/candidate-private" > "{{ wireguard_transaction_scratch.path }}/candidate-public"
+          args:
+            executable: /bin/sh
+          no_log: true
+
+        - name: Read candidate WireGuard public key
+          command: "cat {{ wireguard_transaction_scratch.path }}/candidate-public"
+          register: wireguard_candidate_public_key
+          changed_when: false
+
+        - name: Read candidate WireGuard private key
+          command: "cat {{ wireguard_transaction_scratch.path }}/candidate-private"
+          register: wireguard_candidate_private_key
           changed_when: false
           no_log: true
 
-        - name: Read WireGuard public key
-          command: "cat {{ wireguard_public_key_path }}"
-          register: wireguard_public_key_result
-          changed_when: false
-
-        - name: Write WireGuard interface config
+        - name: Build candidate WireGuard configuration
           copy:
-            dest: "{{ wireguard_config_path }}"
+            dest: "{{ wireguard_transaction_scratch.path }}/candidate.conf"
             owner: root
             group: root
             mode: "0600"
@@ -124,7 +217,7 @@
               [Interface]
               Address = {{ wireguard_interface_address }}
               ListenPort = {{ wireguard_requested_listen_port }}
-              PrivateKey = {{ wireguard_private_key_result.stdout | trim }}
+              PrivateKey = {{ wireguard_candidate_private_key.stdout | trim }}
               PostUp = iptables -C INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT || iptables -I INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT
               PostDown = iptables -D INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT || true
               {% for peer in wireguard_requested_peers %}
@@ -139,6 +232,45 @@
               PersistentKeepalive = {{ peer.persistent_keepalive }}
               {% endif %}
               {% endfor %}
+          no_log: true
+
+        - name: Validate candidate WireGuard configuration
+          command: "wg-quick strip {{ wireguard_transaction_scratch.path }}/candidate.conf"
+          changed_when: false
+          no_log: true
+
+        - name: Mark WireGuard activation as started
+          set_fact:
+            wireguard_activation_started: true
+
+        - name: Install validated WireGuard private key
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/candidate-private"
+            dest: "{{ wireguard_private_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Install validated WireGuard public key
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/candidate-public"
+            dest: "{{ wireguard_public_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Install validated WireGuard configuration
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/candidate.conf"
+            dest: "{{ wireguard_config_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
           no_log: true
 
         - name: Ensure WireGuard service enabled and restarted
@@ -166,12 +298,12 @@
 
         - name: Emit WireGuard structured outputs
           shell: |
-            printf 'TEMPLATE_OUTPUT_JSON=%s\n' "{{ wireguard_output_payload | to_json | replace('\"', '\\\"') }}"
+            printf 'TEMPLATE_OUTPUT_JSON=%s\n' '{{ wireguard_output_payload | to_json }}'
           args:
             executable: /bin/sh
           vars:
             wireguard_output_payload:
-              wireguard_public_key: "{{ wireguard_public_key_result.stdout | trim }}"
+              wireguard_public_key: "{{ wireguard_candidate_public_key.stdout | trim }}"
               wireguard_ip: "{{ wireguard_ip }}"
 
         - name: OPERATION_STEP wireguard:ready
@@ -191,21 +323,99 @@
             name: "{{ wireguard_service_name }}"
             state: stopped
             enabled: false
+          when: wireguard_activation_started | default(false)
           failed_when: false
 
         - name: Delete WireGuard interface after failure
           command: "ip link delete dev {{ wireguard_interface_name }}"
+          when: wireguard_activation_started | default(false)
           failed_when: false
           changed_when: false
 
-        - name: Remove partial WireGuard files after failure
+        - name: Restore existing WireGuard configuration
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/config"
+            dest: "{{ wireguard_config_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "{{ wireguard_config_before.mode }}"
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_transaction_scratch is defined
+            and wireguard_config_before is defined
+            and wireguard_config_before.exists
+          no_log: true
+
+        - name: Remove newly created WireGuard configuration
           file:
-            path: "{{ item }}"
+            path: "{{ wireguard_config_path }}"
             state: absent
-          loop:
-            - "{{ wireguard_config_path }}"
-            - "{{ wireguard_private_key_path }}"
-            - "{{ wireguard_public_key_path }}"
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_config_before is defined
+            and not wireguard_config_before.exists
+          failed_when: false
+
+        - name: Restore existing WireGuard private key
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/private"
+            dest: "{{ wireguard_private_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "{{ wireguard_private_before.mode }}"
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_transaction_scratch is defined
+            and wireguard_private_before is defined
+            and wireguard_private_before.exists
+          no_log: true
+
+        - name: Remove newly created WireGuard private key
+          file:
+            path: "{{ wireguard_private_key_path }}"
+            state: absent
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_private_before is defined
+            and not wireguard_private_before.exists
+          failed_when: false
+
+        - name: Restore existing WireGuard public key
+          copy:
+            src: "{{ wireguard_transaction_scratch.path }}/public"
+            dest: "{{ wireguard_public_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "{{ wireguard_public_before.mode }}"
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_transaction_scratch is defined
+            and wireguard_public_before is defined
+            and wireguard_public_before.exists
+          no_log: true
+
+        - name: Remove newly created WireGuard public key
+          file:
+            path: "{{ wireguard_public_key_path }}"
+            state: absent
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_public_before is defined
+            and not wireguard_public_before.exists
+          failed_when: false
+
+        - name: Restore preexisting WireGuard service state
+          systemd:
+            name: "{{ wireguard_service_name }}"
+            enabled: "{{ wireguard_service_was_enabled }}"
+            state: "{{ 'started' if wireguard_service_was_running else 'stopped' }}"
+          when: >-
+            wireguard_activation_started | default(false)
+            and wireguard_service_before is defined
+            and wireguard_service_before | length > 0
           failed_when: false
 
         - name: OPERATION_STEP wireguard:failure
@@ -217,3 +427,10 @@
         - name: Fail WireGuard overlay ensure
           fail:
             msg: "WireGuard overlay ensure failed"
+      always:
+        - name: Remove WireGuard transaction scratch
+          file:
+            path: "{{ wireguard_transaction_scratch.path }}"
+            state: absent
+          when: wireguard_transaction_scratch is defined
+          no_log: true
