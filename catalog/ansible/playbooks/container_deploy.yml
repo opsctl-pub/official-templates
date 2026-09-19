@@ -10,6 +10,7 @@
     host_health_port: "{{ app_health_port | default(app_ports[0]) }}"
     exposure_mode: "{{ backend_exposure_mode | default('host') }}"
     loopback_backend_enabled: "{{ exposure_mode == 'loopback' }}"
+    source_dual_backend_enabled: "{{ exposure_mode == 'loopback_wireguard' }}"
     traefik_enabled: "{{ (app_traefik_enabled | default(false) | bool) and not loopback_backend_enabled }}"
     traefik_hosts: "{{ app_traefik_hosts | default(([app_traefik_host] if (app_traefik_host is defined and (app_traefik_host | string | length) > 0) else []), true) }}"
     traefik_rule: "{{ 'Host(' ~ (traefik_hosts | map('regex_replace', '^(.*)$', '`\\1`') | join(',')) ~ ')' }}"
@@ -29,6 +30,7 @@
     health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
     health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
     published_ports: []
+    host_port_preflight_enabled: "{{ (not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled }}"
     traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
     traefik_label_map: {}
     opsctl_label_map:
@@ -43,8 +45,8 @@
     - name: Validate backend exposure mode before mutation
       assert:
         that:
-          - exposure_mode in ['host', 'wireguard', 'loopback']
-        fail_msg: "backend_exposure_mode must be host, wireguard, or loopback"
+          - exposure_mode in ['host', 'wireguard', 'loopback', 'loopback_wireguard']
+        fail_msg: "backend_exposure_mode must be host, wireguard, loopback, or loopback_wireguard"
 
     - name: Validate loopback backend mapping before mutation
       assert:
@@ -56,7 +58,7 @@
           - (backend_container_port | int) > 0
           - (backend_container_port | int) <= 65535
         fail_msg: "route_port and container_port are required for backend_exposure_mode=loopback"
-      when: loopback_backend_enabled
+      when: loopback_backend_enabled or source_dual_backend_enabled
   tasks:
     - name: Ensure container health port derived when missing
       set_fact:
@@ -75,11 +77,30 @@
         fail_msg: "wireguard_ip, route_port, and container_port are required for backend_exposure_mode=wireguard"
       when: wireguard_backend_enabled
 
+    - name: Validate combined source backend exposure inputs
+      assert:
+        that:
+          - source_dual_backend_enabled
+          - backend_wireguard_ip | string | length > 0
+          - backend_route_port is not none
+          - effective_backend_container_port is not none
+        fail_msg: "loopback_wireguard exposure requires WireGuard IP, route port, and container port"
+      when: source_dual_backend_enabled
+
+    - name: Derive published ports for combined source backend exposure
+      set_fact:
+        published_ports:
+          - "127.0.0.1:{{ backend_route_port }}:{{ backend_container_port }}"
+          - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
+      when: source_dual_backend_enabled
+
     - name: Derive published ports for WireGuard backend exposure
       set_fact:
         published_ports:
           - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
-      when: wireguard_backend_enabled
+      when:
+        - wireguard_backend_enabled
+        - not source_dual_backend_enabled
 
     - name: Derive published port for loopback backend exposure
       set_fact:
@@ -93,6 +114,7 @@
       when:
         - not wireguard_backend_enabled
         - not loopback_backend_enabled
+        - not source_dual_backend_enabled
         - traefik_enabled
 
     - name: Derive published ports for direct host exposure
@@ -106,6 +128,7 @@
       when:
         - not wireguard_backend_enabled
         - not loopback_backend_enabled
+        - not source_dual_backend_enabled
         - not traefik_enabled
 
     - name: OPERATION_STEP start
@@ -144,12 +167,11 @@
         deploy_host_ports: >-
           {{
             [backend_route_port]
-            if loopback_backend_enabled
+            if (loopback_backend_enabled or source_dual_backend_enabled)
             else (published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list)
           }}
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (published_ports | length) > 0
 
     - name: OPERATION_STEP preflight:ports start
@@ -158,8 +180,7 @@
       args:
         executable: /bin/sh
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Detect host port conflicts
@@ -237,32 +258,28 @@
       changed_when: false
       failed_when: port_conflicts_result.rc != 0
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Parse port conflict results
       set_fact:
         port_conflict_entries: "{{ port_conflicts_result.stdout | default('[]') | from_json }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Initialize post-conflict list
       set_fact:
         port_conflict_entries_post: "{{ port_conflict_entries | default([]) }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Record conflicting container names
       set_fact:
         port_conflict_names: "{{ port_conflict_entries | map(attribute='name') | list }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
 
     - name: Fail on port conflicts without override
@@ -276,10 +293,9 @@
           fail:
             msg: "port_conflict"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
-        - loopback_backend_enabled or not (replace_conflicts | default(false) | bool)
+        - loopback_backend_enabled or source_dual_backend_enabled or not (replace_conflicts | default(false) | bool)
 
     - name: Determine removable conflict containers
       shell: |
@@ -328,8 +344,7 @@
       changed_when: false
       failed_when: removable_conflicts.rc != 0
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
 
@@ -337,8 +352,7 @@
       set_fact:
         removable_containers: "{{ removable_conflicts.stdout | default('[]') | from_json }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
 
@@ -346,8 +360,7 @@
       command: docker rm -f {{ item }}
       loop: "{{ removable_containers | default([]) }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
         - (removable_containers | default([]) | length) > 0
 
@@ -357,8 +370,7 @@
       args:
         executable: /bin/sh
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
         - (removable_containers | default([]) | length) > 0
 
@@ -437,8 +449,7 @@
       changed_when: false
       failed_when: port_conflicts_retry_result.rc != 0
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
 
@@ -448,6 +459,7 @@
       when:
         - not traefik_enabled
         - not wireguard_backend_enabled
+        - not source_dual_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
 
@@ -462,8 +474,7 @@
           fail:
             msg: "port_conflict"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries_post | default([]) | length) > 0
 
@@ -473,8 +484,7 @@
       args:
         executable: /bin/sh
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
+        - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
         - (
             (port_conflict_entries | length == 0)
