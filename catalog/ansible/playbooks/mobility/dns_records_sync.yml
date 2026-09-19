@@ -40,6 +40,26 @@
           loop_control:
             label: "{{ item.hostname }}:{{ item.action }}"
 
+        - name: Validate confirmed external DNS delete shape
+          assert:
+            that:
+              - (compare_before_apply | default(false)) is boolean
+              - >-
+                not (compare_before_apply | default(false) | bool)
+                or (
+                  (item.action | string) == 'delete'
+                  and (item.record_type | string | upper) == 'A'
+                  and (item.tracked_record_id is not defined or item.tracked_record_id is none)
+                  and (item.provider_record_id is defined)
+                  and ((item.provider_record_id | string | length) > 0)
+                  and not (item.proxied | default(false) | bool)
+                )
+            fail_msg: "Confirmed external DNS delete plan is invalid"
+          loop: "{{ dns_changes }}"
+          loop_control:
+            label: "{{ item.hostname }}:{{ item.action }}"
+          when: compare_before_apply | default(false) | bool
+
         - name: Initialize applied changes accumulator
           set_fact:
             dns_sync_applied_changes: []
