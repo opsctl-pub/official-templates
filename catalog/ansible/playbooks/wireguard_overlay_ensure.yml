@@ -5,15 +5,15 @@
   become: true
   vars:
     wireguard_base_dir: "/etc/wireguard"
-    wireguard_state: "{{ wireguard_state | default('present') }}"
-    wireguard_listen_port: "{{ wireguard_listen_port | default(51820) }}"
+    wireguard_requested_state: "{{ wireguard_state | default('present') }}"
+    wireguard_requested_listen_port: "{{ wireguard_listen_port | default(51820) }}"
     short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
     wireguard_interface_name: "wg-{{ short_deployment_id }}"
     wireguard_private_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.key"
     wireguard_public_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.pub"
     wireguard_config_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.conf"
     wireguard_service_name: "wg-quick@{{ wireguard_interface_name }}"
-    wireguard_peers: "{{ wireguard_peers | default([]) }}"
+    wireguard_requested_peers: "{{ wireguard_peers | default([]) }}"
   pre_tasks:
     - name: Skip WireGuard ensure when running in simulate mode
       meta: end_play
@@ -74,7 +74,7 @@
 
             - name: End play after WireGuard cleanup
               meta: end_play
-          when: wireguard_state == "absent"
+          when: wireguard_requested_state == "absent"
 
         - name: Validate required WireGuard variables
           assert:
@@ -123,11 +123,11 @@
             content: |
               [Interface]
               Address = {{ wireguard_interface_address }}
-              ListenPort = {{ wireguard_listen_port }}
+              ListenPort = {{ wireguard_requested_listen_port }}
               PrivateKey = {{ wireguard_private_key_result.stdout | trim }}
-              PostUp = iptables -C INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT || iptables -I INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT
-              PostDown = iptables -D INPUT -p udp --dport {{ wireguard_listen_port }} -j ACCEPT || true
-              {% for peer in wireguard_peers %}
+              PostUp = iptables -C INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT || iptables -I INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT
+              PostDown = iptables -D INPUT -p udp --dport {{ wireguard_requested_listen_port }} -j ACCEPT || true
+              {% for peer in wireguard_requested_peers %}
 
               [Peer]
               PublicKey = {{ peer.public_key }}
