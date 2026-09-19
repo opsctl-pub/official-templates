@@ -32,10 +32,30 @@
         - name: Validate F-1 changeset shape
           assert:
             that:
-              - (item.action | string) in ["create", "update", "delete"]
+              - (item.action | string) in ["create", "update", "delete", "adopt"]
               - (item.record_type | string | upper) == "A"
               - not (item.proxied | default(false) | bool)
             fail_msg: "F-1 supports Cloudflare A records in DNS-only mode only"
+          loop: "{{ dns_changes }}"
+          loop_control:
+            label: "{{ item.hostname }}:{{ item.action }}"
+
+        - name: Validate exact DNS adoption identity shape
+          assert:
+            that:
+              - >-
+                (item.action | string) != 'adopt'
+                or (
+                  item.provider_record_id is defined
+                  and (item.provider_record_id | string | length) > 0
+                  and item.deployment_id is defined
+                  and (item.deployment_id | string | length) > 0
+                  and item.tracked_record_id is defined
+                  and item.tracked_record_id is none
+                  and (item.record_type | string | upper) == 'A'
+                  and not (item.proxied | default(false) | bool)
+                )
+            fail_msg: "DNS adoption plan identity is invalid"
           loop: "{{ dns_changes }}"
           loop_control:
             label: "{{ item.hostname }}:{{ item.action }}"

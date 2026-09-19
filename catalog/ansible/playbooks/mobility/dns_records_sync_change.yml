@@ -32,6 +32,54 @@
         - dns_change.action == 'delete'
         - compare_before_apply | default(false) | bool
 
+    - name: Read the exact provider record before adoption
+      uri:
+        url: "{{ cloudflare_api_base }}/zones/{{ provider_zone_id }}/dns_records/{{ dns_change.provider_record_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+          Content-Type: "application/json"
+        status_code: 200
+        return_content: true
+      register: dns_sync_adopt_result
+      no_log: true
+      when: dns_change.action == 'adopt'
+
+    - name: Assert the exact provider record still matches the adoption plan
+      assert:
+        that:
+          - dns_sync_adopt_result.json.success | default(false)
+          - dns_sync_adopt_result.json.result is defined
+          - dns_sync_adopt_result.json.result.id == dns_change.provider_record_id
+          - dns_sync_adopt_result.json.result.name == dns_change.hostname
+          - (dns_sync_adopt_result.json.result.type | string | upper) == (dns_change.record_type | string | upper)
+          - dns_sync_adopt_result.json.result.content == dns_change.value
+          - (dns_sync_adopt_result.json.result.ttl | int) == (dns_change.ttl | int)
+          - (dns_sync_adopt_result.json.result.proxied | bool) == (dns_change.proxied | bool)
+        fail_msg: "Adopted external DNS record changed or is missing"
+      when: dns_change.action == 'adopt'
+
+    - name: Accumulate the adopted managed DNS change
+      set_fact:
+        dns_sync_applied_changes: >-
+          {{
+            dns_sync_applied_changes + [
+              {
+                "change_id": dns_change.change_id,
+                "action": dns_change.action,
+                "hostname": dns_change.hostname,
+                "record_type": dns_change.record_type,
+                "value": dns_change.value,
+                "ttl": dns_change.ttl,
+                "proxied": false,
+                "provider_record_id": dns_change.provider_record_id,
+                "deployment_id": dns_change.deployment_id,
+                "tracked_record_id": dns_change.tracked_record_id | default(None)
+              }
+            ]
+          }}
+      when: dns_change.action == 'adopt'
+
     - name: Apply one Cloudflare managed DNS change
       uri:
         url: >-
@@ -61,6 +109,7 @@
         return_content: true
       register: dns_sync_apply_result
       no_log: true
+      when: dns_change.action != 'adopt'
 
     - name: Assert the Cloudflare change succeeded
       assert:
@@ -78,6 +127,7 @@
               else 'Cloudflare request failed'
             )
           }}
+      when: dns_change.action != 'adopt'
 
     - name: Accumulate the applied managed DNS change
       set_fact:
@@ -105,6 +155,7 @@
               }
             ]
           }}
+      when: dns_change.action != 'adopt'
 
     - name: Emit cumulative structured DNS sync outputs
       debug:
