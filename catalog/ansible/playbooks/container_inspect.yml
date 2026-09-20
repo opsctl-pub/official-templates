@@ -124,6 +124,16 @@
             state = container_payload.get("State") or {}
             return bool(state.get("Running"))
 
+        def identity_labels_for(container_payload):
+            labels = labels_for(container_payload) if container_payload is not None else {}
+            return {
+                "com.opsctl.managed": labels.get("com.opsctl.managed"),
+                "com.opsctl.org_id": labels.get("com.opsctl.org_id"),
+                "com.opsctl.project_id": labels.get("com.opsctl.project_id"),
+                "com.opsctl.app": labels.get("com.opsctl.app"),
+                "com.opsctl.deployment_id": labels.get("com.opsctl.deployment_id"),
+            }
+
         def observed_from_payload(container_payload):
             image_ref = ((container_payload.get("Config") or {}).get("Image"))
             if not isinstance(image_ref, str) or not image_ref.strip():
@@ -139,6 +149,7 @@
                 "ports": ports_for(container_payload),
                 "health_status": health_status_for(container_payload),
                 "running": running_for(container_payload),
+                "identity_labels": identity_labels_for(container_payload),
             }
 
         identity_match = "missing"
@@ -202,6 +213,7 @@
             "running": False,
             "identity_match": identity_match,
             "inspect_duration_ms": duration_ms,
+            "identity_labels": identity_labels_for(None),
         }
         if selected_payload is not None:
             result.update(observed_from_payload(selected_payload))
