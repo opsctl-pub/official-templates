@@ -5,8 +5,12 @@
   vars:
     timeout_s: 60
     resolved_health_mode: "{{ health_mode | default('http') }}"
+    resolved_health_target_kind: "{{ health_target_kind | default('loopback') }}"
     resolved_expected_status: "{{ expected_status | default(200) | int }}"
     resolved_health_validate_certs: "{{ health_validate_certs | default(true) }}"
+    resolved_health_url: >-
+      {{ health_url if resolved_health_target_kind == 'loopback' else
+         'http://' ~ health_host ~ ':' ~ (health_port | string) ~ health_path }}
   tasks:
     - name: Validate health verification mode
       assert:
@@ -18,7 +22,7 @@
       block:
         - name: OPERATION_STEP health:start http
           shell: |
-            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"http","url":"%s"}}\n' "{{ health_url }}"
+            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"http","url":"%s"}}\n' "{{ resolved_health_url }}"
           args:
             executable: /bin/sh
           when: resolved_health_mode == 'http'
@@ -26,14 +30,70 @@
         - name: Validate direct HTTP assertion inputs
           assert:
             that:
-              - health_url is match('^https?://127\\.0\\.0\\.1:[0-9]+/.*$')
+              - resolved_health_target_kind in ['loopback', 'wireguard']
+              - >-
+                (resolved_health_target_kind == 'wireguard') or
+                (resolved_health_url is match('^https?://127\\.0\\.0\\.1:[0-9]+/.*$'))
               - resolved_expected_status >= 100
               - resolved_expected_status <= 599
               - resolved_health_validate_certs is boolean
-              - health_url is match('^https://') or resolved_health_validate_certs
+              - resolved_health_url is match('^https://') or resolved_health_validate_certs
               - body_contains is not defined or (body_contains is string and body_contains | length > 0 and body_contains | length <= 1024)
             fail_msg: "HTTP health endpoint settings are invalid"
           when: resolved_health_mode == 'http'
+
+        - name: Validate WireGuard HTTP target
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import ipaddress
+                import sys
+                from urllib.parse import urlsplit
+
+                host, port_raw, path, url = sys.argv[1:5]
+                try:
+                    address = ipaddress.ip_address(host)
+                    port = int(port_raw)
+                    if str(address) != host or not 1 <= port <= 65535:
+                        raise ValueError
+                    if (
+                        not path.startswith('/')
+                        or path.startswith('//')
+                        or any(character.isspace() for character in path)
+                        or '\\' in path
+                        or '?' in path
+                        or '#' in path
+                    ):
+                        raise ValueError
+                    expected_host = f'[{host}]' if ':' in host else host
+                    expected_url = f'http://{expected_host}:{port}{path}'
+                    parsed = urlsplit(url)
+                    if (
+                        url != expected_url
+                        or parsed.scheme != 'http'
+                        or parsed.hostname != host
+                        or parsed.port != port
+                        or parsed.path != path
+                        or parsed.username is not None
+                        or parsed.password is not None
+                        or parsed.query
+                        or parsed.fragment
+                    ):
+                        raise ValueError
+                except (TypeError, ValueError, IndexError):
+                    raise SystemExit(1)
+              - "{{ health_host }}"
+              - "{{ health_port }}"
+              - "{{ health_path }}"
+              - "{{ health_url }}"
+          args:
+            chdir: /tmp
+          changed_when: false
+          when: resolved_health_mode == 'http' and resolved_health_target_kind == 'wireguard'
+          failed_when: _wireguard_health_target.rc != 0
+          register: _wireguard_health_target
 
         - name: Check HTTP health endpoint
           ansible.builtin.command:
@@ -103,7 +163,7 @@
                 except Exception:
                     print(json.dumps(result, separators=(",", ":")))
                     raise SystemExit(5)
-              - "{{ health_url }}"
+              - "{{ resolved_health_url }}"
               - "{{ resolved_expected_status }}"
               - "{{ body_contains | default('') }}"
               - "{{ health_headers | default({}) | to_json }}"
