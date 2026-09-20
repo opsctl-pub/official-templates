@@ -42,6 +42,103 @@
     final_label_map: "{{ opsctl_label_map }}"
     deploy_host_ports: []
     health_strategy: "running"
+    source_replacement_removed: false
+    source_replacement_recheck_complete: false
+    source_replacement_recheck_failed: false
+    source_replacement_original: {}
+    source_replacement_restore_script: |
+      python3 - <<'PY'
+      import json
+      import subprocess
+
+      original = json.loads(r'''{{ source_replacement_original | to_json }}''')
+      expected = json.loads(r'''{{ source_replacement | to_json }}''')
+      name = original["name"]
+      config = original.get("config") or {}
+      host_config = original.get("host_config") or {}
+
+      subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+      create = ["docker", "create", "--name", name]
+      restart_policy = host_config.get("RestartPolicy") or {}
+      restart_name = restart_policy.get("Name")
+      if restart_name and restart_name != "no":
+          create.extend(["--restart", restart_name])
+      network_mode = host_config.get("NetworkMode")
+      if network_mode and network_mode != "default":
+          create.extend(["--network", network_mode])
+      working_dir = config.get("WorkingDir")
+      if working_dir:
+          create.extend(["--workdir", working_dir])
+      user = config.get("User")
+      if user:
+          create.extend(["--user", user])
+      entrypoint = config.get("Entrypoint") or []
+      if entrypoint:
+          create.extend(["--entrypoint", entrypoint[0]])
+      for env_value in config.get("Env") or []:
+          if isinstance(env_value, str):
+              create.extend(["--env", env_value])
+      for label_key, label_value in sorted((config.get("Labels") or {}).items()):
+          create.extend(["--label", f"{label_key}={label_value}"])
+      for bind in host_config.get("Binds") or []:
+          if isinstance(bind, str):
+              create.extend(["--volume", bind])
+      for container_key, bindings in (host_config.get("PortBindings") or {}).items():
+          if not isinstance(bindings, list):
+              continue
+          container_port, protocol = container_key.split("/", 1)
+          for binding in bindings:
+              if not isinstance(binding, dict):
+                  continue
+              host_ip = str(binding.get("HostIp") or "")
+              host_port = str(binding.get("HostPort") or "")
+              if ":" in host_ip and not host_ip.startswith("["):
+                  host_ip = f"[{host_ip}]"
+              published = f"{host_ip}:{host_port}:{container_port}/{protocol}" if host_ip else f"{host_port}:{container_port}/{protocol}"
+              create.extend(["--publish", published])
+
+      image = config.get("Image")
+      if not isinstance(image, str) or not image:
+          raise SystemExit("source_replacement_restore_image_invalid")
+      create.append(image)
+      command = config.get("Cmd")
+      if isinstance(command, list):
+          create.extend(str(item) for item in command)
+      elif isinstance(command, str) and command:
+          create.append(command)
+      subprocess.run(create, check=True, capture_output=True, text=True)
+      subprocess.run(["docker", "start", name], check=True, capture_output=True, text=True)
+
+      inspected = subprocess.run(
+          ["docker", "inspect", name], check=True, capture_output=True, text=True
+      )
+      current = json.loads(inspected.stdout)[0]
+      current_config = current.get("Config") or {}
+      current_host_config = current.get("HostConfig") or {}
+      for key in ("Image", "Cmd", "Entrypoint", "Env", "WorkingDir", "User", "Labels", "ExposedPorts", "Volumes"):
+          if current_config.get(key) != config.get(key):
+              raise SystemExit("source_replacement_restore_config_mismatch")
+      if (current_host_config.get("PortBindings") or {}) != (host_config.get("PortBindings") or {}):
+          raise SystemExit("source_replacement_restore_bindings_mismatch")
+      if (current_host_config.get("Binds") or []) != (host_config.get("Binds") or []):
+          raise SystemExit("source_replacement_restore_mounts_mismatch")
+      if not (current.get("State") or {}).get("Running"):
+          raise SystemExit("source_replacement_restore_not_running")
+
+      health_path = {{ app_health_container_path | default('/health') | to_json }}
+      health_port = expected.get("container_port")
+      health = subprocess.run(
+          [
+              "docker", "exec", name, "sh", "-c",
+              f"wget -q --spider http://127.0.0.1:{health_port}{health_path}",
+          ],
+          capture_output=True,
+          text=True,
+      )
+      if health.returncode != 0:
+          raise SystemExit("source_replacement_restore_health_failed")
+      PY
   pre_tasks:
     - name: Validate backend exposure mode before mutation
       assert:
@@ -272,7 +369,7 @@
 
     - name: Initialize post-conflict list
       set_fact:
-        port_conflict_entries_post: "{{ port_conflict_entries | default([]) }}"
+        port_conflict_entries_post: "{{ [] if (source_replacement is defined) else (port_conflict_entries | default([])) }}"
       when:
         - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
@@ -472,13 +569,21 @@
                 )
         if frozenset(actual_bindings) not in expected_binding_sets:
             raise SystemExit("source_replacement_bindings_mismatch")
-        print(json.dumps([name]))
+        print(json.dumps({
+            "containers": [name],
+            "original": {
+                "name": name,
+                "config": config,
+                "host_config": item.get("HostConfig") or {},
+            },
+        }))
         PY
       args:
         executable: /bin/bash
       register: source_replacement_validation
       changed_when: false
       failed_when: source_replacement_validation.rc != 0
+      no_log: true
       when:
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
@@ -487,13 +592,21 @@
 
     - name: Parse exact source replacement container list
       set_fact:
-        removable_containers: "{{ source_replacement_validation.stdout | default('[]') | from_json }}"
+        removable_containers: "{{ (source_replacement_validation.stdout | default('{}') | from_json).containers }}"
+        source_replacement_original: "{{ (source_replacement_validation.stdout | default('{}') | from_json).original }}"
         source_replacement_verified: true
+      no_log: true
       when:
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
         - source_replacement is defined
+
+    - name: Mark source replacement transaction active
+      set_fact:
+        source_replacement_removed: true
+      when:
+        - source_replacement_verified | default(false) | bool
 
     - name: Remove conflicting container "{{ item }}"
       command: docker rm -f {{ item }}
@@ -586,7 +699,9 @@
         executable: /bin/bash
       register: port_conflicts_retry_result
       changed_when: false
-      failed_when: port_conflicts_retry_result.rc != 0
+      failed_when:
+        - port_conflicts_retry_result.rc != 0
+        - not (source_replacement_verified | default(false) | bool)
       when:
         - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
@@ -594,16 +709,46 @@
 
     - name: Parse post-removal conflicts
       set_fact:
-        port_conflict_entries_post: "{{ port_conflicts_retry_result.stdout | default('[]') | from_json }}"
+        port_conflict_entries_post: >-
+          {{
+            (port_conflicts_retry_result.stdout | default('[]') | from_json)
+            if (port_conflicts_retry_result.rc | default(1) | int) == 0
+            else []
+          }}
+        source_replacement_recheck_complete: true
+        source_replacement_recheck_failed: "{{ (port_conflicts_retry_result.rc | default(1) | int) != 0 }}"
       when:
-        - not traefik_enabled
-        - not wireguard_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
         - (
             source_replacement_verified | default(false) | bool
-            or not source_dual_backend_enabled
+            or (
+              not traefik_enabled
+              and not wireguard_backend_enabled
+              and not source_dual_backend_enabled
+            )
           )
+
+    - name: Fail when post-removal conflict recheck fails
+      block:
+        - name: Abort after post-removal conflict recheck failure
+          fail:
+            msg: "post_removal_conflict_recheck_failed"
+      rescue:
+        - name: Restore source container after conflict recheck failure
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
+      when:
+        - source_replacement_verified | default(false) | bool
+        - source_replacement_removed | default(false) | bool
+        - source_replacement_recheck_failed | default(false) | bool
 
     - name: Fail when conflicts remain after override
       block:
@@ -615,10 +760,42 @@
         - name: Abort due to remaining port conflicts
           fail:
             msg: "port_conflict"
+      rescue:
+        - name: Restore source container after post-removal conflict failure
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
       when:
         - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries_post | default([]) | length) > 0
+
+    - name: Require source replacement post-removal recheck
+      block:
+        - name: Abort when source replacement recheck was not completed
+          fail:
+            msg: "post_removal_conflict_recheck_missing"
+      rescue:
+        - name: Restore source container after missing conflict recheck
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
+      when:
+        - source_replacement_verified | default(false) | bool
+        - source_replacement_removed | default(false) | bool
+        - not (source_replacement_recheck_complete | default(false) | bool)
 
     - name: OPERATION_STEP preflight:ports complete
       shell: |
@@ -633,7 +810,17 @@
             or
             (
               replace_conflicts | default(false) | bool
-              and (port_conflict_entries_post | default([]) | length) == 0
+              and (
+                (
+                  source_replacement_verified | default(false) | bool
+                  and source_replacement_recheck_complete | default(false) | bool
+                  and (port_conflict_entries_post | default([]) | length) == 0
+                )
+                or (
+                  not (source_replacement_verified | default(false) | bool)
+                  and (port_conflict_entries_post | default([]) | length) == 0
+                )
+              )
             )
           )
 
@@ -796,6 +983,16 @@
           args:
             executable: /bin/sh
       rescue:
+        - name: Restore source container after image pull failure
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+          when:
+            - source_replacement_verified | default(false) | bool
+            - source_replacement_removed | default(false) | bool
         - name: OPERATION_STEP image:pull failed
           shell: |
             printf 'OPERATION_STEP={"name":"image:pull","status":"failed","metadata":{"display_name":"Pull container image","reason_code":"image_pull_failed"}}\n'
@@ -964,6 +1161,16 @@
             env: "{{ app_env | default({}) }}"
             labels: "{{ final_label_map }}"
       rescue:
+        - name: Restore source container after container startup failure
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+          when:
+            - source_replacement_verified | default(false) | bool
+            - source_replacement_removed | default(false) | bool
         - name: Collect container startup diagnostics
           include_tasks: ../tasks/container_failure_diagnostics.yml
 
@@ -1051,6 +1258,16 @@
           args:
             executable: /bin/sh
       rescue:
+        - name: Restore source container after health validation failure
+          shell: "{{ source_replacement_restore_script }}"
+          args:
+            executable: /bin/bash
+          no_log: true
+          failed_when: source_replacement_restore_result.rc != 0
+          register: source_replacement_restore_result
+          when:
+            - source_replacement_verified | default(false) | bool
+            - source_replacement_removed | default(false) | bool
         - name: Collect container health diagnostics
           include_tasks: ../tasks/container_failure_diagnostics.yml
 
