@@ -377,7 +377,7 @@
         expected = json.loads('''{{ source_replacement | default(None) | to_json }}''')
         required = {
             "intent", "container_name", "app_slug", "org_id", "project_id",
-            "deployment_id", "image", "current_exposure_mode", "exposure_mode", "wireguard_ip",
+            "deployment_id", "image", "current_exposure_modes", "exposure_mode", "wireguard_ip",
             "route_port", "container_port", "replace_conflicts",
         }
         if not isinstance(expected, dict) or set(expected) != required:
@@ -419,26 +419,44 @@
             raise SystemExit("source_replacement_deployment_mismatch")
         if config.get("Image") != expected["image"]:
             raise SystemExit("source_replacement_image_mismatch")
-        if expected["current_exposure_mode"] != "loopback":
-            raise SystemExit("source_replacement_current_exposure_invalid")
+        if expected["current_exposure_modes"] != ["loopback", "loopback_wireguard"]:
+            raise SystemExit("source_replacement_current_exposure_modes_invalid")
         if expected["exposure_mode"] != "loopback_wireguard":
             raise SystemExit("source_replacement_exposure_invalid")
         route_port = expected["route_port"]
         container_port = expected["container_port"]
-        expected_bindings = {
-            f"127.0.0.1:{route_port}:{container_port}",
+        loopback_binding = f"127.0.0.1:{route_port}:{container_port}"
+        wireguard_binding = f"{expected['wireguard_ip']}:{route_port}:{container_port}"
+        expected_binding_sets = {
+            frozenset({loopback_binding}),
+            frozenset({loopback_binding, wireguard_binding}),
         }
         actual_bindings = set()
         ports = ((item.get("NetworkSettings") or {}).get("Ports") or {})
+        if not isinstance(ports, dict):
+            raise SystemExit("source_replacement_bindings_invalid")
         for container_key, bindings in ports.items():
             if container_key != f"{container_port}/tcp":
-                continue
-            for binding in bindings or []:
-                host_ip = binding.get("HostIp") or "0.0.0.0"
+                raise SystemExit("source_replacement_bindings_invalid")
+            if not isinstance(bindings, list):
+                raise SystemExit("source_replacement_bindings_invalid")
+            for binding in bindings:
+                if not isinstance(binding, dict):
+                    raise SystemExit("source_replacement_bindings_invalid")
+                host_ip = binding.get("HostIp")
+                host_port = binding.get("HostPort")
+                if not isinstance(host_ip, str) or not host_ip.strip():
+                    raise SystemExit("source_replacement_bindings_invalid")
+                try:
+                    host_port = int(str(host_port))
+                except (TypeError, ValueError):
+                    raise SystemExit("source_replacement_bindings_invalid")
+                if not 1 <= host_port <= 65535:
+                    raise SystemExit("source_replacement_bindings_invalid")
                 actual_bindings.add(
-                    f"{host_ip}:{binding.get('HostPort')}:{container_port}"
+                    f"{host_ip}:{host_port}:{container_port}"
                 )
-        if actual_bindings != expected_bindings:
+        if frozenset(actual_bindings) not in expected_binding_sets:
             raise SystemExit("source_replacement_bindings_mismatch")
         print(json.dumps([name]))
         PY
