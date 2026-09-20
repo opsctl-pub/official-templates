@@ -36,7 +36,7 @@
     opsctl_label_map:
       "com.opsctl.managed": "true"
       "com.opsctl.org_id": "{{ app_org_id | default('') }}"
-      "com.opsctl.project_id": "{{ app_project_id | default('') }}"
+      "com.opsctl.project_id": "{{ app_project_id | default('', true) }}"
       "com.opsctl.app": "{{ app_slug | default(container_name) }}"
       "com.opsctl.deployment_id": "{{ app_deployment_id | default('') }}"
     final_label_map: "{{ opsctl_label_map }}"
@@ -372,6 +372,7 @@
       shell: |
         python3 - <<'PY'
         import json, subprocess, sys
+        from uuid import UUID
 
         conflicts = json.loads('''{{ port_conflict_entries | default([]) | to_json }}''')
         expected = json.loads('''{{ source_replacement | default(None) | to_json }}''')
@@ -386,6 +387,19 @@
             raise SystemExit("source_replacement_intent_invalid")
         if expected["replace_conflicts"] is not True:
             raise SystemExit("source_replacement_flag_invalid")
+        for key in ("org_id", "deployment_id"):
+            try:
+                if str(UUID(str(expected[key]))) != expected[key]:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise SystemExit("source_replacement_identity_invalid")
+        project_id = expected["project_id"]
+        if project_id is not None:
+            try:
+                if str(UUID(str(project_id))) != project_id:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise SystemExit("source_replacement_identity_invalid")
         if len(conflicts) != 1 or conflicts[0].get("name") != expected["container_name"]:
             raise SystemExit("source_replacement_conflict_set_invalid")
         name = expected["container_name"]
