@@ -513,21 +513,23 @@
         labels = config.get("Labels") or {}
         if labels.get("com.opsctl.managed") != "true":
             raise SystemExit("source_replacement_not_opsctl_owned")
-        for key, expected_value in {
-            "com.opsctl.org_id": expected["org_id"],
-            "com.opsctl.project_id": expected["project_id"],
-            "com.opsctl.app": expected["app_slug"],
-        }.items():
-            actual_value = labels.get(key)
-            if key in {"com.opsctl.project_id"} and actual_value in (None, ""):
-                continue
-            if actual_value != expected_value:
-                raise SystemExit("source_replacement_identity_mismatch")
         deployment_label = labels.get("com.opsctl.deployment_id")
         if deployment_label in (None, ""):
             deployment_label = None
         if deployment_label is not None and deployment_label != expected["deployment_id"]:
             raise SystemExit("source_replacement_deployment_mismatch")
+        for key, expected_value in {
+            "com.opsctl.org_id": expected["org_id"],
+            "com.opsctl.app": expected["app_slug"],
+        }.items():
+            if labels.get(key) != expected_value:
+                raise SystemExit("source_replacement_identity_mismatch")
+        if deployment_label != expected["deployment_id"]:
+            actual_project = labels.get("com.opsctl.project_id")
+            if actual_project in (None, ""):
+                actual_project = None
+            if actual_project != expected["project_id"]:
+                raise SystemExit("source_replacement_identity_mismatch")
         if config.get("Image") != expected["image"]:
             raise SystemExit("source_replacement_image_mismatch")
         if expected["current_exposure_modes"] != ["loopback", "loopback_wireguard"]:
