@@ -193,6 +193,7 @@
         target_org = {{ app_org_id | default('') | to_json }}
         target_project = {{ app_project_id | default('') | to_json }}
         target_app = {{ app_slug | default(container_name) | to_json }}
+        source_replacement = json.loads('''{{ source_replacement | default(None) | to_json }}''')
         require_project = bool(target_project)
         if not ports:
             print("[]")
@@ -223,7 +224,7 @@
             name = data.get("Names") or data.get("ID")
             if not name:
                 continue
-            if name == target_container:
+            if name == target_container and not source_replacement:
                 inspect_result = subprocess.run(
                     ["docker", "inspect", target_container],
                     capture_output=True,
@@ -295,7 +296,15 @@
       when:
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
-        - loopback_backend_enabled or source_dual_backend_enabled or not (replace_conflicts | default(false) | bool)
+        - (
+            source_replacement is not defined
+            or not (replace_conflicts | default(false) | bool)
+          )
+        - (
+            loopback_backend_enabled
+            or source_dual_backend_enabled
+            or not (replace_conflicts | default(false) | bool)
+          )
 
     - name: Determine removable conflict containers
       shell: |
@@ -347,6 +356,7 @@
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
+        - source_replacement is not defined
 
     - name: Parse removable container list
       set_fact:
@@ -355,6 +365,98 @@
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
         - replace_conflicts | default(false) | bool
+        - source_replacement is not defined
+
+    - name: Validate exact source replacement container
+      shell: |
+        python3 - <<'PY'
+        import json, subprocess, sys
+
+        conflicts = json.loads('''{{ port_conflict_entries | default([]) | to_json }}''')
+        expected = json.loads('''{{ source_replacement | default(None) | to_json }}''')
+        required = {
+            "intent", "container_name", "app_slug", "org_id", "project_id",
+            "deployment_id", "image", "current_exposure_mode", "exposure_mode", "wireguard_ip",
+            "route_port", "container_port", "replace_conflicts",
+        }
+        if not isinstance(expected, dict) or set(expected) != required:
+            raise SystemExit("source_replacement_identity_invalid")
+        if expected["intent"] != "replace_exact_source_container":
+            raise SystemExit("source_replacement_intent_invalid")
+        if expected["replace_conflicts"] is not True:
+            raise SystemExit("source_replacement_flag_invalid")
+        if len(conflicts) != 1 or conflicts[0].get("name") != expected["container_name"]:
+            raise SystemExit("source_replacement_conflict_set_invalid")
+        name = expected["container_name"]
+        result = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+        try:
+            data = json.loads(result.stdout)
+            item = data[0]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            raise SystemExit("source_replacement_inspect_invalid")
+        config = item.get("Config") or {}
+        labels = config.get("Labels") or {}
+        if labels.get("com.opsctl.managed") != "true":
+            raise SystemExit("source_replacement_not_opsctl_owned")
+        for key, expected_value in {
+            "com.opsctl.org_id": expected["org_id"],
+            "com.opsctl.project_id": expected["project_id"],
+            "com.opsctl.app": expected["app_slug"],
+        }.items():
+            actual_value = labels.get(key)
+            if actual_value is not None and actual_value != expected_value:
+                raise SystemExit("source_replacement_identity_mismatch")
+        deployment_label = labels.get("com.opsctl.deployment_id")
+        if deployment_label is not None and deployment_label != expected["deployment_id"]:
+            raise SystemExit("source_replacement_deployment_mismatch")
+        if config.get("Image") != expected["image"]:
+            raise SystemExit("source_replacement_image_mismatch")
+        if expected["current_exposure_mode"] != "loopback":
+            raise SystemExit("source_replacement_current_exposure_invalid")
+        if expected["exposure_mode"] != "loopback_wireguard":
+            raise SystemExit("source_replacement_exposure_invalid")
+        route_port = expected["route_port"]
+        container_port = expected["container_port"]
+        expected_bindings = {
+            f"127.0.0.1:{route_port}:{container_port}",
+        }
+        actual_bindings = set()
+        ports = ((item.get("NetworkSettings") or {}).get("Ports") or {})
+        for container_key, bindings in ports.items():
+            if container_key != f"{container_port}/tcp":
+                continue
+            for binding in bindings or []:
+                host_ip = binding.get("HostIp") or "0.0.0.0"
+                actual_bindings.add(
+                    f"{host_ip}:{binding.get('HostPort')}:{container_port}"
+                )
+        if actual_bindings != expected_bindings:
+            raise SystemExit("source_replacement_bindings_mismatch")
+        print(json.dumps([name]))
+        PY
+      args:
+        executable: /bin/bash
+      register: source_replacement_validation
+      changed_when: false
+      failed_when: source_replacement_validation.rc != 0
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is defined
+
+    - name: Parse exact source replacement container list
+      set_fact:
+        removable_containers: "{{ source_replacement_validation.stdout | default('[]') | from_json }}"
+        source_replacement_verified: true
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is defined
 
     - name: Remove conflicting container "{{ item }}"
       command: docker rm -f {{ item }}
@@ -459,9 +561,12 @@
       when:
         - not traefik_enabled
         - not wireguard_backend_enabled
-        - not source_dual_backend_enabled
         - replace_conflicts | default(false) | bool
         - (port_conflict_entries | length) > 0
+        - (
+            source_replacement_verified | default(false) | bool
+            or not source_dual_backend_enabled
+          )
 
     - name: Fail when conflicts remain after override
       block:
