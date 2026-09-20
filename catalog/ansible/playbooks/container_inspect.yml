@@ -18,6 +18,7 @@
     - name: Collect deployment inspection metadata
       shell: |
         python3 - <<'PY'
+        import ipaddress
         import json
         import subprocess
         import time
@@ -110,6 +111,62 @@
                 unique[(entry["host"], entry["container"])] = entry
             return [unique[key] for key in sorted(unique.keys())]
 
+        def port_bindings_for(container_payload):
+            network_settings = container_payload.get("NetworkSettings") or {}
+            if not isinstance(network_settings, dict):
+                raise ValueError("NetworkSettings must be an object")
+            raw_ports = network_settings.get("Ports") or {}
+            if not isinstance(raw_ports, dict):
+                raise ValueError("NetworkSettings.Ports must be an object")
+
+            bindings = set()
+            for container_binding, host_bindings in raw_ports.items():
+                if not isinstance(container_binding, str):
+                    raise ValueError("container binding key must be a string")
+                parts = container_binding.split("/")
+                if len(parts) != 2 or parts[1] not in {"tcp", "udp", "sctp"}:
+                    raise ValueError("container binding key is invalid")
+                try:
+                    container_port = int(parts[0])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("container port is invalid") from exc
+                if not 1 <= container_port <= 65535:
+                    raise ValueError("container port is invalid")
+                if host_bindings is None:
+                    continue
+                if not isinstance(host_bindings, list):
+                    raise ValueError("host bindings must be a list or null")
+                for binding in host_bindings:
+                    if not isinstance(binding, dict):
+                        raise ValueError("host binding must be an object")
+                    host_ip = binding.get("HostIp")
+                    host_port = binding.get("HostPort")
+                    if not isinstance(host_ip, str) or not host_ip.strip():
+                        raise ValueError("host IP is invalid")
+                    try:
+                        normalized_host_ip = ipaddress.ip_address(host_ip.strip()).compressed
+                        normalized_host_port = int(str(host_port))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("host binding is invalid") from exc
+                    if not 1 <= normalized_host_port <= 65535:
+                        raise ValueError("host port is invalid")
+                    bindings.add((
+                        parts[1],
+                        container_port,
+                        normalized_host_ip,
+                        normalized_host_port,
+                    ))
+
+            return [
+                {
+                    "protocol": protocol,
+                    "container_port": container_port,
+                    "host_ip": host_ip,
+                    "host_port": host_port,
+                }
+                for protocol, container_port, host_ip, host_port in sorted(bindings)
+            ]
+
         def health_status_for(container_payload):
             state = container_payload.get("State") or {}
             health = state.get("Health") or {}
@@ -147,6 +204,7 @@
                 "image_ref": image_ref,
                 "image_digest": image_digest_for(container_payload),
                 "ports": ports_for(container_payload),
+                "port_bindings": port_bindings_for(container_payload),
                 "health_status": health_status_for(container_payload),
                 "running": running_for(container_payload),
                 "identity_labels": identity_labels_for(container_payload),
@@ -209,6 +267,7 @@
             "image_ref": None,
             "image_digest": None,
             "ports": [],
+            "port_bindings": [],
             "health_status": "none",
             "running": False,
             "identity_match": identity_match,
