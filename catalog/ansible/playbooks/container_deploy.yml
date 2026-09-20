@@ -38,6 +38,7 @@
       "com.opsctl.org_id": "{{ app_org_id | default('') }}"
       "com.opsctl.project_id": "{{ app_project_id | default('') }}"
       "com.opsctl.app": "{{ app_slug | default(container_name) }}"
+      "com.opsctl.deployment_id": "{{ app_deployment_id | default('') }}"
     final_label_map: "{{ opsctl_label_map }}"
     deploy_host_ports: []
     health_strategy: "running"
@@ -407,9 +408,13 @@
             "com.opsctl.app": expected["app_slug"],
         }.items():
             actual_value = labels.get(key)
-            if actual_value is not None and actual_value != expected_value:
+            if key in {"com.opsctl.project_id"} and actual_value in (None, ""):
+                continue
+            if actual_value != expected_value:
                 raise SystemExit("source_replacement_identity_mismatch")
         deployment_label = labels.get("com.opsctl.deployment_id")
+        if deployment_label in (None, ""):
+            deployment_label = None
         if deployment_label is not None and deployment_label != expected["deployment_id"]:
             raise SystemExit("source_replacement_deployment_mismatch")
         if config.get("Image") != expected["image"]:
