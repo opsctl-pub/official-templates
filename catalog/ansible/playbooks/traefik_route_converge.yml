@@ -12,8 +12,7 @@
     resolved_route_state: "{{ route_state | default('present', true) }}"
     resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
     resolved_route_middlewares: "{{ route_middlewares | default([], true) }}"
-    traefik_backends:
-      - url: "http://127.0.0.1:{{ route_port }}"
+    resolved_traefik_backends: "{{ traefik_backends | default([{'url': 'http://127.0.0.1:' ~ (route_port | string)}]) }}"
   pre_tasks:
     - name: Skip Traefik route converge in simulate mode
       meta: end_play
@@ -58,13 +57,18 @@
           - resolved_route_middlewares is not string
           - (resolved_route_middlewares | length) <= 50
           - (resolved_route_middlewares | unique | list | length) == (resolved_route_middlewares | length)
+          - resolved_traefik_backends is sequence
+          - resolved_traefik_backends is not string
+          - (resolved_traefik_backends | length) > 0
+          - (resolved_traefik_backends | map(attribute='url') | list | unique | list | length) == (resolved_traefik_backends | length)
         fail_msg: "Traefik route identity is missing or malformed"
 
     - name: Validate optional route comparison evidence
       assert:
         that:
           - expected_route_observation is mapping
-          - expected_route_observation.keys() | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port']
+          - expected_route_observation.keys() | difference(['backend_count', 'backend_digest']) | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port']
+          - ('backend_count' in expected_route_observation) == ('backend_digest' in expected_route_observation)
           - expected_route_observation.presence in ['present', 'absent']
           - expected_route_observation.digest is match('^[0-9a-f]{64}$')
         fail_msg: "Traefik route comparison evidence is invalid"
@@ -95,6 +99,20 @@
       loop: "{{ resolved_route_middlewares }}"
       loop_control:
         label: "middleware"
+      when: resolved_route_state == 'present'
+
+    - name: Validate private Traefik backends before mutation
+      assert:
+        that:
+          - item is mapping
+          - item.keys() | list == ['url']
+          - item.url is string
+          - item.url is match('^http://[^:/?#]+:[0-9]+/?$')
+          - item.url | regex_search(':[0-9]+/?$') | regex_replace('[^0-9]', '') | int == route_port
+        fail_msg: "Traefik backend identity is invalid"
+      loop: "{{ resolved_traefik_backends }}"
+      loop_control:
+        label: "backend"
       when: resolved_route_state == 'present'
 
   tasks:
@@ -196,8 +214,8 @@
               - ('deployment-' ~ deployment_id) in staged_route_config.http.routers
               - ('deployment-' ~ deployment_id) in staged_route_config.http.services
               - staged_route_config.http.routers['deployment-' ~ deployment_id].service == ('deployment-' ~ deployment_id)
-              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | length == 1
-              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers[0].url == ('http://127.0.0.1:' ~ (route_port | string))
+              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | length == (resolved_traefik_backends | length)
+              - (staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | map(attribute='url') | list) == (resolved_traefik_backends | map(attribute='url') | list)
               - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls.certResolver == route_tls_cert_resolver
               - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
               - (not redirect_http_to_https) or (staged_route_config.http.keys() | sort == ['middlewares', 'routers', 'services'])

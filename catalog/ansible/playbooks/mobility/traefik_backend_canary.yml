@@ -1,0 +1,361 @@
+- name: Manage one stable-ingress Traefik backend canary
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    canary_file_path: "{{ traefik_dynamic_dir }}/promotion-canary-{{ promotion_id }}.yml"
+    canary_backend_url: "{{ traefik_backends[0].url }}"
+    canary_identity_seed: "{{ org_id }}:{{ deployment_id }}:{{ promotion_id }}:{{ gateway_id }}:{{ target_node_id }}:{{ target_revision_id }}:{{ route_port }}:{{ canary_backend_url }}"
+    canary_identity_digest: "{{ canary_identity_seed | hash('sha256') }}"
+    canary_host: "opsctl-canary-{{ canary_identity_digest[:24] }}.invalid"
+    canary_router: "opsctl-canary-{{ canary_identity_digest[:24] }}"
+    canary_service: "opsctl-canary-{{ canary_identity_digest[:24] }}"
+  pre_tasks:
+    - name: Validate canary identity before mutation
+      ansible.builtin.assert:
+        that:
+          - action in ['observe', 'converge_present', 'converge_absent']
+          - promotion_id is string
+          - promotion_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - deployment_id is string
+          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - org_id is string
+          - org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - gateway_id is string
+          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - gateway_server_id is string
+          - gateway_server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - target_node_id is string
+          - target_node_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - target_revision_id is string
+          - target_revision_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+          - overlay_cidr is string
+          - overlay_cidr is match('^[0-9a-fA-F:.]+/[0-9]{1,3}$')
+          - route_port is integer
+          - route_port > 0
+          - route_port <= 65535
+          - route_hosts is sequence
+          - route_hosts is not string
+          - route_hosts | length == 1
+          - route_hosts[0] == canary_host
+          - traefik_backends is sequence
+          - traefik_backends is not string
+          - traefik_backends | length == 1
+          - traefik_backends[0] is mapping
+          - traefik_backends[0].keys() | list == ['url']
+          - canary_backend_url is string
+          - canary_backend_url is match('^http://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$')
+          - canary_backend_url is not search('[?#]')
+          - gateway_wireguard_ip is string
+          - gateway_wireguard_ip is match('^(?:10\.)[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
+          - (action == 'observe' and (expected_observation is not defined or expected_observation is none)) or (action != 'observe' and expected_observation is mapping)
+        fail_msg: "Stable-ingress canary identity is invalid"
+
+    - name: Read exact canary file before mutation
+      ansible.builtin.stat:
+        path: "{{ canary_file_path }}"
+        follow: false
+      register: canary_file
+      no_log: true
+
+    - name: Reject symlink or non-regular canary path
+      ansible.builtin.assert:
+        that:
+          - not canary_file.stat.exists or (canary_file.stat.isreg and not canary_file.stat.islnk)
+        fail_msg: "Existing stable-ingress canary path is not a regular file"
+      no_log: true
+
+    - name: Snapshot exact existing canary metadata
+      ansible.builtin.set_fact:
+        prior_canary_exists: "{{ canary_file.stat.exists | bool }}"
+        prior_canary_uid: "{{ canary_file.stat.uid | default(0) }}"
+        prior_canary_gid: "{{ canary_file.stat.gid | default(0) }}"
+        prior_canary_mode: "{{ canary_file.stat.mode | default('0644') }}"
+      no_log: true
+
+    - name: Read exact existing canary content
+      ansible.builtin.slurp:
+        path: "{{ canary_file_path }}"
+      register: existing_canary_content
+      when: prior_canary_exists
+      no_log: true
+
+    - name: Parse existing canary content
+      ansible.builtin.set_fact:
+        existing_canary_config: "{{ existing_canary_content.content | b64decode | from_yaml }}"
+      when: prior_canary_exists
+      no_log: true
+
+    - name: Validate existing canary ownership before mutation
+      ansible.builtin.assert:
+        that:
+          - existing_canary_config is mapping
+          - existing_canary_config.keys() | list == ['http']
+          - existing_canary_config.http.routers is mapping
+          - existing_canary_config.http.routers.keys() | list == [canary_router]
+          - existing_canary_config.http.services is mapping
+          - existing_canary_config.http.services.keys() | list == [canary_service]
+          - existing_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'rule', 'service']
+          - existing_canary_config.http.routers[canary_router].rule == ('Host(`' ~ canary_host ~ '`)')
+          - existing_canary_config.http.routers[canary_router].entryPoints == ['web']
+          - existing_canary_config.http.routers[canary_router].service == canary_service
+          - existing_canary_config.http.services[canary_service].keys() | sort == ['loadBalancer']
+          - existing_canary_config.http.services[canary_service].loadBalancer.keys() | sort == ['passHostHeader', 'servers']
+          - existing_canary_config.http.services[canary_service].loadBalancer.passHostHeader is true
+          - existing_canary_config.http.services[canary_service].loadBalancer.servers | length == 1
+          - existing_canary_config.http.services[canary_service].loadBalancer.servers[0].keys() | list == ['url']
+          - existing_canary_config.http.services[canary_service].loadBalancer.servers[0].url == canary_backend_url
+        fail_msg: "Existing stable-ingress canary is not owned by this identity"
+      when: prior_canary_exists
+      no_log: true
+
+    - name: Normalize pre-convergence canary observation
+      ansible.builtin.set_fact:
+        promotion_canary_observation:
+          presence: "{{ 'present' if prior_canary_exists else 'absent' }}"
+          identity_digest: "{{ canary_identity_digest }}"
+          backend_count: "{{ 1 if prior_canary_exists else 0 }}"
+          backend_digest: "{{ (('[' ~ (canary_backend_url | to_json) ~ ']') | hash('sha256')) if prior_canary_exists else ('[]' | hash('sha256')) }}"
+      no_log: true
+
+    - name: Add pre-convergence observation digest
+      ansible.builtin.set_fact:
+        promotion_canary_observation: "{{ promotion_canary_observation | combine({'digest': (promotion_canary_observation | dict2items | sort(attribute='key') | items2dict | to_json(separators=(',', ':')) | hash('sha256'))}) }}"
+      no_log: true
+
+    - name: Validate expected canary observation before mutation
+      ansible.builtin.assert:
+        that:
+          - promotion_canary_observation == expected_observation
+        fail_msg: "Stable-ingress canary compare-and-set failed"
+      when: action != 'observe'
+      no_log: true
+
+    - name: Emit observation-only canary result
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': promotion_canary_observation} | to_json }}
+      when: action == 'observe'
+
+    - name: Stop after observation
+      ansible.builtin.meta: end_play
+      when: action == 'observe'
+
+    - name: Ensure canary directory exists
+      ansible.builtin.file:
+        path: "{{ traefik_dynamic_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+  tasks:
+    - name: Converge stable-ingress canary transactionally
+      block:
+        - name: Create a unique canary stage
+          ansible.builtin.tempfile:
+            state: file
+            path: "{{ traefik_dynamic_dir }}"
+            prefix: "promotion-canary-{{ promotion_id }}."
+            suffix: ".stage"
+          register: canary_stage
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Remove exact canary file
+          ansible.builtin.file:
+            path: "{{ canary_file_path }}"
+            state: absent
+          when: action == 'converge_absent'
+
+        - name: Render exact canary file to a unique stage
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../../templates/traefik_backend_canary.yml.j2"
+            dest: "{{ canary_stage.path }}"
+            owner: "{{ prior_canary_uid }}"
+            group: "{{ prior_canary_gid }}"
+            mode: "{{ prior_canary_mode }}"
+          when: action == 'converge_present'
+
+        - name: Read staged canary
+          ansible.builtin.slurp:
+            path: "{{ canary_stage.path }}"
+          register: staged_canary_content
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Parse staged canary
+          ansible.builtin.set_fact:
+            staged_canary_config: "{{ staged_canary_content.content | b64decode | from_yaml }}"
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Validate staged canary before activation
+          ansible.builtin.assert:
+            that:
+              - staged_canary_config is mapping
+              - staged_canary_config.keys() | list == ['http']
+              - staged_canary_config.http.routers.keys() | list == [canary_router]
+              - staged_canary_config.http.services.keys() | list == [canary_service]
+              - staged_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'rule', 'service']
+              - staged_canary_config.http.routers[canary_router].rule == ('Host(`' ~ canary_host ~ '`)')
+              - staged_canary_config.http.routers[canary_router].entryPoints == ['web']
+              - staged_canary_config.http.routers[canary_router].service == canary_service
+              - staged_canary_config.http.services[canary_service].loadBalancer.servers | length == 1
+              - staged_canary_config.http.services[canary_service].loadBalancer.servers[0].url == canary_backend_url
+            fail_msg: "Staged stable-ingress canary is invalid"
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Atomically activate staged canary
+          ansible.builtin.command:
+            cmd: "mv -- {{ canary_stage.path }} {{ canary_file_path }}"
+          when: action == 'converge_present'
+          changed_when: true
+
+        - name: Remove any staged canary after absent convergence
+          ansible.builtin.file:
+            path: "{{ canary_stage.path }}"
+            state: absent
+          when: action == 'converge_present'
+
+        - name: Read activated canary state
+          ansible.builtin.stat:
+            path: "{{ canary_file_path }}"
+            follow: false
+          register: final_canary_file
+          no_log: true
+
+        - name: Read activated canary content
+          ansible.builtin.slurp:
+            path: "{{ canary_file_path }}"
+          register: final_canary_content
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Parse activated canary content
+          ansible.builtin.set_fact:
+            final_canary_config: "{{ final_canary_content.content | b64decode | from_yaml }}"
+          when: action == 'converge_present'
+          no_log: true
+
+        - name: Validate activated canary state
+          ansible.builtin.assert:
+            that:
+              - (action == 'converge_present') == final_canary_file.stat.exists
+              - (not final_canary_file.stat.exists) or (final_canary_file.stat.isreg and not final_canary_file.stat.islnk)
+              - (action == 'converge_absent') or final_canary_config == staged_canary_config
+            fail_msg: "Stable-ingress canary state is invalid"
+          no_log: true
+
+        - name: Normalize final canary observation
+          ansible.builtin.set_fact:
+            final_canary_observation:
+              presence: "{{ 'present' if final_canary_file.stat.exists else 'absent' }}"
+              identity_digest: "{{ canary_identity_digest }}"
+              backend_count: "{{ 1 if final_canary_file.stat.exists else 0 }}"
+              backend_digest: "{{ (('[' ~ (canary_backend_url | to_json) ~ ']') | hash('sha256')) if final_canary_file.stat.exists else ('[]' | hash('sha256')) }}"
+          no_log: true
+
+        - name: Add final canary observation digest
+          ansible.builtin.set_fact:
+            final_canary_observation: "{{ final_canary_observation | combine({'digest': (final_canary_observation | dict2items | sort(attribute='key') | items2dict | to_json(separators=(',', ':')) | hash('sha256'))}) }}"
+          no_log: true
+
+        - name: Emit canary observation
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': final_canary_observation} | to_json }}
+
+        - name: Emit canary completion marker
+          ansible.builtin.debug:
+            msg: >-
+              OPERATION_STEP={{ {'name': 'traefik-backend-canary:complete', 'status': 'completed', 'metadata': {'action': action, 'promotion_id': promotion_id}} | to_json }}
+      rescue:
+        - name: Remove incomplete staged canary
+          ansible.builtin.file:
+            path: "{{ canary_stage.path }}"
+            state: absent
+          when: canary_stage is defined and canary_stage.path is defined
+          failed_when: false
+
+        - name: Create a unique recovery stage
+          ansible.builtin.tempfile:
+            state: file
+            path: "{{ traefik_dynamic_dir }}"
+            prefix: "promotion-canary-recovery-{{ promotion_id }}."
+            suffix: ".stage"
+          register: recovery_stage
+          when: prior_canary_exists
+          no_log: true
+
+        - name: Restore exact prior canary content
+          ansible.builtin.copy:
+            dest: "{{ recovery_stage.path }}"
+            content: "{{ existing_canary_content.content | b64decode }}"
+            owner: "{{ prior_canary_uid }}"
+            group: "{{ prior_canary_gid }}"
+            mode: "{{ prior_canary_mode }}"
+          when: prior_canary_exists and recovery_stage is defined and recovery_stage.path is defined
+          failed_when: false
+          no_log: true
+
+        - name: Atomically restore prior canary content
+          ansible.builtin.command:
+            cmd: "mv -- {{ recovery_stage.path }} {{ canary_file_path }}"
+          when: prior_canary_exists and recovery_stage is defined and recovery_stage.path is defined
+          changed_when: true
+          failed_when: false
+
+        - name: Restore exact prior canary absence
+          ansible.builtin.file:
+            path: "{{ canary_file_path }}"
+            state: absent
+          when: not prior_canary_exists
+          failed_when: false
+
+        - name: Restore prior canary metadata
+          ansible.builtin.file:
+            path: "{{ canary_file_path }}"
+            owner: "{{ prior_canary_uid }}"
+            group: "{{ prior_canary_gid }}"
+            mode: "{{ prior_canary_mode }}"
+          when: prior_canary_exists
+          failed_when: false
+          no_log: true
+
+        - name: Verify prior canary restoration
+          ansible.builtin.stat:
+            path: "{{ canary_file_path }}"
+            follow: false
+          register: restored_canary_file
+          no_log: true
+
+        - name: Read restored canary content
+          ansible.builtin.slurp:
+            path: "{{ canary_file_path }}"
+          register: restored_canary_content
+          when: prior_canary_exists
+          failed_when: false
+          no_log: true
+
+        - name: Remove incomplete recovery stage
+          ansible.builtin.file:
+            path: "{{ recovery_stage.path }}"
+            state: absent
+          when: recovery_stage is defined and recovery_stage.path is defined
+          failed_when: false
+
+        - name: Verify restored canary identity
+          ansible.builtin.assert:
+            that:
+              - restored_canary_file.stat.exists == prior_canary_exists
+              - (not prior_canary_exists) or (restored_canary_file.stat.uid == prior_canary_uid and restored_canary_file.stat.gid == prior_canary_gid and restored_canary_file.stat.mode == prior_canary_mode)
+              - (not prior_canary_exists) or restored_canary_content.content == existing_canary_content.content
+            fail_msg: "Stable-ingress canary restoration could not be proven"
+          no_log: true
+
+        - name: Fail canary convergence
+          ansible.builtin.fail:
+            msg: "Stable-ingress canary convergence failed"

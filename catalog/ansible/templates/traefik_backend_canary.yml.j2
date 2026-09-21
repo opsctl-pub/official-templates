@@ -1,0 +1,13 @@
+http:
+  routers:
+    {{ canary_router }}:
+      rule: 'Host(`{{ canary_host }}`)'
+      entryPoints:
+        - web
+      service: {{ canary_service }}
+  services:
+    {{ canary_service }}:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: {{ canary_backend_url | to_json }}

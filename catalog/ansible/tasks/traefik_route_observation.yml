@@ -30,6 +30,11 @@
     fail_msg: "Managed Traefik gateway is unavailable"
   no_log: true
 
+- name: Set expected route backend URLs
+  set_fact:
+    expected_backend_urls: "{{ (traefik_backends | default([], true)) | map(attribute='url') | list }}"
+  no_log: true
+
 - name: Inspect exact deployment route file
   stat:
     path: "{{ route_file_path }}"
@@ -80,6 +85,11 @@
         redirect_middleware_key: "{{ route_key }}-https-redirect"
         route_redirect_present: "{{ 'middlewares' in route_config.http }}"
 
+    - name: Normalize managed backend URLs
+      set_fact:
+        observed_backend_urls: "{{ route_service.loadBalancer.servers | map(attribute='url') | list }}"
+      no_log: true
+
     - name: Read normalized route host candidates
       set_fact:
         observed_route_hosts: "{{ route_router.rule | regex_findall('`([^`]+)`') | sort }}"
@@ -116,10 +126,12 @@
           - route_service.loadBalancer is mapping
           - route_service.loadBalancer.keys() | sort == ['passHostHeader', 'servers']
           - route_service.loadBalancer.passHostHeader is sameas true
-          - route_service.loadBalancer.servers | length == 1
+          - route_service.loadBalancer.servers | length > 0
           - route_service.loadBalancer.servers[0] is mapping
           - route_service.loadBalancer.servers[0].keys() | list == ['url']
-          - route_service.loadBalancer.servers[0].url is match('^http://127\.0\.0\.1:[0-9]+$')
+          - (expected_backend_urls | length == 0 and route_service.loadBalancer.servers | length == 1 and route_service.loadBalancer.servers[0].url is match('^http://127\.0\.0\.1:[0-9]+$')) or (expected_backend_urls | length > 0 and observed_backend_urls == expected_backend_urls)
+          - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
+          - (observed_backend_urls | select('match', '^http://[^:/?#]+:[0-9]+$') | list | length) == (observed_backend_urls | length)
           - (route_router.middlewares | default([])) is sequence
           - (route_router.middlewares | default([])) is not string
         fail_msg: "Managed Traefik route is malformed"
@@ -156,11 +168,15 @@
         route_observation_base:
           presence: present
           hosts: "{{ observed_route_hosts }}"
-          route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://127\\.0\\.0\\.1:', '') | int }}"
+          route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int }}"
           https: "{{ 'tls' in route_router }}"
           redirect_http_to_https: "{{ route_redirect_present }}"
           middlewares: "{{ route_router.middlewares | default([]) }}"
-          backend_identity_class: loopback
+          backend_identity_class: "{{ 'private' if (expected_backend_urls | length > 0) else 'loopback' }}"
+    - name: Add normalized private backend identity
+      set_fact:
+        route_observation_base: "{{ route_observation_base | combine({'backend_count': observed_backend_urls | length, 'backend_digest': observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')}) }}"
+      when: expected_backend_urls | length > 0
   rescue:
     - name: Set unknown route observation
       set_fact:
