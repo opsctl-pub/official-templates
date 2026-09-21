@@ -13,6 +13,74 @@
     gateway_wireguard_address: "{{ gateway_wireguard_ip if ('/' in (gateway_wireguard_ip | string)) else (gateway_wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
     effective_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
   pre_tasks:
+    - name: Validate exact attach contract before any host access
+      assert:
+        that:
+          - deployment_id is defined
+          - deployment_id is string
+          - deployment_id is match('^[0-9a-fA-F-]{36}$')
+          - server_id is defined
+          - server_id is string
+          - server_id is match('^[0-9a-fA-F-]{36}$')
+          - overlay_cidr is defined
+          - overlay_cidr is string
+          - overlay_cidr is match('^[0-9a-fA-F:.]+/[0-9]+$')
+          - gateway_wireguard_ip is defined
+          - gateway_wireguard_ip is string
+          - gateway_wireguard_ip is match('^[0-9a-fA-F:.]+$')
+          - wireguard_peers is defined
+          - wireguard_peers is sequence
+          - wireguard_peers is not string
+          - route_port is defined
+          - route_port is number
+          - route_port | int >= 1
+          - route_port | int <= 65535
+          - effective_route_hosts is sequence
+          - effective_route_hosts is not string
+          - effective_route_hosts | length > 0
+          - route_https is defined
+          - route_https is boolean
+          - route_middlewares is defined
+          - route_middlewares is sequence
+          - route_middlewares is not string
+          - traefik_backends is defined
+          - traefik_backends is sequence
+          - traefik_backends is not string
+          - traefik_backends | length > 0
+        fail_msg: "Traefik attach contract is incomplete or malformed"
+    - name: Validate exact attach route hosts
+      assert:
+        that:
+          - item is string
+          - item | length > 0
+        fail_msg: "Traefik attach route host is invalid"
+      loop: "{{ effective_route_hosts }}"
+    - name: Validate exact attach WireGuard peers
+      assert:
+        that:
+          - item is mapping
+          - item.public_key is defined
+          - item.public_key is string
+          - item.public_key | length > 0
+          - item.allowed_ips is defined
+          - item.allowed_ips is string
+          - item.allowed_ips | length > 0
+          - item.endpoint is defined
+          - item.endpoint is string
+          - item.endpoint | length > 0
+          - item.persistent_keepalive is defined
+          - item.persistent_keepalive is number
+        fail_msg: "Traefik attach WireGuard peer is invalid"
+      loop: "{{ wireguard_peers }}"
+    - name: Validate exact attach backends
+      assert:
+        that:
+          - item is mapping
+          - item.url is defined
+          - item.url is string
+          - item.url is match('^http://[^:/?#]+:[0-9]+/?$')
+        fail_msg: "Traefik attach backend is invalid"
+      loop: "{{ traefik_backends }}"
     - name: Skip attach when running in simulate mode
       meta: end_play
       when: simulate | default(false)
@@ -25,14 +93,6 @@
             printf 'OPERATION_STEP={"name":"attach:start","status":"running","metadata":{"display_name":"Attach load balancer backends","deployment_id":"%s","route_hosts":%s}}\n' "{{ deployment_id }}" '{{ effective_route_hosts | to_json }}'
           args:
             executable: /bin/sh
-
-        - name: Validate attach inputs
-          assert:
-            that:
-              - route_port is defined
-              - (effective_route_hosts | length) > 0
-              - (traefik_backends | default([]) | length) > 0
-            fail_msg: "Traefik attach requires route_hosts, route_port, and at least one backend"
 
         - name: Ensure Traefik dynamic directory exists
           file:
