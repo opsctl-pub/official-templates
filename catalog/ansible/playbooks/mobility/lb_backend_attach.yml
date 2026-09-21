@@ -40,6 +40,9 @@
           - effective_route_hosts | length > 0
           - route_https is defined
           - route_https is boolean
+          - redirect_http_to_https is defined
+          - redirect_http_to_https is boolean
+          - not redirect_http_to_https or route_https
           - route_middlewares is defined
           - route_middlewares is sequence
           - route_middlewares is not string
