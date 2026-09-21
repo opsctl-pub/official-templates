@@ -145,7 +145,7 @@
 
         - name: Render deterministic deployment route file
           template:
-            src: "{{ playbook_dir }}/../templates/traefik_deployment_route.yml.j2"
+            src: "{{ playbook_dir }}/../../templates/traefik_deployment_route.yml.j2"
             dest: "{{ route_file_path }}"
             owner: root
             group: root
