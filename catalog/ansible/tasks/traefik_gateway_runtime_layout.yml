@@ -17,6 +17,10 @@
         | length) == 0
       - traefik_gateway_force_recreate is boolean
       - traefik_gateway_sensitive is boolean
+      - traefik_gateway_target_major == 3
+      - traefik_gateway_target_version == '3.7.13'
+      - traefik_gateway_allow_major_upgrade is boolean
+      - traefik_image is match('^traefik@sha256:[0-9a-f]{64}$')
     fail_msg: "Managed Traefik runtime inputs are invalid"
   no_log: "{{ traefik_gateway_sensitive }}"
 
@@ -70,11 +74,46 @@
     group: root
     mode: "0700"
 
-- name: Ensure Traefik ACME file exists
+- name: Inspect Traefik ACME file without changing it
+  stat:
+    path: "{{ traefik_acme_dir }}/acme.json"
+  register: traefik_acme_file
+  no_log: true
+
+- name: Create missing Traefik ACME file
   file:
     path: "{{ traefik_acme_dir }}/acme.json"
     state: touch
     mode: "0600"
+  when: not traefik_acme_file.stat.exists
+
+- name: Refuse unsafe Traefik ACME file mode
+  assert:
+    that:
+      - traefik_acme_file.stat.get('mode', '') == '0600' or not traefik_acme_file.stat.exists
+    fail_msg: "Existing Traefik ACME file mode is not the canonical 0600 mode"
+  no_log: true
+
+- name: Verify immutable target Traefik image and binary
+  shell: |
+    set -eu
+    docker pull "{{ traefik_image }}" >/dev/null
+    digest="{{ traefik_image.split('@', 1)[1] }}"
+    repo_digests="$(docker image inspect "{{ traefik_image }}" --format '{% raw %}{{json .RepoDigests}}{% endraw %}')"
+    case "$repo_digests" in
+      *"$digest"*) ;;
+      *) echo "target_digest_not_resolved" >&2; exit 1 ;;
+    esac
+    version="$(docker run --rm --entrypoint traefik "{{ traefik_image }}" version 2>&1)"
+    printf '%s\n' "$version"
+    printf '%s\n' "$version" \
+      | awk '$1 == "Version:" { found=1; valid=($2 == "{{ traefik_gateway_target_version }}"); exit } END { exit !(found && valid) }'
+  args:
+    executable: /bin/sh
+  register: traefik_target_binary
+  changed_when: false
+  failed_when: traefik_target_binary.rc != 0
+  no_log: "{{ traefik_gateway_sensitive }}"
 
 - name: Inspect existing Traefik container
   community.docker.docker_container_info:
@@ -138,6 +177,52 @@
       {{ existing_traefik.Mounts | default([]) if existing_traefik else [] }}
   no_log: true
 
+- name: Snapshot exact prior Traefik runtime identity
+  set_fact:
+    traefik_prior_runtime: "{{ existing_traefik }}"
+    traefik_prior_runtime_present: "{{ managed_traefik_present }}"
+  no_log: true
+
+- name: Read current managed Traefik major version
+  shell: |
+    set -eu
+    docker exec "{{ traefik_container_name }}" traefik version \
+      | awk '/^Version:/ { split($2, parts, /\./); print parts[1]; exit }'
+  args:
+    executable: /bin/sh
+  register: traefik_current_version
+  changed_when: false
+  failed_when: false
+  when:
+    - managed_traefik_present
+    - existing_traefik.State.Status == 'running'
+  no_log: true
+
+- name: Normalize current managed Traefik major version
+  set_fact:
+    traefik_current_major: >-
+      {{
+        (traefik_current_version.stdout | trim)
+        if (
+          managed_traefik_present
+          and existing_traefik.State.Status == 'running'
+          and traefik_current_version is defined
+          and traefik_current_version.rc == 0
+        )
+        else 'unknown'
+      }}
+  no_log: true
+
+- name: Identify an exact target-image managed runtime
+  set_fact:
+    traefik_target_image_matches: >-
+      {{
+        managed_traefik_present
+        and existing_traefik is not none
+        and existing_traefik.Config.Image == traefik_image
+      }}
+  no_log: true
+
 - name: Classify existing Traefik runtime
   set_fact:
     managed_traefik_ready: >-
@@ -185,25 +270,251 @@
       }}
   no_log: true
 
-- name: Ensure canonical managed Traefik container is running
-  community.docker.docker_container:
-    name: "{{ traefik_container_name }}"
-    image: "{{ traefik_image }}"
-    state: started
-    recreate: true
-    restart_policy: always
-    detach: true
-    network_mode: host
-    volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "{{ traefik_dynamic_dir }}:{{ traefik_dynamic_dir }}"
-      - "{{ traefik_acme_dir }}:{{ traefik_acme_dir }}"
-      - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
-    command: "{{ traefik_command_args }}"
-    labels: "{{ traefik_managed_labels }}"
-    pull: false
-  when: traefik_gateway_force_recreate or not managed_traefik_ready
+- name: Enforce closed Traefik major-upgrade gate
+  assert:
+    that:
+      - >-
+        managed_traefik_ready
+        or not managed_traefik_present
+        or traefik_gateway_allow_major_upgrade
+        or traefik_current_major == (traefik_gateway_target_major | string)
+        or traefik_target_image_matches
+    fail_msg: >-
+      Refusing Traefik replacement across major versions without the internal
+      major-upgrade gate
   no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Initialize Traefik replacement state
+  set_fact:
+    traefik_replacement_started: false
+  no_log: true
+
+- name: Replace Traefik only when canonical identity differs or forced
+  block:
+    - name: Mark replacement before removing the old runtime
+      set_fact:
+        traefik_replacement_started: true
+      no_log: true
+
+    - name: Create canonical managed Traefik container
+      community.docker.docker_container:
+        name: "{{ traefik_container_name }}"
+        image: "{{ traefik_image }}"
+        state: started
+        recreate: true
+        restart_policy: always
+        detach: true
+        network_mode: host
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock:ro"
+          - "{{ traefik_dynamic_dir }}:{{ traefik_dynamic_dir }}"
+          - "{{ traefik_acme_dir }}:{{ traefik_acme_dir }}"
+          - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
+        command: "{{ traefik_command_args }}"
+        labels: "{{ traefik_managed_labels }}"
+        pull: false
+      no_log: "{{ traefik_gateway_sensitive }}"
+
+    - name: Inspect replacement Traefik container
+      community.docker.docker_container_info:
+        name: "{{ traefik_container_name }}"
+      register: traefik_replacement_info
+      no_log: true
+
+    - name: Read replacement Traefik container
+      set_fact:
+        traefik_replacement_details: >-
+          {{
+            (traefik_replacement_info.get('containers', []) | first)
+            if ((traefik_replacement_info.get('containers', []) | length) > 0)
+            else (traefik_replacement_info.get('container', None))
+          }}
+      no_log: true
+
+    - name: Verify replacement Traefik binary
+      shell: |
+        set -eu
+        docker exec "{{ traefik_container_name }}" traefik version \
+          | awk '$1 == "Version:" { found=1; valid=($2 == "{{ traefik_gateway_target_version }}"); exit } END { exit !(found && valid) }'
+      args:
+        executable: /bin/sh
+      register: traefik_replacement_binary
+      changed_when: false
+      failed_when: traefik_replacement_binary.rc != 0
+      no_log: "{{ traefik_gateway_sensitive }}"
+
+    - name: Verify replacement Traefik identity
+      assert:
+        that:
+          - traefik_replacement_details is not none
+          - traefik_replacement_details.State.Status == 'running'
+          - traefik_replacement_details.HostConfig.NetworkMode == 'host'
+          - traefik_replacement_details.Config.Image == traefik_image
+          - >-
+            ((traefik_replacement_details.Config.Labels
+            | combine(traefik_managed_labels))
+            == traefik_replacement_details.Config.Labels)
+          - >-
+            ((traefik_command_args | difference(traefik_replacement_details.Config.Cmd))
+            | length) == 0
+          - >-
+            (traefik_replacement_details.Mounts
+            | selectattr('Destination', 'equalto', '/var/run/docker.sock')
+            | selectattr('Source', 'equalto', '/var/run/docker.sock')
+            | selectattr('RW', 'sameas', false)
+            | list | length) == 1
+          - >-
+            (traefik_replacement_details.Mounts
+            | selectattr('Destination', 'equalto', traefik_dynamic_dir)
+            | selectattr('Source', 'equalto', traefik_dynamic_dir)
+            | selectattr('RW', 'sameas', true)
+            | list | length) == 1
+          - >-
+            (traefik_replacement_details.Mounts
+            | selectattr('Destination', 'equalto', traefik_acme_dir)
+            | selectattr('Source', 'equalto', traefik_acme_dir)
+            | selectattr('RW', 'sameas', true)
+            | list | length) == 1
+          - >-
+            (traefik_replacement_details.Mounts
+            | selectattr('Destination', 'equalto', traefik_certificate_dir)
+            | selectattr('Source', 'equalto', traefik_certificate_dir)
+            | selectattr('RW', 'sameas', false)
+            | list | length) == 1
+        fail_msg: "Traefik replacement did not converge to the canonical identity"
+      no_log: "{{ traefik_gateway_sensitive }}"
+
+    - name: Verify replacement Traefik native readiness
+      command:
+        argv:
+          - docker
+          - exec
+          - "{{ traefik_container_name }}"
+          - traefik
+          - healthcheck
+          - --ping
+      register: traefik_replacement_health
+      changed_when: false
+      retries: 20
+      delay: 1
+      until: traefik_replacement_health.rc == 0
+      no_log: "{{ traefik_gateway_sensitive }}"
+  rescue:
+    - name: Restore exact prior Traefik runtime
+      shell: |
+        python3 - <<'PY'
+        import json
+        import subprocess
+
+        prior = json.loads(r'''{{ traefik_prior_runtime | to_json }}''')
+        name = prior.get('Name', '').lstrip('/') or {{ traefik_container_name | to_json }}
+        config = prior.get('Config') or {}
+        host_config = prior.get('HostConfig') or {}
+
+        subprocess.run(["docker", "rm", "-f", name], check=False,
+                       capture_output=True, text=True)
+        create = ["docker", "create", "--name", name]
+        restart = host_config.get("RestartPolicy") or {}
+        restart_name = restart.get("Name") or "no"
+        if restart_name != "no":
+            value = restart_name
+            retries = restart.get("MaximumRetryCount")
+            if restart_name == "on-failure" and retries:
+                value = f"{restart_name}:{retries}"
+            create.extend(["--restart", value])
+        network_mode = host_config.get("NetworkMode")
+        if network_mode and network_mode != "default":
+            create.extend(["--network", network_mode])
+        if config.get("WorkingDir"):
+            create.extend(["--workdir", config["WorkingDir"]])
+        if config.get("User"):
+            create.extend(["--user", config["User"]])
+        entrypoint = config.get("Entrypoint") or []
+        if entrypoint:
+            create.extend(["--entrypoint", entrypoint[0]])
+        for value in config.get("Env") or []:
+            create.extend(["--env", value])
+        for key, value in sorted((config.get("Labels") or {}).items()):
+            create.extend(["--label", f"{key}={value}"])
+        for bind in host_config.get("Binds") or []:
+            create.extend(["--volume", bind])
+        for key, bindings in sorted((host_config.get("PortBindings") or {}).items()):
+            if not isinstance(bindings, list):
+                raise RuntimeError("prior_port_bindings_invalid")
+            port, protocol = key.split("/", 1)
+            for binding in bindings:
+                host_ip = str(binding.get("HostIp") or "")
+                host_port = str(binding.get("HostPort") or "")
+                if ":" in host_ip and not host_ip.startswith("["):
+                    host_ip = f"[{host_ip}]"
+                value = f"{host_ip}:{host_port}:{port}/{protocol}" if host_ip else f"{host_port}:{port}/{protocol}"
+                create.extend(["--publish", value])
+        image = config.get("Image")
+        if not isinstance(image, str) or not image:
+            raise RuntimeError("prior_image_invalid")
+        create.append(image)
+        command = config.get("Cmd")
+        if isinstance(command, list):
+            create.extend(str(item) for item in command)
+        elif isinstance(command, str) and command:
+            create.append(command)
+        subprocess.run(create, check=True, capture_output=True, text=True)
+        subprocess.run(["docker", "start", name], check=True,
+                       capture_output=True, text=True)
+
+        current = json.loads(
+            subprocess.run(["docker", "inspect", name], check=True,
+                           capture_output=True, text=True).stdout
+        )[0]
+        current_config = current.get("Config") or {}
+        current_host = current.get("HostConfig") or {}
+        checks = {
+            "image": current_config.get("Image") == config.get("Image"),
+            "command": current_config.get("Cmd") == config.get("Cmd"),
+            "entrypoint": current_config.get("Entrypoint") == config.get("Entrypoint"),
+            "labels": current_config.get("Labels") == config.get("Labels"),
+            "network": current_host.get("NetworkMode") == host_config.get("NetworkMode"),
+            "restart": current_host.get("RestartPolicy") == host_config.get("RestartPolicy"),
+            "binds": sorted(current_host.get("Binds") or []) == sorted(host_config.get("Binds") or []),
+            "running": (current.get("State") or {}).get("Status") == "running",
+        }
+        if not all(checks.values()):
+            raise RuntimeError("prior_runtime_restore_mismatch:" + json.dumps(checks, sort_keys=True))
+        PY
+      args:
+        executable: /bin/sh
+      register: traefik_restore_result
+      changed_when: true
+      failed_when: traefik_restore_result.rc != 0
+      when:
+        - traefik_replacement_started
+        - traefik_prior_runtime_present
+      no_log: true
+
+    - name: Remove failed fresh Traefik replacement
+      shell: |
+        set -eu
+        docker rm -f "{{ traefik_container_name }}" >/dev/null 2>&1 || true
+        if docker inspect "{{ traefik_container_name }}" >/dev/null 2>&1; then
+          echo "failed_fresh_traefik_still_present" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/sh
+      register: traefik_fresh_cleanup_result
+      changed_when: true
+      failed_when: traefik_fresh_cleanup_result.rc != 0
+      when:
+        - traefik_replacement_started
+        - not traefik_prior_runtime_present
+      no_log: true
+
+    - name: Fail Traefik replacement after restoration attempt
+      fail:
+        msg: >-
+          Traefik replacement failed; prior runtime restoration was attempted
+          and must be verified from the task result
+  when: traefik_gateway_force_recreate or not managed_traefik_ready
 
 - name: Inspect converged Traefik container
   community.docker.docker_container_info:
@@ -263,4 +574,20 @@
         | selectattr('RW', 'sameas', false)
         | list | length) == 1
     fail_msg: "Traefik did not converge to the canonical managed runtime"
+  no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Verify canonical Traefik native readiness
+  command:
+    argv:
+      - docker
+      - exec
+      - "{{ traefik_container_name }}"
+      - traefik
+      - healthcheck
+      - --ping
+  register: traefik_healthcheck
+  changed_when: false
+  retries: 20
+  delay: 1
+  until: traefik_healthcheck.rc == 0
   no_log: "{{ traefik_gateway_sensitive }}"

@@ -5,11 +5,14 @@
   become: true
   vars:
     traefik_container_name: "traefik"
-    traefik_image: "traefik:2.11"
+    traefik_image: "traefik@sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     traefik_acme_dir: "/var/lib/traefik"
     traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
     acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    traefik_gateway_target_major: 3
+    traefik_gateway_target_version: "3.7.13"
+    traefik_gateway_allow_major_upgrade: false
   pre_tasks:
     - name: Skip Traefik ensure when running in simulate mode
       meta: end_play
