@@ -48,6 +48,6 @@ http:
       loadBalancer:
         passHostHeader: true
         servers:
-{% for backend in traefik_backends %}
+{% for backend in traefik_backends | default(resolved_traefik_backends) %}
           - url: {{ backend.url | to_json }}
 {% endfor %}
