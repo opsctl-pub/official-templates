@@ -9,7 +9,19 @@
     expected_org_id: "{{ app_org_id | default('') }}"
     expected_project_id: "{{ app_project_id | default('') }}"
     expected_app_slug: "{{ app_slug | default(container_name) }}"
+    expected_deployment_id: "{{ app_deployment_id | default('') }}"
+    expected_image_ref: "{{ app_image_ref | default('') }}"
+    allow_organization_owned_container: "{{ app_allow_organization_owned_container | default(false) }}"
   tasks:
+    - name: Validate organization-owned removal identity
+      assert:
+        that:
+          - allow_organization_owned_container is boolean
+          - >-
+            not allow_organization_owned_container or
+            (expected_deployment_id | length > 0 and expected_image_ref | length > 0)
+        fail_msg: "Organization-owned removal identity is invalid"
+
     - name: OPERATION_STEP remove:start
       shell: |
         printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"display_name":"Remove container","container_name":{{ container_name | to_json }},"router_name":{{ router_name | to_json }}}}\n'
@@ -36,9 +48,27 @@
         container_payload: "{{ (container_inspect.stdout | from_json)[0] }}"
       when: container_inspect.rc == 0
 
+    - name: Read container ownership labels
+      set_fact:
+        container_labels: "{{ (container_payload.get('Config', {}) or {}).get('Labels', {}) or {} }}"
+      when: container_inspect.rc == 0
+
     - name: Evaluate ownership guard
       set_fact:
-        label_guard_ok: "{{ ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.managed') == 'true' and ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.org_id') == expected_org_id and ((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.app') == expected_app_slug and ((expected_project_id | length == 0) or (((container_payload.get('Config', {}) or {}).get('Labels', {}) or {}).get('com.opsctl.project_id') == expected_project_id)) }}"
+        label_guard_ok: >-
+          {{ container_labels.get('com.opsctl.managed') == 'true'
+             and container_labels.get('com.opsctl.org_id') == expected_org_id
+             and container_labels.get('com.opsctl.app') == expected_app_slug
+             and (
+               expected_project_id | length == 0
+               or container_labels.get('com.opsctl.project_id') == expected_project_id
+               or (
+                 allow_organization_owned_container
+                 and container_labels.get('com.opsctl.project_id') in [none, '']
+                 and container_labels.get('com.opsctl.deployment_id') in [none, '', expected_deployment_id]
+                 and (container_payload.get('Config', {}) or {}).get('Image') == expected_image_ref
+               )
+             ) }}
       when: container_inspect.rc == 0
 
     - name: OPERATION_STEP remove:fail label mismatch
