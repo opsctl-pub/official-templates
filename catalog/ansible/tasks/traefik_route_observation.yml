@@ -15,16 +15,6 @@
       }}
   no_log: true
 
-- name: Read managed Traefik gateway image identity
-  set_fact:
-    observed_traefik_image: >-
-      {{
-        existing_traefik.Config.Image
-        if (existing_traefik is mapping and existing_traefik.Config is mapping)
-        else ''
-      }}
-  no_log: true
-
 - name: Validate managed watched Traefik runtime
   assert:
     that:
@@ -163,10 +153,9 @@
             else []
           }}
 
-    - name: Set accepted Traefik route matcher patterns
+    - name: Set accepted Traefik v3 route matcher pattern
       set_fact:
         route_v3_rule_pattern: '^Host\(`[^`]+`\)(?: \|\| Host\(`[^`]+`\))*$'
-        route_v2_rule_pattern: '^Host\(`[^`]+`(?:,`[^`]+`)+\)$'
 
     - name: Validate exact managed route structure
       assert:
@@ -184,7 +173,7 @@
           - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
           - route_router.service == route_key
           - route_router.rule is string
-          - (route_router.rule is match(route_v3_rule_pattern)) or ((route_router.rule is match(route_v2_rule_pattern)) and observed_traefik_image == 'traefik:2.11')
+          - route_router.rule is match(route_v3_rule_pattern)
           - (observed_route_hosts | length) > 0
           - (observed_route_hosts | unique | list | length) == (observed_route_hosts | length)
           - (observed_route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (observed_route_hosts | length)

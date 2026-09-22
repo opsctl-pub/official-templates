@@ -13,7 +13,6 @@
     acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
     traefik_gateway_target_major: 3
     traefik_gateway_target_version: "3.7.13"
-    traefik_gateway_allow_major_upgrade: false
   pre_tasks:
     - name: Skip Traefik proxy when running in simulate mode
       meta: end_play

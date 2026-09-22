@@ -19,7 +19,6 @@
       - traefik_gateway_sensitive is boolean
       - traefik_gateway_target_major == 3
       - traefik_gateway_target_version == '3.7.13'
-      - traefik_gateway_allow_major_upgrade is boolean
       - traefik_image is match('^traefik@sha256:[0-9a-f]{64}$')
     fail_msg: "Managed Traefik runtime inputs are invalid"
   no_log: "{{ traefik_gateway_sensitive }}"
@@ -270,18 +269,16 @@
       }}
   no_log: true
 
-- name: Enforce closed Traefik major-upgrade gate
+- name: Refuse managed Traefik cross-major replacement
   assert:
     that:
       - >-
         managed_traefik_ready
         or not managed_traefik_present
-        or traefik_gateway_allow_major_upgrade
         or traefik_current_major == (traefik_gateway_target_major | string)
         or traefik_target_image_matches
     fail_msg: >-
-      Refusing Traefik replacement across major versions without the internal
-      major-upgrade gate
+      Refusing Traefik replacement across major versions
   no_log: "{{ traefik_gateway_sensitive }}"
 
 - name: Initialize Traefik replacement state
