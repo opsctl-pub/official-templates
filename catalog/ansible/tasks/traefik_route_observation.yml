@@ -35,6 +35,17 @@
     expected_backend_urls: "{{ (traefik_backends | default([], true)) | map(attribute='url') | list }}"
   no_log: true
 
+- name: Set current route backend identity
+  set_fact:
+    route_cas_present: "{{ expected_route_observation is defined and expected_route_observation.presence == 'present' }}"
+    current_backend_identity_class: >-
+      {{
+        expected_route_observation.backend_identity_class
+        if (expected_route_observation is defined and expected_route_observation.presence == 'present')
+        else ('private' if (expected_backend_urls | length) > 0 else 'loopback')
+      }}
+  no_log: true
+
 - name: Inspect exact deployment route file
   stat:
     path: "{{ route_file_path }}"
@@ -94,6 +105,10 @@
       set_fact:
         observed_route_hosts: "{{ route_router.rule | regex_findall('`([^`]+)`') | sort }}"
 
+    - name: Set accepted Traefik v3 route matcher pattern
+      set_fact:
+        route_rule_pattern: '^Host\(`[^`]+`\)(?: \|\| Host\(`[^`]+`\))*$'
+
     - name: Validate exact managed route structure
       assert:
         that:
@@ -110,7 +125,7 @@
           - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
           - route_router.service == route_key
           - route_router.rule is string
-          - route_router.rule is match('^Host\(`[^`]+`(?:,`[^`]+`)*\)$')
+          - route_router.rule is match(route_rule_pattern)
           - (observed_route_hosts | length) > 0
           - (observed_route_hosts | unique | list | length) == (observed_route_hosts | length)
           - (observed_route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (observed_route_hosts | length)
@@ -129,7 +144,8 @@
           - route_service.loadBalancer.servers | length > 0
           - route_service.loadBalancer.servers[0] is mapping
           - route_service.loadBalancer.servers[0].keys() | list == ['url']
-          - (expected_backend_urls | length == 0 and route_service.loadBalancer.servers | length == 1 and route_service.loadBalancer.servers[0].url is match('^http://127\.0\.0\.1:[0-9]+$')) or (expected_backend_urls | length > 0 and observed_backend_urls == expected_backend_urls)
+          - route_cas_present or ((expected_backend_urls | length == 0 and route_service.loadBalancer.servers | length == 1 and route_service.loadBalancer.servers[0].url is match('^http://127\.0\.0\.1:[0-9]+$')) or (expected_backend_urls | length > 0 and observed_backend_urls == expected_backend_urls))
+          - (not route_cas_present) or ((current_backend_identity_class == 'private' and (observed_backend_urls | length) == (expected_route_observation.backend_count | int) and (observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')) == expected_route_observation.backend_digest) or (current_backend_identity_class == 'loopback' and observed_backend_urls == ['http://127.0.0.1:' ~ (route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int | string)]))
           - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
           - (observed_backend_urls | select('match', '^http://[^:/?#]+:[0-9]+$') | list | length) == (observed_backend_urls | length)
           - (route_router.middlewares | default([])) is sequence
@@ -172,11 +188,11 @@
           https: "{{ 'tls' in route_router }}"
           redirect_http_to_https: "{{ route_redirect_present }}"
           middlewares: "{{ route_router.middlewares | default([]) }}"
-          backend_identity_class: "{{ 'private' if (expected_backend_urls | length > 0) else 'loopback' }}"
+          backend_identity_class: "{{ current_backend_identity_class }}"
     - name: Add normalized private backend identity
       set_fact:
         route_observation_base: "{{ route_observation_base | combine({'backend_count': observed_backend_urls | length, 'backend_digest': observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')}) }}"
-      when: expected_backend_urls | length > 0
+      when: current_backend_identity_class == 'private'
   rescue:
     - name: Set unknown route observation
       set_fact:

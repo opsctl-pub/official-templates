@@ -6,7 +6,7 @@ http:
   routers:
 {% if redirect_http_to_https %}
     deployment-{{ deployment_id }}-http-redirect:
-      rule: 'Host({% for host in effective_route_hosts %}`{{ host }}`{% if not loop.last %},{% endif %}{% endfor %})'
+      rule: '{% for host in effective_route_hosts %}Host(`{{ host }}`){% if not loop.last %} || {% endif %}{% endfor %}'
       priority: 1000
       entryPoints:
         - web
@@ -15,7 +15,7 @@ http:
       service: noop@internal
 {% endif %}
     deployment-{{ deployment_id }}:
-      rule: 'Host({% for host in effective_route_hosts %}`{{ host }}`{% if not loop.last %},{% endif %}{% endfor %})'
+      rule: '{% for host in effective_route_hosts %}Host(`{{ host }}`){% if not loop.last %} || {% endif %}{% endfor %}'
       priority: 1000
       entryPoints:
 {% if route_https | default(true) %}
