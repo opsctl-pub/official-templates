@@ -15,6 +15,16 @@
       }}
   no_log: true
 
+- name: Read managed Traefik gateway image identity
+  set_fact:
+    observed_traefik_image: >-
+      {{
+        existing_traefik.Config.Image
+        if (existing_traefik is mapping and existing_traefik.Config is mapping)
+        else ''
+      }}
+  no_log: true
+
 - name: Validate managed watched Traefik runtime
   assert:
     that:
@@ -87,27 +97,76 @@
 
     - name: Read exact router and service
       set_fact:
-        route_router: "{{ route_config.http.routers[route_key] }}"
-        route_service: "{{ route_config.http.services[route_key] }}"
+        route_http: >-
+          {{
+            route_config.get('http')
+            if route_config is mapping
+            else none
+          }}
+
+    - name: Read exact managed router and service entries
+      set_fact:
+        route_router: >-
+          {{
+            route_config.http.routers.get(route_key)
+            if (
+              route_config is mapping
+              and route_config.http is mapping
+              and route_config.http.routers is mapping
+            )
+            else none
+          }}
+        route_service: >-
+          {{
+            route_config.http.services.get(route_key)
+            if (
+              route_config is mapping
+              and route_config.http is mapping
+              and route_config.http.services is mapping
+            )
+            else none
+          }}
 
     - name: Identify managed HTTP redirect shape
       set_fact:
         redirect_route_key: "{{ route_key }}-http-redirect"
         redirect_middleware_key: "{{ route_key }}-https-redirect"
-        route_redirect_present: "{{ 'middlewares' in route_config.http }}"
+        route_redirect_present: >-
+          {{ route_http is mapping and 'middlewares' in route_http }}
 
     - name: Normalize managed backend URLs
       set_fact:
-        observed_backend_urls: "{{ route_service.loadBalancer.servers | map(attribute='url') | list }}"
+        observed_backend_urls: >-
+          {{
+            route_service.loadBalancer.servers
+            | map(attribute='url')
+            | list
+            if (
+              route_service is mapping
+              and route_service.loadBalancer is mapping
+              and route_service.loadBalancer.servers is sequence
+              and route_service.loadBalancer.servers is not string
+            )
+            else []
+          }}
       no_log: true
 
     - name: Read normalized route host candidates
       set_fact:
-        observed_route_hosts: "{{ route_router.rule | regex_findall('`([^`]+)`') | sort }}"
+        observed_route_hosts: >-
+          {{
+            route_router.rule | regex_findall('`([^`]+)`') | sort
+            if (
+              route_router is mapping
+              and route_router.rule is string
+            )
+            else []
+          }}
 
-    - name: Set accepted Traefik v3 route matcher pattern
+    - name: Set accepted Traefik route matcher patterns
       set_fact:
-        route_rule_pattern: '^Host\(`[^`]+`\)(?: \|\| Host\(`[^`]+`\))*$'
+        route_v3_rule_pattern: '^Host\(`[^`]+`\)(?: \|\| Host\(`[^`]+`\))*$'
+        route_v2_rule_pattern: '^Host\(`[^`]+`(?:,`[^`]+`)+\)$'
 
     - name: Validate exact managed route structure
       assert:
@@ -125,7 +184,7 @@
           - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
           - route_router.service == route_key
           - route_router.rule is string
-          - route_router.rule is match(route_rule_pattern)
+          - (route_router.rule is match(route_v3_rule_pattern)) or ((route_router.rule is match(route_v2_rule_pattern)) and observed_traefik_image == 'traefik:2.11')
           - (observed_route_hosts | length) > 0
           - (observed_route_hosts | unique | list | length) == (observed_route_hosts | length)
           - (observed_route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (observed_route_hosts | length)
@@ -151,6 +210,18 @@
           - (route_router.middlewares | default([])) is sequence
           - (route_router.middlewares | default([])) is not string
         fail_msg: "Managed Traefik route is malformed"
+      register: route_structure_assertion
+      ignore_errors: true
+      no_log: true
+
+    - name: Emit safe first failing route predicate
+      fail:
+        msg: >-
+          route_observation_assertion_failed={{
+            route_structure_assertion.assertion
+            | default('route structure predicate evaluation failed')
+          }}
+      when: route_structure_assertion.failed | default(false)
 
     - name: Validate route without managed HTTP redirect
       assert:
