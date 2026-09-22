@@ -8,6 +8,7 @@
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
     route_key: "deployment-{{ deployment_id }}"
+    observe_gateway_wireguard_enabled: "{{ observe_gateway_wireguard | default(false) | bool }}"
   pre_tasks:
     - name: Validate route observation identity
       assert:
@@ -20,14 +21,109 @@
           - deployment_id is string
           - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
         fail_msg: "Traefik route observation identity is invalid"
+    - name: Validate optional gateway WireGuard observation flag
+      assert:
+        that:
+          - observe_gateway_wireguard is not defined or observe_gateway_wireguard is boolean
+          - not observe_gateway_wireguard_enabled or observe_gateway_wireguard is true
+        fail_msg: "Gateway WireGuard observation is invalid"
 
   tasks:
     - name: Read normalized deployment route
       include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
 
+    - name: Set stable-ingress gateway observer identity
+      set_fact:
+        gateway_bootstrap_interface: "wg-{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
+        gateway_bootstrap_service: "wg-quick@wg-{{ (deployment_id | string | regex_replace('-', ''))[:8] }}.service"
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Require the exact bootstrap route and backend
+      assert:
+        that:
+          - route_observation.presence == 'present'
+          - route_observation.backend_identity_class == 'loopback'
+          - observed_backend_urls | default([]) | length == 1
+          - observed_backend_urls[0] == 'http://127.0.0.1:' ~ (route_observation.route_port | string)
+        fail_msg: "Stable-ingress gateway route is not the exact loopback route"
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Read the exact gateway WireGuard public key
+      command: "wg show {{ gateway_bootstrap_interface }} public-key"
+      register: gateway_bootstrap_public_key
+      changed_when: false
+      failed_when: false
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Read the exact gateway WireGuard IPv4 address
+      command: "ip -4 -o addr show dev {{ gateway_bootstrap_interface }} scope global"
+      register: gateway_bootstrap_address
+      changed_when: false
+      failed_when: false
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Read the qualified gateway WireGuard service state
+      command: >-
+        systemctl show {{ gateway_bootstrap_service }}
+        --property=LoadState,ActiveState,SubState --value
+      register: gateway_bootstrap_service_state
+      changed_when: false
+      failed_when: false
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Normalize and validate gateway WireGuard evidence
+      set_fact:
+        gateway_bootstrap_ipv4: >-
+          {{ (gateway_bootstrap_address.stdout | regex_findall('inet ([0-9.]+)/[0-9]+') | unique) }}
+        gateway_bootstrap_public_key_value: "{{ gateway_bootstrap_public_key.stdout | trim }}"
+        gateway_bootstrap_service_values: "{{ gateway_bootstrap_service_state.stdout_lines | map('trim') | list }}"
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Reject incomplete or ambiguous gateway WireGuard evidence
+      assert:
+        that:
+          - gateway_bootstrap_public_key.rc == 0
+          - gateway_bootstrap_public_key_value is match('^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$')
+          - gateway_bootstrap_ipv4 | length == 1
+          - gateway_bootstrap_ipv4[0] is match('^(?!127\\.)(?!0\\.)(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$')
+          - gateway_bootstrap_address.rc == 0
+          - gateway_bootstrap_service_state.rc == 0
+          - gateway_bootstrap_service_values | length == 3
+          - gateway_bootstrap_service_values[0] == 'loaded'
+          - gateway_bootstrap_service_values[1] == 'active'
+          - gateway_bootstrap_service_values[2] in ['running', 'exited']
+        fail_msg: "Gateway WireGuard evidence is incomplete or ambiguous"
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
+    - name: Build the bounded gateway bootstrap observation
+      set_fact:
+        gateway_bootstrap_observation:
+          route_backend_urls: "{{ observed_backend_urls }}"
+          interface: "{{ gateway_bootstrap_interface }}"
+          ipv4: "{{ gateway_bootstrap_ipv4[0] }}"
+          public_key: "{{ gateway_bootstrap_public_key_value }}"
+          service:
+            name: "{{ gateway_bootstrap_service }}"
+            load_state: "{{ gateway_bootstrap_service_values[0] }}"
+            active_state: "{{ gateway_bootstrap_service_values[1] }}"
+            sub_state: "{{ gateway_bootstrap_service_values[2] }}"
+      when: observe_gateway_wireguard_enabled
+      no_log: true
+
     - name: Emit normalized deployment route observation
       debug:
         msg: >-
           TEMPLATE_OUTPUT_JSON={{
-            {'deployment_route_observation': route_observation} | to_json
+            ({'deployment_route_observation': route_observation}
+             | combine(
+                 {'gateway_bootstrap_observation': gateway_bootstrap_observation}
+                 if observe_gateway_wireguard_enabled else {}
+               )) | to_json
           }}
