@@ -721,8 +721,9 @@
         source_replacement_recheck_complete: true
         source_replacement_recheck_failed: "{{ (port_conflicts_retry_result.rc | default(1) | int) != 0 }}"
       when:
+        - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
-        - (port_conflict_entries | length) > 0
+        - (port_conflict_entries | default([]) | length) > 0
         - (
             source_replacement_verified | default(false) | bool
             or (
