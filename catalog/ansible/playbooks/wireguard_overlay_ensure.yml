@@ -19,6 +19,72 @@
       meta: end_play
       when: simulate | default(false)
 
+    - name: Validate guarded WireGuard operation shape
+      assert:
+        that:
+          - require_absent is not defined or require_absent is true
+          - (expected_public_key is defined) == (expected_wireguard_ip is defined)
+          - expected_public_key is not defined or wireguard_requested_state == 'absent'
+          - require_absent is not defined or wireguard_requested_state == 'present'
+        fail_msg: "WireGuard ownership guard is invalid"
+
+    - name: Inspect fresh WireGuard interface before mutation
+      command: "ip link show dev {{ wireguard_interface_name }}"
+      register: fresh_wireguard_interface
+      changed_when: false
+      failed_when: false
+      when: require_absent | default(false)
+
+    - name: Inspect fresh WireGuard files before mutation
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ wireguard_config_path }}"
+        - "{{ wireguard_private_key_path }}"
+        - "{{ wireguard_public_key_path }}"
+      register: fresh_wireguard_files
+      when: require_absent | default(false)
+
+    - name: Inspect fresh WireGuard service before mutation
+      command: "systemctl is-active {{ wireguard_service_name }}.service"
+      register: fresh_wireguard_service
+      changed_when: false
+      failed_when: false
+      when: require_absent | default(false)
+
+    - name: Refuse preexisting fresh WireGuard state
+      assert:
+        that:
+          - fresh_wireguard_interface.rc != 0
+          - fresh_wireguard_files.results | selectattr('stat.exists') | list | length == 0
+          - fresh_wireguard_service.rc != 0
+        fail_msg: "Fresh WireGuard interface is not absent"
+      when: require_absent | default(false)
+
+    - name: Read owned WireGuard public key before cleanup
+      command: "wg show {{ wireguard_interface_name }} public-key"
+      register: owned_wireguard_public_key
+      changed_when: false
+      failed_when: false
+      when: expected_public_key is defined
+
+    - name: Read owned WireGuard address before cleanup
+      command: "ip -4 -o addr show dev {{ wireguard_interface_name }} scope global"
+      register: owned_wireguard_address
+      changed_when: false
+      failed_when: false
+      when: expected_public_key is defined
+
+    - name: Refuse cleanup of another WireGuard owner
+      assert:
+        that:
+          - owned_wireguard_public_key.rc == 0
+          - owned_wireguard_public_key.stdout | trim == expected_public_key
+          - owned_wireguard_address.rc == 0
+          - owned_wireguard_address.stdout | regex_findall('inet ([0-9.]+)/') == [expected_wireguard_ip]
+        fail_msg: "WireGuard cleanup owner changed"
+      when: expected_public_key is defined
+
   tasks:
     - name: OPERATION_STEP wireguard:start
       shell: |
@@ -65,6 +131,25 @@
                 - "{{ wireguard_config_path }}"
                 - "{{ wireguard_private_key_path }}"
                 - "{{ wireguard_public_key_path }}"
+
+            - name: Verify owned WireGuard interface is absent
+              command: "ip link show dev {{ wireguard_interface_name }}"
+              register: removed_wireguard_interface
+              changed_when: false
+              failed_when: false
+              when: expected_public_key is defined
+
+            - name: Assert owned WireGuard cleanup completed
+              assert:
+                that:
+                  - removed_wireguard_interface.rc != 0
+                fail_msg: "Owned WireGuard interface remains after cleanup"
+              when: expected_public_key is defined
+
+            - name: Emit owned WireGuard cleanup evidence
+              debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'wireguard_absent': true, 'wireguard_ip': expected_wireguard_ip, 'wireguard_public_key': expected_public_key} | to_json }}"
+              when: expected_public_key is defined
 
             - name: OPERATION_STEP wireguard:complete absent
               shell: |
@@ -154,6 +239,11 @@
               - >-
                 (not wireguard_service_has_status)
                 or wireguard_service_status_valid
+                or (
+                  require_absent | default(false)
+                  and wireguard_service_load_state == 'not-found'
+                  and wireguard_service_active_state == 'inactive'
+                )
             fail_msg: >-
               WireGuard systemd ownership is missing, malformed, inactive, failed,
               or unsupported before activation.
