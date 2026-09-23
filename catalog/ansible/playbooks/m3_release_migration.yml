@@ -1,0 +1,75 @@
+---
+- name: Apply M3 forward-compatible release migration
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Validate exact release target
+      ansible.builtin.assert:
+        that:
+          - target_container_name is string
+          - target_container_name | length > 0
+          - deployment_id is string
+          - deployment_id | length > 0
+          - expected_image is string
+          - expected_image is match('^ghcr[.]io/[^ ]+@sha256:[a-f0-9]{64}$')
+          - record_id is string
+          - record_id is match('^[A-Za-z0-9_-]{1,80}$')
+          - expected_value is string
+          - expected_value | length > 0
+          - org_id is string
+          - org_id | length > 0
+          - project_id is string
+          - project_id | length > 0
+
+    - name: Observe exact target container
+      community.docker.docker_container_info:
+        name: "{{ target_container_name }}"
+      register: m3_target_container
+
+    - name: Confirm target ownership and revision
+      ansible.builtin.assert:
+        that:
+          - m3_target_container.exists
+          - m3_target_container.container.State.Running
+          - m3_target_container.container.Config.Image == expected_image
+          - m3_target_container.container.Config.Labels.get('com.opsctl.managed') == 'true'
+          - m3_target_container.container.Config.Labels.get('com.opsctl.org_id') == org_id
+          - m3_target_container.container.Config.Labels.get('com.opsctl.project_id') == project_id
+          - m3_target_container.container.Config.Labels.get('com.opsctl.deployment_id') == deployment_id
+
+    - name: Apply additive schema change and preserve the existing record
+      community.docker.docker_container_exec:
+        container: "{{ target_container_name }}"
+        argv:
+          - python
+          - -c
+          - |
+            import os
+            import sys
+            import psycopg2
+
+            with psycopg2.connect(os.environ["DATABASE_URL"]) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "ALTER TABLE promotion_records "
+                        "ADD COLUMN IF NOT EXISTS release_marker text NOT NULL DEFAULT 'migrated'"
+                    )
+                    cursor.execute(
+                        "SELECT value, release_marker FROM promotion_records WHERE id = %s",
+                        (sys.argv[1],),
+                    )
+                    row = cursor.fetchone()
+                    if row != (sys.argv[2], "migrated"):
+                        raise RuntimeError("M3 release record or migration did not match")
+            print("M3_RELEASE_MIGRATION_OK")
+          - "{{ record_id }}"
+          - "{{ expected_value }}"
+      register: m3_release_migration
+      changed_when: true
+      no_log: true
+
+    - name: Record bounded release result
+      ansible.builtin.debug:
+        msg: M3_RELEASE_MIGRATION_OK
+      when: m3_release_migration.rc == 0

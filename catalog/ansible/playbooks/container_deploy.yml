@@ -267,7 +267,7 @@
           {{
             [backend_route_port]
             if (loopback_backend_enabled or source_dual_backend_enabled)
-            else (published_ports | map('regex_replace', '^([^:]+):.*$', '\\1') | list)
+            else (published_ports | map('regex_search', '^[^:]+') | list)
           }}
       when:
         - host_port_preflight_enabled
