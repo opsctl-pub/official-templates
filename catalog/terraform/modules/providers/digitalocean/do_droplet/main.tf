@@ -112,6 +112,12 @@ resource "digitalocean_firewall" "destroy" {
   name       = "opsctl-destroy-firewall"
   depends_on = [digitalocean_droplet.this]
 
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0"]
+  }
+
   lifecycle {
     precondition {
       condition     = var.firewall_id != ""
