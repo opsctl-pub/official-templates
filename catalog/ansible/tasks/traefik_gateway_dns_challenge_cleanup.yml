@@ -1,0 +1,34 @@
+---
+- name: Inspect runtime before removing newly staged broker credential
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: failed_gateway_info
+  failed_when: false
+  no_log: true
+  when:
+    - dns_challenge_token_installed is defined
+    - not dns_challenge_token_installed.stat.exists
+
+- name: Read failed gateway runtime identity
+  ansible.builtin.set_fact:
+    failed_gateway_details: >-
+      {{
+        (failed_gateway_info.get('containers', []) | first)
+        if (failed_gateway_info.get('containers', []) | length) > 0
+        else failed_gateway_info.get('container', None)
+      }}
+  no_log: true
+  when:
+    - failed_gateway_info is defined
+    - not (failed_gateway_info.failed | default(true))
+
+- name: Remove unreferenced newly staged broker credential
+  ansible.builtin.file:
+    path: "{{ dns_challenge_token_file }}"
+    state: absent
+  no_log: true
+  when:
+    - failed_gateway_details is defined
+    - dns_challenge_token_installed is defined
+    - not dns_challenge_token_installed.stat.exists
+    - failed_gateway_details is none or ('HTTPREQ_PASSWORD_FILE=' ~ dns_challenge_token_file) not in (failed_gateway_details.Config.Env | default([]))

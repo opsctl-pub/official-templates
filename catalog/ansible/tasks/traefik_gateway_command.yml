@@ -5,6 +5,8 @@
       - traefik_gateway_acme_enabled is boolean
       - traefik_gateway_dashboard_enabled is boolean
       - traefik_gateway_acme_environment in ['staging', 'production']
+      - traefik_gateway_acme_challenge_profile in ['http01', 'dns01_broker']
+      - traefik_gateway_acme_challenge_profile != 'dns01_broker' or traefik_gateway_acme_enabled
       - traefik_gateway_target_major == 3
       - traefik_gateway_target_version == '3.7.13'
       - not traefik_gateway_acme_enabled or traefik_email is defined
@@ -28,11 +30,22 @@
         + (
           [
             '--certificatesresolvers.letsencrypt.acme.email=' ~ (traefik_email | string),
-            '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json',
+            '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
+          ]
+          if traefik_gateway_acme_enabled
+          else []
+        )
+        + (
+          [
             '--certificatesresolvers.letsencrypt.acme.httpchallenge=true',
             '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
           ]
-          if traefik_gateway_acme_enabled
+          if traefik_gateway_acme_enabled and traefik_gateway_acme_challenge_profile == 'http01'
+          else []
+        )
+        + (
+          ['--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq']
+          if traefik_gateway_acme_enabled and traefik_gateway_acme_challenge_profile == 'dns01_broker'
           else []
         )
         + (

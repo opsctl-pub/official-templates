@@ -17,11 +17,41 @@
         | length) == 0
       - traefik_gateway_force_recreate is boolean
       - traefik_gateway_sensitive is boolean
+      - (traefik_dns01_enabled | default(false)) is boolean
+      - not (traefik_dns01_enabled | default(false)) or traefik_dns01_broker_url is match('^https://[^/?#@]+/api/v1/dns-challenge$')
+      - not (traefik_dns01_enabled | default(false)) or traefik_dns01_token_file is match('^/var/lib/traefik/broker-secrets/token-[0-9a-f-]{36}$')
+      - not (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in traefik_command_args
+      - not (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in traefik_command_args
+      - (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' not in traefik_command_args
       - traefik_gateway_target_major == 3
       - traefik_gateway_target_version == '3.7.13'
       - traefik_image is match('^traefik@sha256:[0-9a-f]{64}$')
     fail_msg: "Managed Traefik runtime inputs are invalid"
   no_log: "{{ traefik_gateway_sensitive }}"
+
+- name: Build DNS challenge container environment
+  ansible.builtin.set_fact:
+    traefik_dns01_env: >-
+      {{
+        {
+          'HTTPREQ_ENDPOINT': traefik_dns01_broker_url,
+          'HTTPREQ_USERNAME': 'opsctl',
+          'HTTPREQ_PASSWORD_FILE': traefik_dns01_token_file
+        }
+        if (traefik_dns01_enabled | default(false))
+        else {}
+      }}
+    traefik_dns01_expected_env: >-
+      {{
+        [
+          'HTTPREQ_ENDPOINT=' ~ traefik_dns01_broker_url,
+          'HTTPREQ_USERNAME=opsctl',
+          'HTTPREQ_PASSWORD_FILE=' ~ traefik_dns01_token_file
+        ] | sort
+        if (traefik_dns01_enabled | default(false))
+        else []
+      }}
+  no_log: true
 
 - name: Build managed Traefik identity
   set_fact:
@@ -237,6 +267,10 @@
           == existing_traefik_labels
         )
         and (traefik_command_args | difference(existing_traefik_cmd) | length) == 0
+        and (
+          (existing_traefik.Config.Env | default([]) | select('match', '^HTTPREQ_') | list | sort)
+          == traefik_dns01_expected_env
+        )
         and (traefik_legacy_redirect_args | intersect(existing_traefik_cmd) | length) == 0
         and (
           existing_traefik_mounts
@@ -308,6 +342,7 @@
           - "{{ traefik_acme_dir }}:{{ traefik_acme_dir }}"
           - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
         command: "{{ traefik_command_args }}"
+        env: "{{ traefik_dns01_env }}"
         labels: "{{ traefik_managed_labels }}"
         pull: false
       no_log: "{{ traefik_gateway_sensitive }}"
@@ -354,6 +389,10 @@
           - >-
             ((traefik_command_args | difference(traefik_replacement_details.Config.Cmd))
             | length) == 0
+          - >-
+            (traefik_replacement_details.Config.Env | default([])
+            | select('match', '^HTTPREQ_') | list | sort)
+            == traefik_dns01_expected_env
           - >-
             (traefik_replacement_details.Mounts
             | selectattr('Destination', 'equalto', '/var/run/docker.sock')
@@ -545,6 +584,10 @@
       - >-
         ((traefik_command_args | difference(traefik_container_details.Config.Cmd))
         | length) == 0
+      - >-
+        (traefik_container_details.Config.Env | default([])
+        | select('match', '^HTTPREQ_') | list | sort)
+        == traefik_dns01_expected_env
       - (traefik_legacy_redirect_args | intersect(traefik_container_details.Config.Cmd) | length) == 0
       - >-
         (traefik_container_details.Mounts
