@@ -75,3 +75,20 @@ variable "tags" {
   type        = list(string)
   default     = ["terraform", "opsctl"]
 }
+
+variable "ingress_rules" {
+  description = "Backend-declared public TCP/UDP ingress for this managed instance"
+  type = list(object({
+    protocol = string
+    port     = number
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for rule in var.ingress_rules :
+      contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535
+    ])
+    error_message = "Ingress rules require tcp/udp and a port from 1 through 65535."
+  }
+}

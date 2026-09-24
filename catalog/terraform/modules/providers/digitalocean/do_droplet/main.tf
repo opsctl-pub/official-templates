@@ -24,16 +24,16 @@ data "digitalocean_ssh_key" "existing" {
 resource "digitalocean_droplet" "server" {
   count = var.destroy ? 0 : 1
 
-  name     = var.name
-  region   = var.region
-  size     = var.size
-  image    = var.image
+  name   = var.name
+  region = var.region
+  size   = var.size
+  image  = var.image
 
   # Enable monitoring and backups based on variables
-  monitoring         = var.enable_monitoring
-  backups           = var.enable_backups
-  ipv6              = var.enable_ipv6
-  vpc_uuid          = var.vpc_uuid != "" ? var.vpc_uuid : null
+  monitoring = var.enable_monitoring
+  backups    = var.enable_backups
+  ipv6       = var.enable_ipv6
+  vpc_uuid   = var.vpc_uuid != "" ? var.vpc_uuid : null
 
   # Add SSH keys if provided
   ssh_keys = var.ssh_key_id != "" ? [var.ssh_key_id] : (
@@ -54,21 +54,68 @@ resource "digitalocean_droplet" "server" {
   }
 }
 
+resource "digitalocean_firewall" "server" {
+  count = var.destroy ? 0 : 1
+
+  name        = "${var.name}-fw"
+  droplet_ids = [digitalocean_droplet.server[0].id]
+
+  dynamic "inbound_rule" {
+    for_each = var.ingress_rules
+    content {
+      protocol         = inbound_rule.value.protocol
+      port_range       = tostring(inbound_rule.value.port)
+      source_addresses = ["0.0.0.0/0"]
+    }
+  }
+
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "icmp"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+}
+
 # For destroy operations, import the existing droplet
 resource "digitalocean_droplet" "this" {
   count = var.destroy ? 1 : 0
 
   # Minimal required fields for import
   # These values don't matter as we're destroying
-  name     = "destroying"
-  region   = "nyc3"
-  size     = "s-1vcpu-1gb"
-  image    = "ubuntu-24-04-x64"
+  name   = "destroying"
+  region = "nyc3"
+  size   = "s-1vcpu-1gb"
+  image  = "ubuntu-24-04-x64"
 
   lifecycle {
     precondition {
       condition     = var.droplet_id != ""
       error_message = "droplet_id is required when destroy=true"
+    }
+  }
+}
+
+resource "digitalocean_firewall" "destroy" {
+  count = var.destroy && var.destroy_firewall ? 1 : 0
+
+  name       = "opsctl-destroy-firewall"
+  depends_on = [digitalocean_droplet.this]
+
+  lifecycle {
+    precondition {
+      condition     = var.firewall_id != ""
+      error_message = "firewall_id is required when destroy_firewall=true"
     }
   }
 }

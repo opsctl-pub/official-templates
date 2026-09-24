@@ -4,6 +4,11 @@ output "droplet_id" {
   value       = var.destroy ? "" : (length(digitalocean_droplet.server) > 0 ? digitalocean_droplet.server[0].id : "")
 }
 
+output "firewall_id" {
+  description = "ID of the provision-owned cloud firewall"
+  value       = var.destroy ? "" : try(digitalocean_firewall.server[0].id, "")
+}
+
 output "name" {
   description = "Name of the created droplet"
   value       = var.destroy ? "" : (length(digitalocean_droplet.server) > 0 ? digitalocean_droplet.server[0].name : "")

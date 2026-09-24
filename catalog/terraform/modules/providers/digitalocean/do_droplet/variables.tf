@@ -12,6 +12,35 @@ variable "droplet_id" {
   default     = ""
 }
 
+variable "firewall_id" {
+  description = "ID of the exact provision-owned firewall to destroy"
+  type        = string
+  default     = ""
+}
+
+variable "destroy_firewall" {
+  description = "Whether to destroy the provision-owned firewall"
+  type        = bool
+  default     = false
+}
+
+variable "ingress_rules" {
+  description = "Backend-declared public TCP/UDP ingress for this managed Droplet"
+  type = list(object({
+    protocol = string
+    port     = number
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for rule in var.ingress_rules :
+      contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535
+    ])
+    error_message = "Ingress rules require tcp/udp and a port from 1 through 65535."
+  }
+}
+
 # Variables required only for provisioning (when destroy=false)
 variable "name" {
   description = "Name of the droplet (required when destroy=false)"
