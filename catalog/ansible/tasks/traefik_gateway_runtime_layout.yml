@@ -36,7 +36,8 @@
         {
           'HTTPREQ_ENDPOINT': traefik_dns01_broker_url,
           'HTTPREQ_USERNAME': 'opsctl',
-          'HTTPREQ_PASSWORD_FILE': traefik_dns01_token_file
+          'HTTPREQ_PASSWORD_FILE': traefik_dns01_token_file,
+          'HTTPREQ_HTTP_TIMEOUT': '120'
         }
         if (traefik_dns01_enabled | default(false))
         else {}
@@ -46,7 +47,8 @@
         [
           'HTTPREQ_ENDPOINT=' ~ traefik_dns01_broker_url,
           'HTTPREQ_USERNAME=opsctl',
-          'HTTPREQ_PASSWORD_FILE=' ~ traefik_dns01_token_file
+          'HTTPREQ_PASSWORD_FILE=' ~ traefik_dns01_token_file,
+          'HTTPREQ_HTTP_TIMEOUT=120'
         ] | sort
         if (traefik_dns01_enabled | default(false))
         else []
