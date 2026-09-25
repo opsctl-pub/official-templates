@@ -4,100 +4,145 @@
   gather_facts: false
   become: true
   vars:
-    container_name: "{{ app_container_name | default('app') }}"
-    router_name: "{{ app_router_name | default(container_name) }}"
+    container_name: "{{ app_container_name | default('') }}"
     expected_org_id: "{{ app_org_id | default('') }}"
-    expected_project_id: "{{ app_project_id | default('') }}"
-    expected_app_slug: "{{ app_slug | default(container_name) }}"
+    expected_app_slug: "{{ app_slug | default('') }}"
     expected_deployment_id: "{{ app_deployment_id | default('') }}"
-    expected_image_ref: "{{ app_image_ref | default('') }}"
-    allow_organization_owned_container: "{{ app_allow_organization_owned_container | default(false) }}"
+    expected_image_ref: "{{ app_expected_image_ref | default(none) }}"
   tasks:
-    - name: Validate organization-owned removal identity
+    - name: Validate canonical removal identity before inspection
       assert:
         that:
-          - allow_organization_owned_container is boolean
-          - >-
-            not allow_organization_owned_container or
-            (expected_deployment_id | length > 0 and expected_image_ref | length > 0)
-        fail_msg: "Organization-owned removal identity is invalid"
+          - app_managed is defined
+          - app_managed is boolean
+          - app_managed
+          - expected_org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - expected_deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - container_name is string
+          - container_name | length > 0
+          - expected_app_slug is string
+          - expected_app_slug | length > 0
+          - expected_image_ref is none or (expected_image_ref is string and expected_image_ref | length > 0)
+        fail_msg: "Managed container removal identity is invalid"
 
     - name: OPERATION_STEP remove:start
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"display_name":"Remove container","container_name":{{ container_name | to_json }},"router_name":{{ router_name | to_json }}}}\n'
+        printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"display_name":"Remove container","container_name":{{ container_name | to_json }}}}\n'
       args:
         executable: /bin/sh
 
-    - name: Inspect target container
-      shell: docker inspect "{{ container_name }}"
-      args:
-        executable: /bin/sh
+    - name: Inspect exact named container
+      command:
+        argv:
+          - docker
+          - inspect
+          - --type=container
+          - "{{ container_name }}"
       register: container_inspect
       changed_when: false
       failed_when: false
+      no_log: true
 
-    - name: OPERATION_STEP remove:complete when missing
+    - name: Classify confirmed container absence
+      set_fact:
+        container_absent: >-
+          {{ container_inspect.rc == 1 and
+             (container_inspect.stdout | trim) == '[]' and
+             (container_inspect.stderr | trim) in [
+               'Error: No such object: ' ~ container_name,
+               'Error response from daemon: No such container: ' ~ container_name
+             ] }}
+      no_log: true
+
+    - name: Reject unobservable container state
+      fail:
+        msg: "Container removal inspection did not establish present or absent state"
+      when:
+        - container_inspect.rc != 0
+        - not container_absent
+
+    - name: OPERATION_STEP remove:complete when confirmed absent
       shell: |
         printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"display_name":"Container already absent","container_name":{{ container_name | to_json }},"removed":false,"reason":"not_found"}}\n'
       args:
         executable: /bin/sh
-      when: container_inspect.rc != 0
+      when: container_absent
 
-    - name: Parse inspect payload
+    - name: Parse exact inspect payload
       set_fact:
+        container_payloads: "{{ container_inspect.stdout | from_json }}"
         container_payload: "{{ (container_inspect.stdout | from_json)[0] }}"
       when: container_inspect.rc == 0
+      no_log: true
 
-    - name: Read container ownership labels
-      set_fact:
-        container_labels: "{{ (container_payload.get('Config', {}) or {}).get('Labels', {}) or {} }}"
+    - name: Validate inspect object shape
+      assert:
+        that:
+          - container_payloads is sequence
+          - container_payloads | length == 1
+          - container_payload is mapping
+          - container_payload.Id is string
+          - container_payload.Id is match('^[0-9a-f]{64}$')
+          - container_payload.Name == '/' ~ container_name
+          - container_payload.Config is mapping
+          - container_payload.Config.Labels is mapping
+        fail_msg: "Container removal inspection payload is malformed"
+      when: container_inspect.rc == 0
+      no_log: true
+
+    - name: Validate exact managed identity and expected revision image
+      assert:
+        that:
+          - container_payload.Config.Labels.get('com.opsctl.managed') == 'true'
+          - container_payload.Config.Labels.get('com.opsctl.org_id') == expected_org_id
+          - container_payload.Config.Labels.get('com.opsctl.deployment_id') == expected_deployment_id
+          - container_payload.Config.Labels.get('com.opsctl.app') == expected_app_slug
+          - expected_image_ref is none or container_payload.Config.Image == expected_image_ref
+        fail_msg: "Refusing to remove a container without exact OpsCtl ownership"
+      when: container_inspect.rc == 0
+      no_log: true
+
+    - name: Remove inspected immutable container identity
+      command:
+        argv:
+          - docker
+          - rm
+          - -f
+          - "{{ container_payload.Id }}"
+      register: container_remove
+      changed_when: container_remove.rc == 0
       when: container_inspect.rc == 0
 
-    - name: Evaluate ownership guard
-      set_fact:
-        label_guard_ok: >-
-          {{ container_labels.get('com.opsctl.managed') == 'true'
-             and container_labels.get('com.opsctl.org_id') == expected_org_id
-             and container_labels.get('com.opsctl.app') == expected_app_slug
-             and (
-               expected_project_id | length == 0
-               or container_labels.get('com.opsctl.project_id') == expected_project_id
-               or (
-                 allow_organization_owned_container
-                 and container_labels.get('com.opsctl.project_id') in [none, '']
-                 and container_labels.get('com.opsctl.deployment_id') in [none, '', expected_deployment_id]
-                 and (container_payload.get('Config', {}) or {}).get('Image') == expected_image_ref
-               )
-             ) }}
+    - name: Verify inspected container identity is absent
+      command:
+        argv:
+          - docker
+          - inspect
+          - --type=container
+          - "{{ container_payload.Id }}"
+      register: container_removed_inspect
+      changed_when: false
+      failed_when: false
       when: container_inspect.rc == 0
+      no_log: true
 
-    - name: OPERATION_STEP remove:fail label mismatch
-      shell: |
-        printf 'OPERATION_STEP={"name":"remove:fail","status":"failed","metadata":{"display_name":"Container removal failed","container_name":{{ container_name | to_json }},"reason":"label_mismatch"}}\n'
-      args:
-        executable: /bin/sh
-      when:
-        - container_inspect.rc == 0
-        - not label_guard_ok
-
-    - name: Abort on ownership mismatch
-      fail:
-        msg: "Refusing to remove container without matching OpsCtl ownership labels"
-      when:
-        - container_inspect.rc == 0
-        - not label_guard_ok
-
-    - name: Remove owned container
-      command: docker rm -f "{{ container_name }}"
-      when:
-        - container_inspect.rc == 0
-        - label_guard_ok
+    - name: Require exact inspected identity absence
+      assert:
+        that:
+          - container_removed_inspect.rc == 1
+          - (container_removed_inspect.stdout | trim) == '[]'
+          - >-
+            (container_removed_inspect.stderr | trim) in [
+              'Error: No such object: ' ~ container_payload.Id,
+              'Error response from daemon: No such container: ' ~ container_payload.Id
+            ]
+        fail_msg: "Inspected container removal could not be verified"
+      when: container_inspect.rc == 0
+      no_log: true
 
     - name: OPERATION_STEP remove:complete
       shell: |
-        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"display_name":"Container removed","container_name":{{ container_name | to_json }},"removed":true,"router_name":{{ router_name | to_json }}}}\n'
+        printf 'OPERATION_STEP={"name":"remove:complete","status":"completed","metadata":{"display_name":"Container removed","container_name":{{ container_name | to_json }},"removed":true}}\n'
       args:
         executable: /bin/sh
-      when:
-        - container_inspect.rc == 0
-        - label_guard_ok
+      when: container_inspect.rc == 0

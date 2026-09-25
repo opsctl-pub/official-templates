@@ -36,10 +36,10 @@
     traefik_label_map: {}
     opsctl_label_map:
       "com.opsctl.managed": "true"
-      "com.opsctl.org_id": "{{ app_org_id | default('') }}"
+      "com.opsctl.org_id": "{{ app_org_id }}"
       "com.opsctl.project_id": "{{ app_project_id | default('', true) }}"
       "com.opsctl.app": "{{ app_slug | default(container_name) }}"
-      "com.opsctl.deployment_id": "{{ app_deployment_id | default('') }}"
+      "com.opsctl.deployment_id": "{{ app_deployment_id }}"
     final_label_map: "{{ opsctl_label_map }}"
     deploy_host_ports: []
     health_strategy: "running"
@@ -141,6 +141,20 @@
           raise SystemExit("source_replacement_restore_health_failed")
       PY
   pre_tasks:
+    - name: Validate managed runtime identity before mutation
+      assert:
+        that:
+          - app_managed is defined
+          - app_managed is boolean
+          - app_managed
+          - app_org_id is defined
+          - app_org_id is string
+          - app_org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - app_deployment_id is defined
+          - app_deployment_id is string
+          - app_deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        fail_msg: "Managed deployment requires canonical organization and Deployment identity"
+
     - name: Validate backend exposure mode before mutation
       assert:
         that:
