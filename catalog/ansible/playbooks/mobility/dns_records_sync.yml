@@ -29,13 +29,14 @@
               - (provider_zone_id | string | length) > 0
             fail_msg: "dns_records_sync requires Cloudflare credentials and provider_zone_id"
 
-        - name: Validate F-1 changeset shape
+        - name: Validate managed A record changeset shape
           assert:
             that:
               - (item.action | string) in ["create", "update", "delete", "adopt"]
               - (item.record_type | string | upper) == "A"
-              - not (item.proxied | default(false) | bool)
-            fail_msg: "F-1 supports Cloudflare A records in DNS-only mode only"
+              - item.proxied is boolean
+              - not item.proxied or item.ttl == 1
+            fail_msg: "Managed Cloudflare A records require explicit proxy intent and automatic TTL when proxied"
           loop: "{{ dns_changes }}"
           loop_control:
             label: "{{ item.hostname }}:{{ item.action }}"

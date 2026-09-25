@@ -102,7 +102,7 @@
               'name': dns_change.hostname,
               'content': dns_change.value,
               'ttl': dns_change.ttl,
-              'proxied': false
+              'proxied': dns_change.proxied
             }
           }}
         status_code: 200
@@ -129,6 +129,20 @@
           }}
       when: dns_change.action != 'adopt'
 
+    - name: Verify the provider returned the planned record
+      assert:
+        that:
+          - dns_sync_apply_result.json.result is mapping
+          - dns_sync_apply_result.json.result.name == dns_change.hostname
+          - dns_sync_apply_result.json.result.type == dns_change.record_type
+          - dns_sync_apply_result.json.result.content == dns_change.value
+          - dns_sync_apply_result.json.result.ttl == dns_change.ttl
+          - dns_sync_apply_result.json.result.proxied is boolean
+          - dns_sync_apply_result.json.result.proxied == dns_change.proxied
+          - dns_change.action == 'create' or dns_sync_apply_result.json.result.id == dns_change.provider_record_id
+        fail_msg: "Cloudflare record does not match the managed DNS plan"
+      when: dns_change.action in ['create', 'update']
+
     - name: Accumulate the applied managed DNS change
       set_fact:
         dns_sync_applied_changes: >-
@@ -141,7 +155,7 @@
                 "record_type": dns_change.record_type,
                 "value": dns_change.value,
                 "ttl": dns_change.ttl,
-                "proxied": false,
+                "proxied": dns_change.proxied,
                 "provider_record_id": (
                   dns_sync_apply_result.json.result.id
                   if (

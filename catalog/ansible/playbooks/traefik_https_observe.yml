@@ -12,9 +12,9 @@
     - name: Validate HTTPS observation identity
       ansible.builtin.assert:
         that:
-          - adapter_key == 'traefik_acme_http01'
+          - adapter_key in ['traefik_acme_http01', 'traefik_acme_dns01']
           - certificate_mode == 'automatic'
-          - challenge_type == 'http-01'
+          - challenge_type == ('dns-01' if adapter_key == 'traefik_acme_dns01' else 'http-01')
           - resolver_name == 'letsencrypt'
           - renewal_due_days == 30
           - org_id is string
@@ -75,10 +75,20 @@
                 (resolver_email_arguments | length) == 1
                 and '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
                   in existing_traefik.Config.Cmd
-                and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
-                  in existing_traefik.Config.Cmd
-                and '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web'
-                  in existing_traefik.Config.Cmd
+                and (
+                  (
+                    challenge_type == 'http-01'
+                    and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in existing_traefik.Config.Cmd
+                    and '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in existing_traefik.Config.Cmd
+                    and '--certificatesresolvers.letsencrypt.acme.dnschallenge=true' not in existing_traefik.Config.Cmd
+                  )
+                  or (
+                    challenge_type == 'dns-01'
+                    and '--certificatesresolvers.letsencrypt.acme.dnschallenge=true' in existing_traefik.Config.Cmd
+                    and '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in existing_traefik.Config.Cmd
+                    and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in existing_traefik.Config.Cmd
+                  )
+                )
                 and '/var/lib/traefik' in (
                   existing_traefik.Mounts | default([])
                   | map(attribute='Destination') | list
