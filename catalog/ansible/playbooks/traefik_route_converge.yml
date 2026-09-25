@@ -149,10 +149,9 @@
                   (
                     '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in existing_traefik.Config.Cmd
                     and '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in existing_traefik.Config.Cmd
-                    and '--certificatesresolvers.letsencrypt.acme.dnschallenge=true' not in existing_traefik.Config.Cmd
+                    and (existing_traefik.Config.Cmd | select('match', '^--certificatesresolvers\.letsencrypt\.acme\.dnschallenge\.provider=') | list | length) == 0
                   ) or (
-                    '--certificatesresolvers.letsencrypt.acme.dnschallenge=true' in existing_traefik.Config.Cmd
-                    and '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in existing_traefik.Config.Cmd
+                    '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in existing_traefik.Config.Cmd
                     and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in existing_traefik.Config.Cmd
                   )
                 )
