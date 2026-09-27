@@ -84,6 +84,7 @@
         - name: Initialize applied changes accumulator
           set_fact:
             dns_sync_applied_changes: []
+            dns_sync_authorization_denied: false
 
         - name: Apply and record Cloudflare managed DNS changes in order
           include_tasks: dns_records_sync_change.yml
@@ -106,7 +107,7 @@
         - name: Emit partial structured DNS sync outputs after failure
           debug:
             msg: >-
-              TEMPLATE_OUTPUT_JSON={{ {'applied_changes': dns_sync_applied_changes | default([])} | to_json }}
+              TEMPLATE_OUTPUT_JSON={{ ({'applied_changes': dns_sync_applied_changes | default([])} | combine({'authorization_denied': true} if dns_sync_authorization_denied | default(false) | bool else {})) | to_json }}
 
         - name: OPERATION_STEP dns_sync:failure
           shell: |

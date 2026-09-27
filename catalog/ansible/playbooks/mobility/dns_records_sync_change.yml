@@ -105,28 +105,25 @@
               'proxied': dns_change.proxied
             }
           }}
-        status_code: 200
+        status_code: [200, 401, 403]
         return_content: true
       register: dns_sync_apply_result
       no_log: true
       when: dns_change.action != 'adopt'
 
+    - name: Record only an explicit provider authorization denial
+      set_fact:
+        dns_sync_authorization_denied: true
+      when:
+        - dns_change.action != 'adopt'
+        - dns_sync_apply_result.status | int in [401, 403]
+
     - name: Assert the Cloudflare change succeeded
       assert:
         that:
+          - dns_sync_apply_result.status | int == 200
           - dns_sync_apply_result.json.success | default(false)
-        fail_msg: >-
-          {{
-            (
-              dns_sync_apply_result.json.errors[0].message
-              if (
-                dns_sync_apply_result.json.errors is defined and
-                (dns_sync_apply_result.json.errors | length) > 0 and
-                dns_sync_apply_result.json.errors[0].message is defined
-              )
-              else 'Cloudflare request failed'
-            )
-          }}
+        fail_msg: "Cloudflare managed DNS write failed"
       when: dns_change.action != 'adopt'
 
     - name: Verify the provider returned the planned record
