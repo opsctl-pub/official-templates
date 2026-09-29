@@ -34,6 +34,7 @@
           '--accesslog.fields.names.RequestHost=keep',
           '--accesslog.fields.names.RequestMethod=keep',
           '--accesslog.fields.names.RequestPath=keep',
+          '--accesslog.fields.names.TLSVersion=keep',
           '--accesslog.fields.headers.defaultmode=drop',
           '--accesslog.fields.headers.names.X-Opsctl-Verification-Nonce=keep',
           '--entrypoints.web.observability.accesslogs=false',

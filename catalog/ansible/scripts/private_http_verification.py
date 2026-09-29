@@ -2,9 +2,13 @@
 
 import base64
 import hashlib
+import http.client
+import ipaddress
 import json
 import re
 import subprocess
+import socket
+import ssl
 import sys
 import time
 import urllib.request
@@ -65,6 +69,67 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def tls_evidence(peer):
+    """Bounded metadata from the same verified connection as the response."""
+    certificate = peer.getpeercert(binary_form=True)
+    metadata = peer.getpeercert()
+    if not certificate or len(certificate) > 65536:
+        raise ValueError("private_edge_tls_evidence_missing")
+    issuer = ",".join(key + "=" + value for entry in metadata["issuer"] for key, value in entry)
+    if not issuer or len(issuer) > 1024:
+        raise ValueError("private_edge_tls_evidence_invalid")
+    return {
+        "status": "verified", "trust_profile": "system_webpki",
+        "issuer": issuer,
+        "leaf_fingerprint_sha256": hashlib.sha256(certificate).hexdigest(),
+        "not_before": datetime.fromtimestamp(
+            ssl.cert_time_to_seconds(metadata["notBefore"]), timezone.utc,
+        ).isoformat().replace("+00:00", "Z"),
+        "not_after": datetime.fromtimestamp(
+            ssl.cert_time_to_seconds(metadata["notAfter"]), timezone.utc,
+        ).isoformat().replace("+00:00", "Z"),
+        "protocol": peer.version(), "reason": None,
+    }
+
+
+def edge_request(challenge):
+    """Fetch the public edge with Host/SNI and a pinned public DNS answer."""
+    host = challenge["host"]
+    addresses = {item[4][0] for item in socket.getaddrinfo(
+        host, 443, type=socket.SOCK_STREAM,
+    )}
+    if not addresses or any(
+        not ipaddress.ip_address(value).is_global
+        or ipaddress.ip_address(value).is_multicast for value in addresses
+    ):
+        raise ValueError("private_edge_address_invalid")
+    address = sorted(addresses)[0]
+    context = ssl.create_default_context()
+    connection = http.client.HTTPSConnection(host, timeout=6, context=context)
+    connection._create_connection = lambda unused, timeout, source_address: socket.create_connection(
+        (address, 443), timeout, source_address,
+    )
+    try:
+        connection.connect()
+        tls = tls_evidence(connection.sock)
+        connection.request("GET", challenge["path"], headers={
+            "Host": host,
+            "X-Opsctl-Verification-Nonce": challenge["nonce"],
+        })
+        response = connection.getresponse()
+        headers = {}
+        for name in challenge["cache_header_names"]:
+            values = response.headers.get_all(name, [])
+            if len(values) != 1 or len(values[0]) > 128:
+                raise ValueError("private_edge_cache_evidence_invalid")
+            headers[name] = values[0]
+        return response.status, response.read(65537), {
+            "tls": tls, "destination": address, "cache_headers": headers,
+        }
+    finally:
+        connection.close()
+
+
 def gateway(challenge):
     candidates = docker(
         "ps", "-q", "--no-trunc",
@@ -91,18 +156,22 @@ def gateway(challenge):
         if entry.get("request_X-Opsctl-Verification-Nonce") == challenge["nonce"]:
             raise ValueError("private_nonce_already_used")
     started = datetime.now(timezone.utc).isoformat()
-    request = urllib.request.Request(
-        "http://127.0.0.1:" + str(challenge["gateway_port"]) + challenge["path"],
-        headers={
-            "Host": challenge["host"],
-            "X-Opsctl-Verification-Nonce": challenge["nonce"],
-            "Cache-Control": "no-cache, no-store",
-        },
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    with opener.open(request, timeout=6) as response:
-        status = response.status
-        body = response.read(65537)
+    evidence = {}
+    if challenge.get("edge_binding") is not None:
+        status, body, evidence = edge_request(challenge)
+    else:
+        request = urllib.request.Request(
+            "http://127.0.0.1:" + str(challenge["gateway_port"]) + challenge["path"],
+            headers={
+                "Host": challenge["host"],
+                "X-Opsctl-Verification-Nonce": challenge["nonce"],
+                "Cache-Control": "no-cache, no-store",
+            },
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(request, timeout=6) as response:
+            status = response.status
+            body = response.read(65537)
     if (
         len(body) > 65536
         or status != challenge["expected_status"]
@@ -135,11 +204,16 @@ def gateway(challenge):
         or entry.get("RequestPath") != challenge["path"]
     ):
         raise ValueError("private_upstream_mismatch")
+    if challenge.get("edge_binding") is not None:
+        if entry.get("TLSVersion") not in {"1.2", "1.3"}:
+            raise ValueError("private_edge_origin_tls_missing")
+        evidence["origin_tls_observed"] = True
     return {
         "backend_url": challenge["backend_url"],
         "router": challenge["router"],
         "status": status,
         "body_match": True,
+        **evidence,
     }
 
 

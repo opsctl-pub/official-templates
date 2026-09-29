@@ -17,6 +17,8 @@ http:
     deployment-{{ deployment_id }}:
       rule: '{% for host in effective_route_hosts %}Host(`{{ host }}`){% if not loop.last %} || {% endif %}{% endfor %}'
       priority: 1000
+      observability:
+        accessLogs: true
       entryPoints:
 {% if route_https | default(true) %}
         - websecure
