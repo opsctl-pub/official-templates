@@ -121,8 +121,9 @@
       set_fact:
         redirect_route_key: "{{ route_key }}-http-redirect"
         redirect_middleware_key: "{{ route_key }}-https-redirect"
+        origin_identity_middleware_key: "{{ route_key }}-origin-identity"
         route_redirect_present: >-
-          {{ route_http is mapping and 'middlewares' in route_http }}
+          {{ route_http is mapping and route_http.get('middlewares') is mapping and (route_key ~ '-https-redirect') in route_http.middlewares }}
 
     - name: Normalize managed backend URLs
       set_fact:
@@ -175,9 +176,12 @@
           - route_config is mapping
           - route_config.keys() | list == ['http']
           - route_config.http is mapping
-          - route_config.http.keys() | sort in [['routers', 'services'], ['middlewares', 'routers', 'services']]
+          - route_config.http.keys() | sort == ['middlewares', 'routers', 'services']
           - route_config.http.routers is mapping
           - route_config.http.services is mapping
+          - route_config.http.middlewares is mapping
+          - (route_config.http.middlewares.keys() | sort) == (([origin_identity_middleware_key, redirect_middleware_key] | sort) if route_redirect_present else [origin_identity_middleware_key])
+          - "route_config.http.middlewares[origin_identity_middleware_key] == {'headers': {'customResponseHeaders': {'X-OpsCtl-Origin-Identity': server_id | hash('sha256')}}}"
           - route_config.http.routers.keys() | sort in [[route_key], [route_key, redirect_route_key] | sort]
           - route_config.http.services.keys() | list == [route_key]
           - route_router is mapping
@@ -208,8 +212,11 @@
           - (not route_cas_present) or ((current_backend_identity_class == 'private' and (observed_backend_urls | length) == (expected_route_observation.backend_count | int) and (observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')) == expected_route_observation.backend_digest) or (current_backend_identity_class == 'loopback' and observed_backend_urls == ['http://127.0.0.1:' ~ (route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int | string)]))
           - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
           - (observed_backend_urls | select('match', '^http://[^:/?#]+:[0-9]+$') | list | length) == (observed_backend_urls | length)
-          - (route_router.middlewares | default([])) is sequence
-          - (route_router.middlewares | default([])) is not string
+          - route_router.middlewares is sequence
+          - route_router.middlewares is not string
+          - (route_router.middlewares | length) >= 1
+          - route_router.middlewares[-1] == origin_identity_middleware_key
+          - (route_router.middlewares | select('equalto', origin_identity_middleware_key) | list | length) == 1
         fail_msg: "Managed Traefik route is malformed"
       register: route_structure_assertion
       ignore_errors: true
@@ -227,7 +234,6 @@
     - name: Validate route without managed HTTP redirect
       assert:
         that:
-          - route_config.http.keys() | sort == ['routers', 'services']
           - route_config.http.routers.keys() | list == [route_key]
         fail_msg: "Managed Traefik route is malformed"
       when: not route_redirect_present
@@ -239,7 +245,7 @@
           - "'tls' in route_router"
           - route_config.http.routers.keys() | sort == [route_key, redirect_route_key] | sort
           - route_config.http.middlewares is mapping
-          - route_config.http.middlewares.keys() | list == [redirect_middleware_key]
+          - route_config.http.middlewares.keys() | sort == [origin_identity_middleware_key, redirect_middleware_key] | sort
           - route_config.http.routers[redirect_route_key] is mapping
           - route_config.http.routers[redirect_route_key].keys() | sort == ['entryPoints', 'middlewares', 'priority', 'rule', 'service']
           - route_config.http.routers[redirect_route_key].rule == route_router.rule
@@ -259,7 +265,7 @@
           route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int }}"
           https: "{{ 'tls' in route_router }}"
           redirect_http_to_https: "{{ route_redirect_present }}"
-          middlewares: "{{ route_router.middlewares | default([]) }}"
+          middlewares: "{{ route_router.middlewares[:-1] }}"
           backend_identity_class: "{{ current_backend_identity_class }}"
     - name: Add normalized private backend identity
       set_fact:
