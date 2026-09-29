@@ -96,7 +96,13 @@
           - existing_canary_config.http.routers.keys() | list == [canary_router]
           - existing_canary_config.http.services is mapping
           - existing_canary_config.http.services.keys() | list == [canary_service]
-          - existing_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'rule', 'service']
+          - existing_canary_config.http.keys() | sort == ['middlewares', 'routers', 'services']
+          - existing_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'middlewares', 'observability', 'rule', 'service']
+          - existing_canary_config.http.routers[canary_router].middlewares == [canary_router ~ '-private']
+          - >-
+            existing_canary_config.http.routers[canary_router].observability == {'accessLogs': true}
+          - >-
+            existing_canary_config.http.middlewares == {(canary_router ~ '-private'): {'ipAllowList': {'sourceRange': ['127.0.0.1/32', '::1/128']}}}
           - existing_canary_config.http.routers[canary_router].rule == ('Host(`' ~ canary_host ~ '`)')
           - existing_canary_config.http.routers[canary_router].entryPoints == ['web']
           - existing_canary_config.http.routers[canary_router].service == canary_service
@@ -198,7 +204,13 @@
               - staged_canary_config.keys() | list == ['http']
               - staged_canary_config.http.routers.keys() | list == [canary_router]
               - staged_canary_config.http.services.keys() | list == [canary_service]
-              - staged_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'rule', 'service']
+              - staged_canary_config.http.keys() | sort == ['middlewares', 'routers', 'services']
+              - staged_canary_config.http.routers[canary_router].keys() | sort == ['entryPoints', 'middlewares', 'observability', 'rule', 'service']
+              - staged_canary_config.http.routers[canary_router].middlewares == [canary_router ~ '-private']
+              - >-
+                staged_canary_config.http.routers[canary_router].observability == {'accessLogs': true}
+              - >-
+                staged_canary_config.http.middlewares == {(canary_router ~ '-private'): {'ipAllowList': {'sourceRange': ['127.0.0.1/32', '::1/128']}}}
               - staged_canary_config.http.routers[canary_router].rule == ('Host(`' ~ canary_host ~ '`)')
               - staged_canary_config.http.routers[canary_router].entryPoints == ['web']
               - staged_canary_config.http.routers[canary_router].service == canary_service

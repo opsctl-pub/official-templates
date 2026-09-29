@@ -1061,12 +1061,12 @@
 
     - name: Merge OpsControl and Traefik labels
       set_fact:
-        final_label_map: "{{ opsctl_label_map | combine(traefik_label_map) }}"
+        final_label_map: "{{ opsctl_label_map | combine({'com.opsctl.revision_id': app_revision_id} if app_revision_id is defined else {}) | combine(traefik_label_map) }}"
       when: traefik_enabled
 
     - name: Apply baseline OpsControl labels
       set_fact:
-        final_label_map: "{{ opsctl_label_map }}"
+        final_label_map: "{{ opsctl_label_map | combine({'com.opsctl.revision_id': app_revision_id} if app_revision_id is defined else {}) }}"
       when: not traefik_enabled
 
     - name: OPERATION_STEP container:prepare

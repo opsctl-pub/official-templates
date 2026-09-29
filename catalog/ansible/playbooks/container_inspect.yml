@@ -9,6 +9,10 @@
     expected_project_id: "{{ app_project_id | default('') }}"
     expected_app_slug: "{{ app_slug | default(container_name) }}"
   tasks:
+    - name: Attest an explicitly bound private backend revision
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/private_http_verification.yml"
+      when: private_verification is defined
+
     - name: OPERATION_STEP inspect:start
       shell: |
         printf 'OPERATION_STEP={"name":"inspect:start","status":"running","metadata":{"display_name":"Inspect container","container_name":{{ container_name | to_json }}}}\n'

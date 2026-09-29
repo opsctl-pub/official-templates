@@ -1,0 +1,27 @@
+---
+- name: Collect authenticated private verification evidence
+  ansible.builtin.script:
+    cmd: "{{ playbook_dir }}/../scripts/private_http_verification.py {{ private_verification | to_json | b64encode }}"
+    executable: python3
+  become: true
+  register: private_verification_result
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Fail with bounded private verification reason
+  ansible.builtin.fail:
+    msg: "Private upstream verification failed: {{ (private_verification_result.stdout | trim | from_json).error_code }}"
+  when: private_verification_result.rc != 0
+
+- name: Emit sanitized private verification result
+  ansible.builtin.debug:
+    msg: "TEMPLATE_OUTPUT_JSON={{ {'private_verification': (private_verification_result.stdout | trim | from_json)} | to_json }}"
+
+- name: Emit private health completion
+  ansible.builtin.debug:
+    msg: "OPERATION_STEP={{ {'name': 'health:complete', 'status': 'completed', 'metadata': {'mode': 'http', 'expected_status': private_verification.challenge.expected_status, 'observed_status': private_verification.challenge.expected_status, 'body_match': true, 'error_code': 'none'}} | to_json }}"
+  when: private_verification.action == 'gateway'
+
+- name: Stop after private verification
+  ansible.builtin.meta: end_play
