@@ -29,18 +29,15 @@ http:
 {% else %}
         - web
 {% endif %}
+{% if route_middlewares | default([]) | length > 0 %}
       middlewares:
-{% for middleware in route_middlewares | default([]) %}
+{% for middleware in route_middlewares %}
         - {{ middleware }}
 {% endfor %}
-        - deployment-{{ deployment_id }}-origin-identity
+{% endif %}
       service: deployment-{{ deployment_id }}
-  middlewares:
-    deployment-{{ deployment_id }}-origin-identity:
-      headers:
-        customResponseHeaders:
-          X-OpsCtl-Origin-Identity: {{ (server_id | hash('sha256')) | to_json }}
 {% if redirect_http_to_https %}
+  middlewares:
     deployment-{{ deployment_id }}-https-redirect:
       redirectScheme:
         scheme: https
