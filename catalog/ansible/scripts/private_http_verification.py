@@ -175,7 +175,8 @@ def gateway(challenge):
     if (
         len(body) > 65536
         or status != challenge["expected_status"]
-        or challenge["body_contains"] not in body.decode("utf-8", errors="replace")
+        or (challenge["body_contains"] is not None
+            and challenge["body_contains"] not in body.decode("utf-8", errors="replace"))
     ):
         raise ValueError("private_response_mismatch")
     matches = []
