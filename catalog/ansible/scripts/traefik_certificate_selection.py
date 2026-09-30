@@ -126,7 +126,7 @@ class TraefikCertificateSelection:
         validate_owner(owner)
         return self.dynamic_dir / f"certificate-{owner['deployment_id']}.yml"
 
-    def material(self, owner, certificate_file, private_key_file):
+    def material(self, owner, certificate_file, private_key_file, require_current_validity=True):
         validate_owner(owner)
         paths = [Path(certificate_file), Path(private_key_file)]
         for path in paths:
@@ -141,7 +141,8 @@ class TraefikCertificateSelection:
         if (
             leaf.fingerprint(hashes.SHA256()).hex() != owner["fingerprint_sha256"]
             or public_key_bytes(leaf.public_key()) != public_key_bytes(key.public_key())
-            or not validity(leaf, "not_valid_before") <= datetime.now(timezone.utc) < validity(leaf, "not_valid_after")
+            or validity(leaf, "not_valid_before") > datetime.now(timezone.utc)
+            or (require_current_validity and datetime.now(timezone.utc) >= validity(leaf, "not_valid_after"))
         ):
             raise CertificateSelectionError("Selected certificate material identity is invalid")
         sans = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
@@ -164,7 +165,7 @@ class TraefikCertificateSelection:
         }]}}
         return (HEADER + metadata + "\n" + json.dumps(body, sort_keys=True) + "\n").encode()
 
-    def read(self, path):
+    def read(self, path, require_current_validity=True):
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
             raise CertificateSelectionError("Certificate selection record is invalid")
         raw = path.read_bytes()
@@ -185,7 +186,7 @@ class TraefikCertificateSelection:
         files = parsed["tls"]["certificates"][0]
         if not isinstance(files, dict) or set(files) != {"certFile", "keyFile"}:
             raise CertificateSelectionError("Certificate selection files are invalid")
-        return self.material(owner, files["certFile"], files["keyFile"])
+        return self.material(owner, files["certFile"], files["keyFile"], require_current_validity)
 
     def pool(self, owner, candidate):
         selections = []
