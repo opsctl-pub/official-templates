@@ -1,0 +1,70 @@
+---
+- name: Manage a gateway-local native certificate without exporting its key
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+  tasks:
+    - name: Validate native certificate execution
+      ansible.builtin.assert:
+        that:
+          - native_certificate_action in ['csr', 'install']
+          - not (simulate | default(false) | bool)
+          - native_certificate_request is mapping
+          - native_certificate_request.organization_id == org_id
+          - native_certificate_request.server_id == server_id
+        fail_msg: Native certificate execution identity is invalid
+
+    - name: Check gateway certificate tooling before key generation
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python_interpreter | default('python3') }}"
+          - -c
+          - "import cryptography, shutil; assert shutil.which('openssl')"
+      register: native_certificate_tooling
+      changed_when: false
+      failed_when: false
+
+    - name: Install missing gateway certificate tooling
+      ansible.builtin.package:
+        name: [python3-cryptography, openssl]
+        state: present
+      when: native_certificate_tooling.rc != 0
+
+    - name: Execute the local-key owner with bounded public inputs
+      block:
+        - name: Create execution directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: opsctl-native-certificate-
+          register: native_execution_dir
+
+        - name: Deliver canonical certificate helper
+          ansible.builtin.copy:
+            src: ../scripts/native_origin_certificate.py
+            dest: "{{ native_execution_dir.path }}/certificate.py"
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Execute gateway-local certificate action
+          ansible.builtin.command:
+            argv: ["{{ ansible_python_interpreter | default('python3') }}", "{{ native_execution_dir.path }}/certificate.py", "{{ native_certificate_action }}"]
+            stdin: "{{ native_certificate_request | to_json }}"
+          environment:
+            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
+            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+          register: native_certificate_result
+          no_log: true
+      always:
+        - name: Remove execution helper
+          ansible.builtin.file:
+            path: "{{ native_execution_dir.path }}"
+            state: absent
+          when: native_execution_dir is defined and native_execution_dir.path is defined
+
+    - name: Emit only public CSR or verified certificate identity
+      ansible.builtin.debug:
+        msg: "{{ native_certificate_result.stdout | trim }}"
