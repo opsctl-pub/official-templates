@@ -237,6 +237,56 @@ class NativeOriginCertificate:
                     "trust_bundle_sha256": trust_digest, "route_hosts": self.identity["route_hosts"],
                     "classification": "serving", "observed_at": datetime.now(timezone.utc).isoformat()}
 
+    def observe(self, fingerprint, trust_digest):
+        """Verify the installed revision on the final route without rewriting a file."""
+        with self.lock():
+            if not (self.revision / "identity.json").is_file():
+                raise ValueError("Native final revision identity is unavailable")
+            self.bind_identity()
+            if (
+                self.binding.is_symlink() or not self.binding.is_file()
+                or self.binding.read_bytes() != self.binding_bytes(self.identity["revision_id"])
+                or (self.revision / "trust.pem").is_symlink()
+                or hashlib.sha256((self.revision / "trust.pem").read_bytes()).hexdigest() != trust_digest
+            ):
+                raise ValueError("Native final certificate binding changed")
+            self.verify_served(self.revision / "trust.pem", fingerprint, "127.0.0.1", 443)
+            return {
+                "revision_id": self.identity["revision_id"], "fingerprint_sha256": fingerprint,
+                "trust_bundle_sha256": trust_digest, "route_hosts": self.identity["route_hosts"],
+                "classification": "serving", "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def retire(self, active_revision_id, active_fingerprint):
+        """Remove a retired local revision only while its exact replacement is serving."""
+        if active_revision_id == self.identity["revision_id"]:
+            raise ValueError("Native active revision cannot be retired")
+        desired = self.binding_bytes(active_revision_id)
+        with self.lock():
+            if self.binding.is_symlink() or not self.binding.is_file() or self.binding.read_bytes() != desired:
+                raise ValueError("Native retirement replacement binding changed")
+            active = self.base / active_revision_id
+            if active.is_symlink():
+                raise ValueError("Native active revision ownership changed")
+            self.verify_served(active / "trust.pem", active_fingerprint, "127.0.0.1", 443)
+            if self.revision.is_symlink():
+                raise ValueError("Native retired revision ownership changed")
+            if self.revision.exists():
+                self.bind_identity()
+                allowed = {"identity.json", "tls.key", "csr.pem", "tls.crt", "trust.pem"}
+                files = list(self.revision.iterdir())
+                if any(path.name not in allowed or path.is_symlink() or not path.is_file() for path in files):
+                    raise ValueError("Native retired revision contains unowned files")
+                for path in files:
+                    if path.name != "identity.json":
+                        path.unlink()
+                (self.revision / "identity.json").unlink()
+                self.revision.rmdir()
+            return {
+                "revision_id": self.identity["revision_id"], "active_revision_id": active_revision_id,
+                "classification": "retired", "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
 
 def main():
     request = json.loads(sys.stdin.buffer.read(524289))
@@ -251,6 +301,10 @@ def main():
             request["leaf_fingerprint_sha256"], request["trust_bundle_sha256"],
             request["previous_revision_id"],
         )
+    elif sys.argv[1] == "observe":
+        result = contract.observe(request["leaf_fingerprint_sha256"], request["trust_bundle_sha256"])
+    elif sys.argv[1] == "retire":
+        result = contract.retire(request["active_revision_id"], request["active_fingerprint_sha256"])
     else:
         raise ValueError("Native certificate action is invalid")
     print("TEMPLATE_OUTPUT_JSON=" + json.dumps({"native_certificate": result}, sort_keys=True))

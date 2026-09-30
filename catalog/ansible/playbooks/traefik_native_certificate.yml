@@ -10,7 +10,7 @@
     - name: Validate native certificate execution
       ansible.builtin.assert:
         that:
-          - native_certificate_action in ['csr', 'install']
+          - native_certificate_action in ['csr', 'install', 'observe', 'retire']
           - not (simulate | default(false) | bool)
           - native_certificate_request is mapping
           - native_certificate_request.organization_id == org_id
