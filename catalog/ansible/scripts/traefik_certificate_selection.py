@@ -1,0 +1,300 @@
+"""Transactional file-certificate selection for the managed Traefik gateway."""
+
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from uuid import UUID
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
+import yaml
+
+
+HEADER = "# opsctl-certificate-selection "
+OWNER_FIELDS = {
+    "organization_id", "deployment_id", "gateway_id", "server_id", "revision_id",
+    "source", "route_hosts", "fingerprint_sha256",
+}
+
+
+class CertificateSelectionError(ValueError):
+    """Bounded public refusal; never include key, certificate or arbitrary input."""
+
+
+def atomic_write(path, content, mode=0o600):
+    """Persist one complete file and its directory entry without following links."""
+    if path.is_symlink():
+        raise CertificateSelectionError("Certificate file ownership is invalid")
+    descriptor, temporary = tempfile.mkstemp(prefix=".certificate-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def validate_owner(owner):
+    if not isinstance(owner, dict) or set(owner) != OWNER_FIELDS:
+        raise CertificateSelectionError("Certificate selection identity is invalid")
+    for field in OWNER_FIELDS - {"source", "route_hosts", "fingerprint_sha256"}:
+        if not isinstance(owner[field], str) or str(UUID(owner[field])) != owner[field]:
+            raise CertificateSelectionError("Certificate selection identity is invalid")
+    if owner["source"] not in {"automatic", "native", "custom"}:
+        raise CertificateSelectionError("Certificate selection source is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", owner["fingerprint_sha256"]):
+        raise CertificateSelectionError("Certificate selection fingerprint is invalid")
+    hosts = owner["route_hosts"]
+    if (
+        not isinstance(hosts, list) or not 1 <= len(hosts) <= 100
+        or any(not isinstance(host, str) for host in hosts)
+        or hosts != sorted(set(hosts))
+    ):
+        raise CertificateSelectionError("Certificate selection hosts are invalid")
+    for host in hosts:
+        if not re.fullmatch(
+            r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*", host,
+        ):
+            raise CertificateSelectionError("Certificate selection hostname is invalid")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        raise CertificateSelectionError("Certificate selection requires DNS hostnames")
+
+
+def matches(host, names):
+    wildcard = "*." + host.partition(".")[2]
+    return any(name == host or name.rstrip(".") == wildcard for name in names)
+
+
+def public_key_bytes(value):
+    return value.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def validity(leaf, field):
+    value = getattr(leaf, field + "_utc", None)
+    return value if value is not None else getattr(leaf, field).replace(tzinfo=timezone.utc)
+
+
+class TraefikCertificateSelection:
+    """One atomic owner record per Deployment; one lock for the loaded TLS pool."""
+
+    def __init__(self, certificate_dir, dynamic_dir):
+        self.certificate_dir = Path(certificate_dir)
+        self.dynamic_dir = Path(dynamic_dir)
+        for path in (self.certificate_dir, self.dynamic_dir):
+            if not path.is_absolute() or path.resolve() != path or not path.is_dir():
+                raise CertificateSelectionError("Certificate selection layout is invalid")
+
+    @contextmanager
+    def locked(self):
+        descriptor = os.open(
+            self.certificate_dir / ".selection.lock",
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            yield
+
+    def binding(self, owner):
+        validate_owner(owner)
+        return self.dynamic_dir / f"certificate-{owner['deployment_id']}.yml"
+
+    def material(self, owner, certificate_file, private_key_file):
+        validate_owner(owner)
+        paths = [Path(certificate_file), Path(private_key_file)]
+        for path in paths:
+            if (
+                not path.is_absolute() or path.resolve() != path
+                or not path.is_relative_to(self.certificate_dir) or not path.is_file()
+                or path.stat().st_mode & 0o077
+            ):
+                raise CertificateSelectionError("Selected certificate files are invalid")
+        leaf = x509.load_pem_x509_certificate(paths[0].read_bytes())
+        key = serialization.load_pem_private_key(paths[1].read_bytes(), password=None)
+        if (
+            leaf.fingerprint(hashes.SHA256()).hex() != owner["fingerprint_sha256"]
+            or public_key_bytes(leaf.public_key()) != public_key_bytes(key.public_key())
+            or not validity(leaf, "not_valid_before") <= datetime.now(timezone.utc) < validity(leaf, "not_valid_after")
+        ):
+            raise CertificateSelectionError("Selected certificate material identity is invalid")
+        sans = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = sans.get_values_for_type(x509.DNSName)
+        if not all(matches(host, [value.lower() for value in dns_names]) for host in owner["route_hosts"]):
+            raise CertificateSelectionError("Selected certificate does not cover its hostnames")
+        common_names = leaf.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        common_name = common_names[0].value if common_names else ""
+        names = [common_name.lower()] if common_name else []
+        names.extend(value.lower() for value in dns_names if value != common_name)
+        names.extend(str(value) for value in sans.get_values_for_type(x509.IPAddress)
+                     if str(value) != common_name)
+        return {"owner": owner, "names": names, "key": ",".join(sorted(names))}
+
+    def document(self, owner, certificate_file, private_key_file):
+        self.material(owner, certificate_file, private_key_file)
+        metadata = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+        body = {"tls": {"certificates": [{
+            "certFile": str(certificate_file), "keyFile": str(private_key_file),
+        }]}}
+        return (HEADER + metadata + "\n" + json.dumps(body, sort_keys=True) + "\n").encode()
+
+    def read(self, path):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+            raise CertificateSelectionError("Certificate selection record is invalid")
+        raw = path.read_bytes()
+        header, _, body = raw.decode("ascii").partition("\n")
+        if not header.startswith(HEADER):
+            raise CertificateSelectionError("Unowned certificate pool requires reconciliation")
+        owner = json.loads(header[len(HEADER):])
+        if path != self.binding(owner):
+            raise CertificateSelectionError("Certificate selection owner changed")
+        parsed = json.loads(body)
+        if (
+            not isinstance(parsed, dict) or set(parsed) != {"tls"}
+            or not isinstance(parsed["tls"], dict) or set(parsed["tls"]) != {"certificates"}
+            or not isinstance(parsed["tls"]["certificates"], list)
+            or len(parsed["tls"]["certificates"]) != 1
+        ):
+            raise CertificateSelectionError("Certificate selection binding is invalid")
+        files = parsed["tls"]["certificates"][0]
+        if not isinstance(files, dict) or set(files) != {"certFile", "keyFile"}:
+            raise CertificateSelectionError("Certificate selection files are invalid")
+        return self.material(owner, files["certFile"], files["keyFile"])
+
+    def pool(self, owner, candidate):
+        selections = []
+        binding = self.binding(owner)
+        for path in sorted(self.dynamic_dir.iterdir()):
+            if path.suffix not in {".yml", ".yaml", ".toml"} or path.name.startswith("."):
+                continue
+            if path == binding:
+                continue
+            if path.name.startswith("certificate-"):
+                selection = self.read(path)
+                if any(selection["owner"][field] != owner[field] for field in ("organization_id", "server_id")):
+                    raise CertificateSelectionError("Certificate pool gateway ownership changed")
+                selections.append(selection)
+                continue
+            if path.is_symlink() or path.stat().st_size > 1048576:
+                raise CertificateSelectionError("Gateway TLS configuration is invalid")
+            if path.suffix == ".toml":
+                import tomllib
+                config = tomllib.loads(path.read_text())
+            else:
+                config = yaml.safe_load(path.read_text())
+            if not isinstance(config, dict):
+                raise CertificateSelectionError("Gateway TLS configuration is invalid")
+            tls = config.get("tls", {})
+            if not isinstance(tls, dict) or tls.get("certificates") or tls.get("stores"):
+                raise CertificateSelectionError("Unowned certificate pool requires reconciliation")
+        if candidate is not None:
+            selections.append(candidate)
+        self.validate_pool(selections)
+
+    @staticmethod
+    def validate_pool(selections):
+        pool = {}
+        desired = {}
+        for selection in selections:
+            owner = selection["owner"]
+            pool.setdefault(selection["key"], set()).add(owner["fingerprint_sha256"])
+            for host in owner["route_hosts"]:
+                if host in desired:
+                    raise CertificateSelectionError("Certificate hostname has multiple owners: " + host)
+                desired[host] = owner["fingerprint_sha256"]
+        for host, fingerprint in desired.items():
+            keys = [key for key in pool if matches(host, key.split(","))]
+            if not keys or pool[max(keys)] != {fingerprint}:
+                raise CertificateSelectionError(
+                    "Traefik cannot select the intended certificate for " + host
+                    + "; use non-conflicting certificate ownership or a separate gateway",
+                )
+
+    def activate(self, owner, certificate_file, private_key_file, expected, verify):
+        """CAS, validate the complete pool, activate, verify and restore under one lock."""
+        candidate = self.material(owner, certificate_file, private_key_file)
+        desired = self.document(owner, certificate_file, private_key_file)
+        path = self.binding(owner)
+        with self.locked():
+            if path.is_symlink():
+                raise CertificateSelectionError("Certificate binding ownership is invalid")
+            previous = path.read_bytes() if path.exists() else None
+            if previous not in (expected, desired):
+                raise CertificateSelectionError("Certificate binding changed before activation")
+            self.pool(owner, candidate)
+            try:
+                if previous != desired:
+                    atomic_write(path, desired, 0o644)
+                verify()
+            except Exception:
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                    sync_directory(path.parent)
+                elif previous != desired:
+                    atomic_write(path, previous, 0o644)
+                raise
+
+    def remove(self, owner, expected):
+        """Remove only the exact owned binding without changing another selection."""
+        path = self.binding(owner)
+        with self.locked():
+            if not path.exists() and not path.is_symlink():
+                return
+            selection = self.read(path)
+            if selection["owner"] != owner or path.read_bytes() != expected:
+                raise CertificateSelectionError("Certificate binding changed before removal")
+            self.pool(owner, None)
+            path.unlink()
+            sync_directory(path.parent)
+
+
+def main():
+    request = json.loads(sys.stdin.buffer.read(65537))
+    owner = request["owner"]
+    selection = TraefikCertificateSelection(
+        os.environ["OPSCTL_CERTIFICATE_DIR"], os.environ["OPSCTL_DYNAMIC_DIR"],
+    )
+    expected = request["expected_binding"]
+    expected = expected.encode("ascii") if expected is not None else None
+    if sys.argv[1] == "activate":
+        selection.activate(owner, request["certificate_file"], request["private_key_file"],
+                           expected, lambda: None)
+    elif sys.argv[1] == "remove":
+        selection.remove(owner, expected)
+    else:
+        raise CertificateSelectionError("Certificate selection action is invalid")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except CertificateSelectionError as error:
+        sys.exit(str(error))
+    except Exception:
+        sys.exit("Certificate selection execution failed")

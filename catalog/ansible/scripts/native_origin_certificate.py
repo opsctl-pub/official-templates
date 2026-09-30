@@ -12,35 +12,15 @@ import socket
 import ssl
 import subprocess
 import sys
-import tempfile
 import time
 from uuid import UUID
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-
-
-def atomic_write(path, content, mode=0o600):
-    """Replace complete files; never expose a partial key, chain or binding."""
-    if path.is_symlink():
-        raise ValueError("Native certificate file ownership is invalid")
-    descriptor, temporary = tempfile.mkstemp(prefix=".native-", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            os.fchmod(stream.fileno(), mode)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+from traefik_certificate_selection import (
+    CertificateSelectionError, TraefikCertificateSelection, atomic_write,
+)
 
 
 class NativeOriginCertificate:
@@ -73,7 +53,8 @@ class NativeOriginCertificate:
             if not path.is_absolute() or path.is_symlink() or not path.is_dir():
                 raise ValueError("Native certificate layout is unavailable")
         self.base = certificate_dir / ("native-" + identity["deployment_id"])
-        self.binding = dynamic_dir / ("native-certificate-" + identity["deployment_id"] + ".yml")
+        self.selection = TraefikCertificateSelection(certificate_dir, dynamic_dir)
+        self.binding = dynamic_dir / ("certificate-" + identity["deployment_id"] + ".yml")
         if self.base.is_symlink():
             raise ValueError("Native certificate layout is invalid")
         self.base.mkdir(mode=0o700, exist_ok=True)
@@ -144,8 +125,19 @@ class NativeOriginCertificate:
         if str(UUID(revision_id)) != revision_id:
             raise ValueError("Native certificate predecessor is invalid")
         path = self.base / revision_id
-        return ("tls:\n  certificates:\n    - certFile: " + json.dumps(str(path / "tls.crt"))
-                + "\n      keyFile: " + json.dumps(str(path / "tls.key")) + "\n").encode()
+        leaf = x509.load_pem_x509_certificate((path / "tls.crt").read_bytes())
+        return self.selection.document(
+            self.selection_owner(revision_id, leaf.fingerprint(hashes.SHA256()).hex()),
+            path / "tls.crt", path / "tls.key",
+        )
+
+    def selection_owner(self, revision_id, fingerprint):
+        return {
+            **{field: self.identity[field] for field in (
+                "organization_id", "deployment_id", "gateway_id", "server_id", "route_hosts",
+            )},
+            "revision_id": revision_id, "source": "native", "fingerprint_sha256": fingerprint,
+        }
 
     def verify_served(self, trust_file, fingerprint, address, port):
         """Verify SNI, hostname, trust and exact served leaf on the local gateway listener."""
@@ -213,21 +205,16 @@ class NativeOriginCertificate:
                     raise ValueError("Native origin chain trust is invalid")
             if self.binding.is_symlink():
                 raise ValueError("Native certificate binding ownership is invalid")
-            previous = self.binding.read_bytes() if self.binding.exists() else None
-            desired = self.binding_bytes(self.identity["revision_id"])
             expected = self.binding_bytes(previous_revision_id) if previous_revision_id else None
-            if previous not in (expected, desired):
-                raise ValueError("Native certificate binding changed before installation")
             try:
-                if previous != desired:
-                    atomic_write(self.binding, desired, mode=0o644)
-                self.verify_served(trust_path, fingerprint, address, port)
+                self.selection.activate(
+                    self.selection_owner(self.identity["revision_id"], fingerprint),
+                    cert_path, key_path, expected,
+                    lambda: self.verify_served(trust_path, fingerprint, address, port),
+                )
             except Exception:
-                if previous is None:
-                    self.binding.unlink(missing_ok=True)
-                else:
-                    atomic_write(self.binding, previous, mode=0o644)
-                    prior = self.base / (previous_revision_id or self.identity["revision_id"])
+                if previous_revision_id and self.binding.is_file() and self.binding.read_bytes() == expected:
+                    prior = self.base / previous_revision_id
                     old_leaf = x509.load_pem_x509_certificate((prior / "tls.crt").read_bytes())
                     self.verify_served(
                         prior / "trust.pem", old_leaf.fingerprint(hashes.SHA256()).hex(), address, port,
@@ -239,7 +226,7 @@ class NativeOriginCertificate:
 
     def observe(self, fingerprint, trust_digest):
         """Verify the installed revision on the final route without rewriting a file."""
-        with self.lock():
+        with self.lock(), self.selection.locked():
             if not (self.revision / "identity.json").is_file():
                 raise ValueError("Native final revision identity is unavailable")
             self.bind_identity()
@@ -262,7 +249,7 @@ class NativeOriginCertificate:
         if active_revision_id == self.identity["revision_id"]:
             raise ValueError("Native active revision cannot be retired")
         desired = self.binding_bytes(active_revision_id)
-        with self.lock():
+        with self.lock(), self.selection.locked():
             if self.binding.is_symlink() or not self.binding.is_file() or self.binding.read_bytes() != desired:
                 raise ValueError("Native retirement replacement binding changed")
             active = self.base / active_revision_id
@@ -313,5 +300,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except CertificateSelectionError as error:
+        sys.exit(str(error))
     except Exception:
         sys.exit("Native certificate execution failed")

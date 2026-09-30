@@ -22,14 +22,14 @@
         argv:
           - "{{ ansible_python_interpreter | default('python3') }}"
           - -c
-          - "import cryptography, shutil; assert shutil.which('openssl')"
+          - "import cryptography, yaml, shutil; assert shutil.which('openssl')"
       register: native_certificate_tooling
       changed_when: false
       failed_when: false
 
     - name: Install missing gateway certificate tooling
       ansible.builtin.package:
-        name: [python3-cryptography, openssl]
+        name: [python3-cryptography, python3-yaml, openssl]
         state: present
       when: native_certificate_tooling.rc != 0
 
@@ -49,6 +49,14 @@
             group: root
             mode: '0700'
 
+        - name: Deliver the shared Traefik selection owner
+          ansible.builtin.copy:
+            src: ../scripts/traefik_certificate_selection.py
+            dest: "{{ native_execution_dir.path }}/traefik_certificate_selection.py"
+            owner: root
+            group: root
+            mode: '0600'
+
         - name: Execute gateway-local certificate action
           ansible.builtin.command:
             argv: ["{{ ansible_python_interpreter | default('python3') }}", "{{ native_execution_dir.path }}/certificate.py", "{{ native_certificate_action }}"]
@@ -57,7 +65,13 @@
             OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
             OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
           register: native_certificate_result
+          failed_when: false
           no_log: true
+
+        - name: Require successful gateway certificate action
+          ansible.builtin.assert:
+            that: native_certificate_result.rc == 0
+            fail_msg: "{{ native_certificate_result.stderr | truncate(512, true, '') }}"
       always:
         - name: Remove execution helper
           ansible.builtin.file:

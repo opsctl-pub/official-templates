@@ -1,0 +1,51 @@
+---
+- name: Check gateway certificate selection tooling
+  ansible.builtin.command:
+    argv: [python3, -c, 'import cryptography, yaml']
+  register: certificate_selection_tooling
+  changed_when: false
+  failed_when: false
+
+- name: Install missing certificate selection tooling
+  ansible.builtin.package:
+    name: [python3-cryptography, python3-yaml]
+    state: present
+  when: certificate_selection_tooling.rc != 0
+
+- name: Execute the shared certificate selection owner
+  block:
+    - name: Create selection execution directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: opsctl-certificate-selection-
+      register: certificate_selection_dir
+
+    - name: Deliver canonical selection helper
+      ansible.builtin.copy:
+        src: ../scripts/traefik_certificate_selection.py
+        dest: "{{ certificate_selection_dir.path }}/selection.py"
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Compare and update the selected certificate pool
+      ansible.builtin.command:
+        argv: [python3, "{{ certificate_selection_dir.path }}/selection.py", "{{ certificate_selection_action }}"]
+        stdin: "{{ certificate_selection_request | to_json }}"
+      environment:
+        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
+        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+      register: certificate_selection_result
+      failed_when: false
+      no_log: true
+
+    - name: Require successful certificate selection
+      ansible.builtin.assert:
+        that: certificate_selection_result.rc == 0
+        fail_msg: "{{ certificate_selection_result.stderr | truncate(512, true, '') }}"
+  always:
+    - name: Remove selection execution directory
+      ansible.builtin.file:
+        path: "{{ certificate_selection_dir.path }}"
+        state: absent
+      when: certificate_selection_dir is defined and certificate_selection_dir.path is defined

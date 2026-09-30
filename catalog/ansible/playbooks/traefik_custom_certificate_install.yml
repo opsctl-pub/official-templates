@@ -203,50 +203,6 @@
               - "{{ content_digest }}"
           changed_when: false
 
-        - name: Create staged custom certificate binding
-          ansible.builtin.tempfile:
-            state: file
-            path: "{{ traefik_dynamic_dir }}"
-            prefix: ".certificate-{{ deployment_id }}."
-            suffix: ".yml"
-          register: staged_binding
-
-        - name: Render custom certificate binding
-          ansible.builtin.copy:
-            dest: "{{ staged_binding.path }}"
-            owner: root
-            group: root
-            mode: "0644"
-            content: |
-              tls:
-                certificates:
-                  - certFile: {{ certificate_file | to_json }}
-                    keyFile: {{ private_key_file | to_json }}
-
-        - name: Validate staged custom certificate binding
-          ansible.builtin.slurp:
-            path: "{{ staged_binding.path }}"
-          register: staged_binding_content
-
-        - name: Parse staged custom certificate binding
-          ansible.builtin.set_fact:
-            parsed_binding: "{{ staged_binding_content.content | b64decode | from_yaml }}"
-
-        - name: Require exact custom certificate binding
-          ansible.builtin.assert:
-            that:
-              - parsed_binding.keys() | list == ['tls']
-              - parsed_binding.tls.keys() | list == ['certificates']
-              - parsed_binding.tls.certificates | length == 1
-              - parsed_binding.tls.certificates[0].keys() | sort == ['certFile', 'keyFile']
-              - parsed_binding.tls.certificates[0].certFile == certificate_file
-              - parsed_binding.tls.certificates[0].keyFile == private_key_file
-            fail_msg: "Custom certificate binding is invalid"
-
-        - name: Activate custom certificate binding
-          ansible.builtin.command:
-            argv: [mv, --, "{{ staged_binding.path }}", "{{ binding_file }}"]
-
       always:
         - name: Remove incomplete certificate staging files
           ansible.builtin.file:
@@ -255,10 +211,28 @@
           loop: >-
             {{
               [
-                (staged_revision | default({})).get('path', ''),
-                (staged_binding | default({})).get('path', '')
+                (staged_revision | default({})).get('path', '')
               ] | reject('equalto', '') | list
             }}
+
+    - name: Activate through the shared selected-pool owner
+      ansible.builtin.include_tasks:
+        file: ../tasks/traefik_certificate_selection.yml
+      vars:
+        certificate_selection_action: activate
+        certificate_selection_request:
+          owner:
+            organization_id: "{{ org_id }}"
+            deployment_id: "{{ deployment_id }}"
+            gateway_id: "{{ gateway_id }}"
+            server_id: "{{ server_id }}"
+            revision_id: "{{ revision_id }}"
+            source: custom
+            route_hosts: "{{ route_hosts }}"
+            fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
+          certificate_file: "{{ certificate_file }}"
+          private_key_file: "{{ private_key_file }}"
+          expected_binding: "{{ (binding_content.content | b64decode) if binding_stat.stat.exists else none }}"
 
     - name: Build custom certificate installation result
       ansible.builtin.set_fact:

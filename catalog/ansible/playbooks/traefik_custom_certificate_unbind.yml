@@ -61,10 +61,22 @@
             )
         fail_msg: "Custom certificate state changed before unbind"
 
-    - name: Remove exact Deployment custom certificate binding
-      ansible.builtin.file:
-        path: "{{ binding_file }}"
-        state: absent
+    - name: Remove through the shared selected-pool owner
+      ansible.builtin.include_tasks:
+        file: ../tasks/traefik_certificate_selection.yml
+      vars:
+        certificate_selection_action: remove
+        certificate_selection_request:
+          owner:
+            organization_id: "{{ org_id }}"
+            deployment_id: "{{ deployment_id }}"
+            gateway_id: "{{ gateway_id }}"
+            server_id: "{{ server_id }}"
+            revision_id: "{{ revision_id }}"
+            source: custom
+            route_hosts: "{{ route_hosts }}"
+            fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
+          expected_binding: "{{ binding_content.content | b64decode }}"
       when: custom_certificate_observation.classification in ['exact', 'other']
 
     - name: Read custom certificate observation after unbind
