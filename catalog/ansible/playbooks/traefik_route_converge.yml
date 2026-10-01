@@ -8,7 +8,6 @@
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
     route_key: "deployment-{{ deployment_id }}"
-    route_tls_cert_resolver: "letsencrypt"
     resolved_route_state: "{{ route_state | default('present', true) }}"
     resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
     resolved_route_middlewares: "{{ route_middlewares | default([], true) }}"
@@ -46,7 +45,7 @@
           - redirect_http_to_https is boolean
           - (not redirect_http_to_https) or route_https
           - resolved_route_state in ['present', 'absent']
-          - route_tls_cert_resolver == 'letsencrypt'
+          - (route_tls_cert_resolver is not defined) or (route_tls_cert_resolver == '')
           - resolved_route_hosts is sequence
           - resolved_route_hosts is not string
           - (resolved_route_state == 'absent') or ((resolved_route_hosts | length) > 0)
@@ -139,25 +138,6 @@
 
     - name: Converge managed Traefik route
       block:
-        - name: Validate HTTPS resolver configuration
-          assert:
-            that:
-              - "(not route_https) or ((existing_traefik.Config.Cmd | default([]) | select('match', '^--certificatesresolvers\\.letsencrypt\\.acme\\.email=.+$') | list | length) == 1)"
-              - "(not route_https) or ('--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json' in (existing_traefik.Config.Cmd | default([])))"
-              - >-
-                (not route_https) or (
-                  (
-                    '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in existing_traefik.Config.Cmd
-                    and '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web' in existing_traefik.Config.Cmd
-                    and (existing_traefik.Config.Cmd | select('match', '^--certificatesresolvers\.letsencrypt\.acme\.dnschallenge\.provider=') | list | length) == 0
-                  ) or (
-                    '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in existing_traefik.Config.Cmd
-                    and '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in existing_traefik.Config.Cmd
-                  )
-                )
-            fail_msg: "Managed Traefik gateway is not ready for this organization"
-          no_log: true
-
         - name: Verify watched dynamic directory exists
           stat:
             path: "{{ traefik_dynamic_dir }}"
@@ -225,7 +205,7 @@
               - staged_route_config.http.routers['deployment-' ~ deployment_id].service == ('deployment-' ~ deployment_id)
               - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | length == (resolved_traefik_backends | length)
               - (staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | map(attribute='url') | list) == (resolved_traefik_backends | map(attribute='url') | list)
-              - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls.certResolver == route_tls_cert_resolver
+              - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls == {}
               - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
               - (not redirect_http_to_https) or (staged_route_config.http.keys() | sort == ['middlewares', 'routers', 'services'])
               - redirect_http_to_https or (staged_route_config.http.keys() | sort == ['routers', 'services'])

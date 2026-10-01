@@ -181,8 +181,11 @@
           - route_config.http.routers.keys() | sort in [[route_key], [route_key, redirect_route_key] | sort]
           - route_config.http.services.keys() | list == [route_key]
           - route_router is mapping
-          - (route_router.keys() | difference(['entryPoints', 'middlewares', 'priority', 'rule', 'service', 'tls']) | length) == 0
+          - (route_router.keys() | difference(['entryPoints', 'middlewares', 'observability', 'priority', 'rule', 'service', 'tls']) | length) == 0
           - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
+          - ('observability' not in route_router) or (route_router.observability is mapping)
+          - ('observability' not in route_router) or (route_router.observability.keys() | list == ['accessLogs'])
+          - ('observability' not in route_router) or (route_router.observability.accessLogs is sameas true)
           - route_router.service == route_key
           - route_router.rule is string
           - route_router.rule is match(route_v3_rule_pattern)
@@ -193,9 +196,7 @@
           - route_router.entryPoints in [['web'], ['websecure']]
           - (route_router.entryPoints == ['websecure']) == ('tls' in route_router)
           - ('tls' not in route_router) or (route_router.tls is mapping)
-          - ('tls' not in route_router) or ((route_router.tls.keys() | difference(['certResolver']) | length) == 0)
-          - ('tls' not in route_router) or ('certResolver' not in route_router.tls) or (route_router.tls.certResolver is string)
-          - ('tls' not in route_router) or ('certResolver' not in route_router.tls) or ((route_router.tls.certResolver | trim | length) > 0)
+          - ('tls' not in route_router) or (route_router.tls == {})
           - route_service is mapping
           - route_service.keys() | list == ['loadBalancer']
           - route_service.loadBalancer is mapping
