@@ -20,7 +20,8 @@ from cryptography.hazmat.primitives import hashes
 
 from traefik_certificate_selection import (
     CertificateSelectionError, TraefikCertificateSelection, atomic_write,
-    subject_key, sync_directory, validate_owner, validity,
+    HEADER, closed_json_pairs, subject_key, sync_directory, validate_identity,
+    validate_owner, validity,
 )
 
 
@@ -511,6 +512,113 @@ def remove_file(path):
     sync_directory(path.parent)
 
 
+def retirement_records(directory, identity, selection, state_dir):
+    """Refuse corrupt or foreign renewal input before any selected-file effect."""
+    enrollment = directory / "renewal.json"
+    enrolled_identity = identity
+    if enrollment.exists() or enrollment.is_symlink():
+        config = private_json(enrollment)
+        if not isinstance(config, dict) or set(config) != {
+            "identity", "profile", "certificate_dir", "dynamic_dir", "container_name", "http_port",
+        }:
+            raise AutomaticCertificateError("Automatic renewal configuration is invalid")
+        enrolled_identity = config["identity"]
+        validate_identity(enrolled_identity)
+        if (any(enrolled_identity[field] != identity[field]
+                for field in IDENTITY_FIELDS - {"route_hosts"})
+                or config["certificate_dir"] != str(selection.certificate_dir)
+                or config["dynamic_dir"] != str(selection.dynamic_dir)
+                or not isinstance(config["container_name"], str) or not config["container_name"]
+                or type(config["http_port"]) is not int or not 1024 <= config["http_port"] <= 65535):
+            raise AutomaticCertificateError("Automatic renewal configuration changed")
+        TraefikAutomaticCertificate(selection.certificate_dir, selection.dynamic_dir,
+                                    state_dir, config["profile"])
+    pending = directory / "renewal-request.json"
+    if not pending.exists() and not pending.is_symlink():
+        return
+    request = private_json(pending)
+    if (not isinstance(request, dict)
+            or set(request) != {"identity", "operation_id", "action", "expected_binding"}
+            or request["identity"] != enrolled_identity or request["action"] != "renew_due"
+            or not isinstance(request["operation_id"], str)
+            or str(UUID(request["operation_id"])) != request["operation_id"]
+            or not isinstance(request["expected_binding"], str)
+            or not 1 <= len(request["expected_binding"]) <= 65536
+            or not request["expected_binding"].isascii()):
+        raise AutomaticCertificateError("Automatic renewal retry identity is invalid")
+    header, separator, body = request["expected_binding"].partition("\n")
+    if not separator or not header.startswith(HEADER):
+        raise AutomaticCertificateError("Automatic renewal retry selection is invalid")
+    owner = json.loads(header[len(HEADER):], object_pairs_hook=closed_json_pairs)
+    validate_owner(owner)
+    if (owner["source"] != "automatic"
+            or any(owner[field] != enrolled_identity[field] for field in IDENTITY_FIELDS)):
+        raise AutomaticCertificateError("Automatic renewal retry ownership changed")
+    document = json.loads(body, object_pairs_hook=closed_json_pairs)
+    if (not isinstance(document, dict) or set(document) != {"tls"}
+            or not isinstance(document["tls"], dict) or set(document["tls"]) != {"certificates"}
+            or not isinstance(document["tls"]["certificates"], list)
+            or len(document["tls"]["certificates"]) != 1):
+        raise AutomaticCertificateError("Automatic renewal retry selection is invalid")
+    files = document["tls"]["certificates"][0]
+    if not isinstance(files, dict) or set(files) != {"certFile", "keyFile"}:
+        raise AutomaticCertificateError("Automatic renewal retry selection is invalid")
+    selection.material(owner, files["certFile"], files["keyFile"], require_current_validity=False)
+
+
+def retire(request, certificate_dir, dynamic_dir, state_dir):
+    """Retire only exact automatic selection and qualified renewal inputs."""
+    if not isinstance(request, dict) or set(request) != {"identity", "operation_id", "expected_binding"}:
+        raise AutomaticCertificateError("Automatic retirement request is invalid")
+    identity = request["identity"]
+    validate_identity(identity)
+    operation = request["operation_id"]
+    expected = request["expected_binding"]
+    if (not isinstance(operation, str) or str(UUID(operation)) != operation
+            or expected is not None and (not isinstance(expected, str)
+                or not expected.isascii() or not 1 <= len(expected) <= 65536)):
+        raise AutomaticCertificateError("Automatic retirement identity is invalid")
+    root = Path(state_dir)
+    if (not root.is_absolute() or root.resolve() != root or not root.is_dir()
+            or root.stat().st_mode & 0o077):
+        raise AutomaticCertificateError("Automatic retirement state layout is invalid")
+    selection = TraefikCertificateSelection(certificate_dir, dynamic_dir)
+    directory = root / subject_key(identity["subject"])
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.resolve() != directory or directory.stat().st_mode & 0o077:
+        raise AutomaticCertificateError("Automatic retirement owner layout is invalid")
+    observation = {"identity": identity, "operation_id": operation}
+    with locked(directory / ".issuer.lock"):
+        retirement_records(directory, identity, selection, root)
+        current = selection.observe(observation)["automatic_certificate_selection"]["expected_binding"]
+        state = "absent"
+        if current is not None:
+            if current != expected:
+                raise AutomaticCertificateError("Automatic retirement selection changed")
+            binding = selection.dynamic_dir / ("certificate-" + subject_key(identity["subject"]) + ".yml")
+            owner = selection.read(binding, require_current_validity=False)["owner"]
+            if (binding.read_bytes().decode("ascii") != current
+                    or any(owner[field] != identity[field]
+                           for field in IDENTITY_FIELDS - {"route_hosts"})):
+                raise AutomaticCertificateError("Automatic retirement selection changed")
+            if owner["source"] == "automatic":
+                if any(owner[field] != identity[field] for field in IDENTITY_FIELDS):
+                    raise AutomaticCertificateError("Automatic retirement selection identity changed")
+                selection.remove(owner, current.encode("ascii"))
+            else:
+                state = "preserved_nonautomatic"
+        remove_file(directory / "renewal-request.json")
+        remove_file(directory / "renewal.json")
+        fresh = selection.observe(observation)["automatic_certificate_selection"]["expected_binding"]
+        if (fresh != (current if state == "preserved_nonautomatic" else None)
+                or any((directory / name).exists() or (directory / name).is_symlink()
+                       for name in ("renewal.json", "renewal-request.json"))):
+            raise AutomaticCertificateError("Automatic retirement verification failed")
+        result = {"identity": identity, "operation_id": operation,
+                  "selection_state": state, "renewal_enrolled": False}
+        return {"automatic_certificate_retirement": {**result, "digest": digest(result)}}
+
+
 def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
     """One local timer, isolated per-owner attempts, and sanitized durable outcomes."""
     root = Path(state_dir)
@@ -565,6 +673,12 @@ def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
 
 def main():
     os.umask(0o077)
+    if sys.argv[1:] == ["retire"]:
+        request = json.loads(sys.stdin.buffer.read(131073), object_pairs_hook=closed_json_pairs)
+        result = retire(request, os.environ["OPSCTL_CERTIFICATE_DIR"],
+                        os.environ["OPSCTL_DYNAMIC_DIR"], os.environ["OPSCTL_ACME_STATE_DIR"])
+        print("TEMPLATE_OUTPUT_JSON=" + json.dumps(result, sort_keys=True))
+        return
     if sys.argv[1:] == ["renew-due"]:
         if not renew_all(os.environ["OPSCTL_ACME_STATE_DIR"]):
             raise AutomaticCertificateError("Automatic renewal failed; prior selection preserved")

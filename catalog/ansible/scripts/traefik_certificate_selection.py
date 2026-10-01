@@ -297,7 +297,7 @@ class TraefikCertificateSelection:
             if path == binding:
                 continue
             if path.name.startswith("certificate-"):
-                selection = self.read(path)
+                selection = self.read(path, require_current_validity=False)
                 if any(selection["owner"][field] != owner[field] for field in ("organization_id", "server_id")):
                     raise CertificateSelectionError("Certificate pool gateway ownership changed")
                 selections.append(selection)
@@ -367,7 +367,7 @@ class TraefikCertificateSelection:
         with self.locked():
             if not path.exists() and not path.is_symlink():
                 return
-            selection = self.read(path)
+            selection = self.read(path, require_current_validity=False)
             if selection["owner"] != owner or path.read_bytes() != expected:
                 raise CertificateSelectionError("Certificate binding changed before removal")
             self.pool(owner, None)
