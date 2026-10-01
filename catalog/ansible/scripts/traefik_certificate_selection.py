@@ -24,6 +24,7 @@ OWNER_FIELDS = {
     "organization_id", "subject", "gateway_id", "server_id", "revision_id",
     "source", "route_hosts", "fingerprint_sha256",
 }
+IDENTITY_FIELDS = {"organization_id", "subject", "gateway_id", "server_id", "route_hosts"}
 
 
 class CertificateSelectionError(ValueError):
@@ -66,10 +67,11 @@ def subject_key(subject):
     return subject["type"] + "-" + subject["id"]
 
 
-def validate_owner(owner):
-    if not isinstance(owner, dict) or set(owner) != OWNER_FIELDS:
+def validate_identity(owner):
+    """Validate qualified ownership without inventing revision or material truth."""
+    if not isinstance(owner, dict) or set(owner) != IDENTITY_FIELDS:
         raise CertificateSelectionError("Certificate selection identity is invalid")
-    for field in ("organization_id", "server_id", "revision_id"):
+    for field in ("organization_id", "server_id"):
         if not isinstance(owner[field], str) or str(UUID(owner[field])) != owner[field]:
             raise CertificateSelectionError("Certificate selection identity is invalid")
     subject_key(owner["subject"])
@@ -79,10 +81,6 @@ def validate_owner(owner):
     elif (not isinstance(owner["gateway_id"], str)
             or str(UUID(owner["gateway_id"])) != owner["gateway_id"]):
         raise CertificateSelectionError("Deployment certificate gateway identity is invalid")
-    if owner["source"] not in {"automatic", "native", "custom"}:
-        raise CertificateSelectionError("Certificate selection source is invalid")
-    if not re.fullmatch(r"[0-9a-f]{64}", owner["fingerprint_sha256"]):
-        raise CertificateSelectionError("Certificate selection fingerprint is invalid")
     hosts = owner["route_hosts"]
     if (
         not isinstance(hosts, list) or not 1 <= len(hosts) <= 100
@@ -101,6 +99,34 @@ def validate_owner(owner):
         except ValueError:
             continue
         raise CertificateSelectionError("Certificate selection requires DNS hostnames")
+
+
+def validate_owner(owner):
+    if not isinstance(owner, dict) or set(owner) != OWNER_FIELDS:
+        raise CertificateSelectionError("Certificate selection identity is invalid")
+    validate_identity({field: owner[field] for field in IDENTITY_FIELDS})
+    if (not isinstance(owner["revision_id"], str)
+            or str(UUID(owner["revision_id"])) != owner["revision_id"]):
+        raise CertificateSelectionError("Certificate selection identity is invalid")
+    if owner["source"] not in {"automatic", "native", "custom"}:
+        raise CertificateSelectionError("Certificate selection source is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", owner["fingerprint_sha256"]):
+        raise CertificateSelectionError("Certificate selection fingerprint is invalid")
+
+
+def closed_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise CertificateSelectionError("Certificate selection evidence is invalid")
+        result[key] = value
+    return result
+
+
+def file_identity(path):
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def matches(host, names):
@@ -142,6 +168,63 @@ class TraefikCertificateSelection:
     def binding(self, owner):
         validate_owner(owner)
         return self.dynamic_dir / f"certificate-{subject_key(owner['subject'])}.yml"
+
+    def _observation_snapshot(self, path, identity):
+        """Capture bytes plus file identity, validating expired owned material too."""
+        for directory in (self.certificate_dir, self.dynamic_dir):
+            if directory.resolve() != directory or not directory.is_dir():
+                raise CertificateSelectionError("Certificate selection layout is invalid")
+        if path.is_symlink():
+            raise CertificateSelectionError("Certificate selection record is invalid")
+        if not path.exists():
+            return None
+        before = file_identity(path)
+        selected = self.read(path, require_current_validity=False)
+        if any(selected["owner"][field] != identity[field]
+               for field in IDENTITY_FIELDS - {"route_hosts"}):
+            raise CertificateSelectionError("Certificate selection ownership changed")
+        raw = path.read_bytes()
+        if not 1 <= len(raw) <= 65536:
+            raise CertificateSelectionError("Certificate selection record is invalid")
+        header, separator, body = raw.decode("ascii").partition("\n")
+        if not separator or not header.startswith(HEADER):
+            raise CertificateSelectionError("Certificate selection record is invalid")
+        owner = json.loads(header[len(HEADER):], object_pairs_hook=closed_json_pairs)
+        document = json.loads(body, object_pairs_hook=closed_json_pairs)
+        if owner != selected["owner"]:
+            raise CertificateSelectionError("Certificate selection changed during observation")
+        files = document["tls"]["certificates"][0]
+        material = []
+        for field in ("certFile", "keyFile"):
+            file = Path(files[field])
+            stat = file_identity(file)
+            material.append((stat, hashlib.sha256(file.read_bytes()).digest()))
+        if path.is_symlink() or file_identity(path) != before:
+            raise CertificateSelectionError("Certificate selection changed during observation")
+        return raw, before, material
+
+    def observe(self, request):
+        """Return read-only byte CAS evidence with a stable material snapshot."""
+        if not isinstance(request, dict) or set(request) != {"identity", "operation_id"}:
+            raise CertificateSelectionError("Certificate selection request is invalid")
+        identity = request["identity"]
+        validate_identity(identity)
+        operation_id = request["operation_id"]
+        if not isinstance(operation_id, str) or str(UUID(operation_id)) != operation_id:
+            raise CertificateSelectionError("Certificate selection operation is invalid")
+        path = self.dynamic_dir / f"certificate-{subject_key(identity['subject'])}.yml"
+        snapshot = self._observation_snapshot(path, identity)
+        if self._observation_snapshot(path, identity) != snapshot:
+            raise CertificateSelectionError("Certificate selection changed during observation")
+        result = {
+            "identity": identity,
+            "operation_id": operation_id,
+            "expected_binding": snapshot[0].decode("ascii") if snapshot else None,
+        }
+        result["digest"] = hashlib.sha256(
+            json.dumps(result, sort_keys=True, separators=(",", ":")).encode(),
+        ).hexdigest()
+        return {"automatic_certificate_selection": result}
 
     def material(self, owner, certificate_file, private_key_file, require_current_validity=True):
         validate_owner(owner)
@@ -294,10 +377,13 @@ class TraefikCertificateSelection:
 
 def main():
     request = json.loads(sys.stdin.buffer.read(65537))
-    owner = request["owner"]
     selection = TraefikCertificateSelection(
         os.environ["OPSCTL_CERTIFICATE_DIR"], os.environ["OPSCTL_DYNAMIC_DIR"],
     )
+    if sys.argv[1] == "observe":
+        print("TEMPLATE_OUTPUT_JSON=" + json.dumps(selection.observe(request)))
+        return
+    owner = request["owner"]
     expected = request["expected_binding"]
     expected = expected.encode("ascii") if expected is not None else None
     if sys.argv[1] == "activate":

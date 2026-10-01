@@ -6,7 +6,7 @@
   vars:
     traefik_container_name: traefik
     traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
-    traefik_certificate_dir: /var/lib/traefik/certificates
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
     traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
     route_key: "deployment-{{ deployment_id }}"

@@ -3,6 +3,10 @@
   hosts: all
   gather_facts: false
   become: true
+  vars:
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
   pre_tasks:
     - name: Skip automatic certificate mutation in simulation
       ansible.builtin.meta: end_play
