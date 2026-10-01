@@ -74,9 +74,13 @@ class TraefikAutomaticCertificate:
         validate_url(profile["server_url"])
         if profile["challenge"] == "dns-01":
             validate_url(profile["broker_url"], "/api/v1/dns-challenge")
-            token = Path(profile["token_file"])
-            if (not token.is_absolute() or token.resolve() != token or not token.is_file()
-                    or token.stat().st_mode & 0o077 or not 1 <= token.stat().st_size <= 8192):
+            token_file = profile["token_file"]
+            if (not isinstance(token_file, str) or not token_file
+                    or any(ord(character) < 32 or ord(character) == 127 for character in token_file)):
+                raise AutomaticCertificateError("Automatic certificate broker credential is invalid")
+            token = Path(token_file)
+            if (not token.is_absolute() or str(token) != token_file
+                    or token_file.startswith("//") or ".." in token.parts):
                 raise AutomaticCertificateError("Automatic certificate broker credential is invalid")
         elif profile["broker_url"] is not None or profile["token_file"] is not None:
             raise AutomaticCertificateError("HTTP challenge profile cannot contain broker credentials")
@@ -176,6 +180,11 @@ class TraefikAutomaticCertificate:
                 sync_directory(path.parent)
 
     def issue(self, directory, operation_id, action):
+        if self.profile["challenge"] == "dns-01":
+            token = Path(self.profile["token_file"])
+            if (token.resolve() != token or not token.is_file()
+                    or token.stat().st_mode & 0o077 or not 1 <= token.stat().st_size <= 8192):
+                raise AutomaticCertificateError("Automatic certificate broker credential is invalid")
         args = ["run", "--server", self.profile["server_url"], "--email", self.profile["email"],
                 "--accept-tos", "--path", str(directory)]
         for host in self.identity["route_hosts"]:
@@ -270,6 +279,8 @@ class TraefikAutomaticCertificate:
             result = self._run_locked(directory, operation_id, action, request, expected)
             if action != "renew_due":
                 self.enroll(directory)
+                status = {"observed_at": datetime.now(timezone.utc).isoformat(), **result}
+                atomic_write(directory / "renewal-status.json", json.dumps(status, sort_keys=True).encode())
             return result
 
     def enroll(self, directory):
