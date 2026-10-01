@@ -1,0 +1,113 @@
+---
+- name: Require qualified dashboard retirement inputs
+  ansible.builtin.assert:
+    that:
+      - certificate_selection_request is mapping
+      - automatic_certificate_retirement_request is mapping
+      - certificate_selection_request.identity.subject.type == 'server'
+      - certificate_selection_request.identity.gateway_id == None
+      - certificate_selection_request.identity == automatic_certificate_retirement_request.identity
+      - certificate_selection_request.operation_id == automatic_certificate_retirement_request.operation_id
+      - traefik_dashboard_route_file is defined
+      - traefik_dashboard_route_file is string
+      - traefik_dashboard_route_file == traefik_dynamic_dir ~ '/server-dashboard-' ~ certificate_selection_request.identity.subject.id ~ '.yml'
+      - not (simulate | default(false) | bool)
+    fail_msg: Dashboard retirement identity is invalid
+  no_log: true
+
+- name: Inspect owning dashboard route after successful runtime removal
+  ansible.builtin.stat:
+    path: "{{ traefik_dashboard_route_file }}"
+    follow: false
+  register: dashboard_retirement_route
+
+- name: Require physical dashboard route absence
+  ansible.builtin.assert:
+    that: not dashboard_retirement_route.stat.exists
+    fail_msg: Dashboard route remains installed
+
+- name: Retire qualified dashboard selection and enrollment
+  block:
+    - name: Create transient dashboard retirement directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: opsctl-dashboard-retirement-
+      register: dashboard_retirement_scratch
+
+    - name: Deliver existing selection and retirement helpers
+      ansible.builtin.copy:
+        src: "../scripts/{{ item }}"
+        dest: "{{ dashboard_retirement_scratch.path }}/{{ item }}"
+        mode: '0700'
+      loop: [traefik_certificate_selection.py, traefik_automatic_certificate.py]
+
+    - name: Observe exact selected bytes
+      ansible.builtin.command:
+        argv: [python3, "{{ dashboard_retirement_scratch.path }}/traefik_certificate_selection.py", observe]
+        stdin: "{{ certificate_selection_request | to_json }}"
+      environment:
+        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
+        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+        PYTHONDONTWRITEBYTECODE: '1'
+      register: dashboard_retirement_selection
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Require successful bounded selection observation
+      ansible.builtin.assert:
+        that:
+          - dashboard_retirement_selection.rc == 0
+          - dashboard_retirement_selection.stdout is match('^TEMPLATE_OUTPUT_JSON=')
+          - dashboard_retirement_selection.stdout | length <= 524288
+        fail_msg: Dashboard selection is unavailable
+      no_log: true
+
+    - name: Capture opaque selection CAS
+      ansible.builtin.set_fact:
+        dashboard_retirement_observation: "{{ (dashboard_retirement_selection.stdout | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).automatic_certificate_selection }}"
+      no_log: true
+
+    - name: Require exact observed owner and root
+      ansible.builtin.assert:
+        that:
+          - dashboard_retirement_observation.identity == certificate_selection_request.identity
+          - dashboard_retirement_observation.operation_id == certificate_selection_request.operation_id
+        fail_msg: Dashboard selection identity changed
+      no_log: true
+
+    - name: Retire with exact observed bytes
+      ansible.builtin.command:
+        argv: [python3, "{{ dashboard_retirement_scratch.path }}/traefik_automatic_certificate.py", retire]
+        stdin: "{{ automatic_certificate_retirement_request | combine({'expected_binding': dashboard_retirement_observation.expected_binding}) | to_json }}"
+      environment:
+        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
+        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+        OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
+        PYTHONDONTWRITEBYTECODE: '1'
+      register: dashboard_retirement_action
+      failed_when: false
+      no_log: true
+
+    - name: Require bounded retirement success
+      ansible.builtin.assert:
+        that:
+          - dashboard_retirement_action.rc == 0
+          - dashboard_retirement_action.stdout is match('^TEMPLATE_OUTPUT_JSON=')
+          - dashboard_retirement_action.stdout | length <= 65536
+        fail_msg: Dashboard automatic retirement failed
+      no_log: true
+
+    - name: Emit separate selection evidence
+      ansible.builtin.debug:
+        msg: "{{ dashboard_retirement_selection.stdout }}"
+
+    - name: Emit separate retirement evidence
+      ansible.builtin.debug:
+        msg: "{{ dashboard_retirement_action.stdout }}"
+  always:
+    - name: Remove transient dashboard retirement directory
+      ansible.builtin.file:
+        path: "{{ dashboard_retirement_scratch.path }}"
+        state: absent
+      when: dashboard_retirement_scratch is defined and dashboard_retirement_scratch.path is defined
