@@ -1,0 +1,166 @@
+---
+- name: Inspect runtime before restoration
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: traefik_restore_info
+  no_log: true
+
+- name: Read exact current restoration identity
+  set_fact:
+    traefik_restore_current: "{{ traefik_restore_info.container | default(none) }}"
+  no_log: true
+
+- name: Refuse restoration over another runtime owner
+  assert:
+    that:
+      - >-
+        traefik_restore_current is none
+        or (traefik_prior_runtime_present and traefik_restore_current.Id == traefik_prior_runtime.Id)
+        or (
+          traefik_restore_current.Config.Image == traefik_image
+          and traefik_restore_current.Id == traefik_replacement_details.Id
+          and (traefik_restore_current.Config.Labels | combine(traefik_managed_labels)) == traefik_restore_current.Config.Labels
+          and traefik_restore_current.Config.Cmd == traefik_command_args
+          and traefik_restore_current.HostConfig.NetworkMode == 'host'
+          and traefik_restore_current.Mounts == traefik_replacement_details.Mounts
+        )
+    fail_msg: "Traefik restoration refused: current runtime ownership changed; partial effect requires observation"
+  no_log: true
+
+- name: Restore exact prior Traefik runtime
+  shell: |
+    python3 - <<'PY'
+    import json
+    import subprocess
+
+    prior = json.loads(r'''{{ traefik_prior_runtime | to_json }}''')
+    name = prior.get('Name', '').lstrip('/') or {{ traefik_container_name | to_json }}
+    config = prior.get('Config') or {}
+    host_config = prior.get('HostConfig') or {}
+    expected_current = json.loads(r'''{{ traefik_restore_current | to_json }}''')
+    inspected = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
+    current = json.loads(inspected.stdout)[0] if inspected.returncode == 0 else None
+    if (current or {}).get("Id") != (expected_current or {}).get("Id"):
+        raise RuntimeError("runtime_changed_before_restore")
+
+    subprocess.run(["docker", "rm", "-f", name], check=False,
+                   capture_output=True, text=True)
+    create = ["docker", "create", "--name", name]
+    restart = host_config.get("RestartPolicy") or {}
+    restart_name = restart.get("Name") or "no"
+    if restart_name != "no":
+        value = restart_name
+        retries = restart.get("MaximumRetryCount")
+        if restart_name == "on-failure" and retries:
+            value = f"{restart_name}:{retries}"
+        create.extend(["--restart", value])
+    network_mode = host_config.get("NetworkMode")
+    if network_mode and network_mode != "default":
+        create.extend(["--network", network_mode])
+    if config.get("WorkingDir"):
+        create.extend(["--workdir", config["WorkingDir"]])
+    if config.get("User"):
+        create.extend(["--user", config["User"]])
+    entrypoint = config.get("Entrypoint") or []
+    if entrypoint:
+        create.extend(["--entrypoint", entrypoint[0]])
+    for value in config.get("Env") or []:
+        create.extend(["--env", value])
+    for key, value in sorted((config.get("Labels") or {}).items()):
+        create.extend(["--label", f"{key}={value}"])
+    for bind in host_config.get("Binds") or []:
+        create.extend(["--volume", bind])
+    for key, bindings in sorted((host_config.get("PortBindings") or {}).items()):
+        if not isinstance(bindings, list):
+            raise RuntimeError("prior_port_bindings_invalid")
+        port, protocol = key.split("/", 1)
+        for binding in bindings:
+            host_ip = str(binding.get("HostIp") or "")
+            host_port = str(binding.get("HostPort") or "")
+            if ":" in host_ip and not host_ip.startswith("["):
+                host_ip = f"[{host_ip}]"
+            value = f"{host_ip}:{host_port}:{port}/{protocol}" if host_ip else f"{host_port}:{port}/{protocol}"
+            create.extend(["--publish", value])
+    image = config.get("Image")
+    if not isinstance(image, str) or not image:
+        raise RuntimeError("prior_image_invalid")
+    create.append(image)
+    command = config.get("Cmd")
+    if isinstance(command, list):
+        create.extend(str(item) for item in command)
+    elif isinstance(command, str) and command:
+        create.append(command)
+    subprocess.run(create, check=True, capture_output=True, text=True)
+    prior_status = (prior.get("State") or {}).get("Status")
+    if prior_status in ("running", "paused", "exited"):
+        subprocess.run(["docker", "start", name], check=True,
+                       capture_output=True, text=True)
+        if prior_status != "running":
+            subprocess.run(["docker", "pause" if prior_status == "paused" else "stop", name],
+                           check=True, capture_output=True, text=True)
+
+    current = json.loads(
+        subprocess.run(["docker", "inspect", name], check=True,
+                       capture_output=True, text=True).stdout
+    )[0]
+    current_config = current.get("Config") or {}
+    current_host = current.get("HostConfig") or {}
+    checks = {
+        "image": current_config.get("Image") == config.get("Image"),
+        "command": current_config.get("Cmd") == config.get("Cmd"),
+        "entrypoint": current_config.get("Entrypoint") == config.get("Entrypoint"),
+        "labels": current_config.get("Labels") == config.get("Labels"),
+        "network": current_host.get("NetworkMode") == host_config.get("NetworkMode"),
+        "restart": current_host.get("RestartPolicy") == host_config.get("RestartPolicy"),
+        "binds": sorted(current_host.get("Binds") or []) == sorted(host_config.get("Binds") or []),
+        "environment": current_config.get("Env") == config.get("Env"),
+        "user": current_config.get("User") == config.get("User"),
+        "workdir": current_config.get("WorkingDir") == config.get("WorkingDir"),
+        "ports": current_host.get("PortBindings") == host_config.get("PortBindings"),
+        "status": (current.get("State") or {}).get("Status") == (prior.get("State") or {}).get("Status"),
+    }
+    if not all(checks.values()):
+        raise RuntimeError("prior_runtime_restore_mismatch:" + json.dumps(checks, sort_keys=True))
+    PY
+  args:
+    executable: /bin/sh
+  register: traefik_restore_result
+  changed_when: true
+  failed_when: traefik_restore_result.rc != 0
+  when:
+    - traefik_replacement_started
+    - traefik_prior_runtime_present
+    - traefik_restore_current is none or traefik_restore_current.Id != traefik_prior_runtime.Id
+  no_log: true
+
+- name: Remove failed fresh Traefik replacement
+  shell: |
+    python3 - <<'PY'
+    import json
+    import subprocess
+
+    name = {{ traefik_container_name | to_json }}
+    expected = json.loads(r'''{{ traefik_restore_current | to_json }}''')
+    inspected = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
+    current = json.loads(inspected.stdout)[0] if inspected.returncode == 0 else None
+    if (current or {}).get("Id") != (expected or {}).get("Id"):
+        raise RuntimeError("runtime_changed_before_cleanup")
+    if current is not None:
+        subprocess.run(["docker", "rm", "-f", name], check=True, capture_output=True)
+    if subprocess.run(["docker", "inspect", name], capture_output=True).returncode == 0:
+        raise RuntimeError("failed_fresh_traefik_still_present")
+    PY
+  args:
+    executable: /bin/sh
+  register: traefik_fresh_cleanup_result
+  changed_when: true
+  failed_when: traefik_fresh_cleanup_result.rc != 0
+  when:
+    - traefik_replacement_started
+    - not traefik_prior_runtime_present
+  no_log: true
+
+- name: Mark exact runtime restoration complete
+  set_fact:
+    traefik_runtime_restored: true
+  no_log: true

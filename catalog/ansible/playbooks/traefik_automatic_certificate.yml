@@ -7,126 +7,14 @@
     traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
     traefik_certificate_dir: /etc/traefik/certificates/opsctl
     traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
+    traefik_acme_dir: /var/lib/traefik
+    dns_challenge_broker_url: "{{ automatic_certificate_profile.broker_url | default('') }}"
+    dns_challenge_token_source_file: /var/run/opsctl/file-secret/dns-challenge-token
+    dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('') }}"
   pre_tasks:
     - name: Skip automatic certificate mutation in simulation
       ansible.builtin.meta: end_play
       when: simulate | default(false)
   tasks:
-    - name: Validate automatic certificate execution input
-      ansible.builtin.assert:
-        that:
-          - automatic_certificate_request is mapping
-          - automatic_certificate_profile is mapping
-          - traefik_certificate_dir is defined
-          - traefik_dynamic_dir is defined
-          - traefik_acme_state_dir is defined
-          - traefik_acme_state_dir is match('^/[A-Za-z0-9_./-]+$')
-        fail_msg: Automatic certificate execution input is invalid
-
-    - name: Check gateway certificate tooling
-      ansible.builtin.command:
-        argv: [python3, -c, 'import cryptography, yaml']
-      register: automatic_tooling
-      changed_when: false
-      failed_when: false
-
-    - name: Install missing gateway certificate tooling
-      ansible.builtin.apt:
-        name: [python3-cryptography, python3-yaml]
-        state: present
-        update_cache: false
-      when: automatic_tooling.rc != 0
-
-    - name: Ensure private automatic certificate state
-      ansible.builtin.file:
-        path: "{{ traefik_acme_state_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: '0700'
-
-    - name: Ensure private persistent automatic certificate runtime
-      ansible.builtin.file:
-        path: "{{ traefik_acme_state_dir }}/runtime"
-        state: directory
-        owner: root
-        group: root
-        mode: '0700'
-
-    - name: Run automatic certificate action
-      block:
-        - name: Deliver exact official automatic certificate helpers
-          ansible.builtin.copy:
-            src: "../scripts/{{ item }}"
-            dest: "{{ traefik_acme_state_dir }}/runtime/{{ item }}"
-            owner: root
-            group: root
-            mode: '0600'
-          loop: [traefik_automatic_certificate.py, traefik_certificate_selection.py]
-
-        - name: Execute local issuer and selected-file activation
-          ansible.builtin.command:
-            argv: [python3, "{{ traefik_acme_state_dir }}/runtime/traefik_automatic_certificate.py"]
-            stdin: >-
-              {{ {'profile': automatic_certificate_profile,
-                  'request': automatic_certificate_request} | to_json }}
-          environment:
-            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-          register: automatic_action
-          failed_when: false
-          no_log: true
-
-        - name: Report bounded automatic certificate failure
-          ansible.builtin.assert:
-            that: automatic_action.rc == 0
-            fail_msg: "{{ automatic_action.stderr | default('Automatic certificate action failed') }}"
-
-        - name: Install gateway-local automatic renewal service
-          ansible.builtin.copy:
-            dest: /etc/systemd/system/opsctl-certificate-renewal.service
-            owner: root
-            group: root
-            mode: '0644'
-            content: |
-              [Unit]
-              Description=OpsCtl gateway-local automatic certificate renewal
-              Wants=network-online.target
-              After=network-online.target docker.service
-              Requires=docker.service
-
-              [Service]
-              Type=oneshot
-              UMask=0077
-              Environment="OPSCTL_ACME_STATE_DIR={{ traefik_acme_state_dir }}"
-              ExecStart=/usr/bin/python3 "{{ traefik_acme_state_dir }}/runtime/traefik_automatic_certificate.py" renew-due
-
-        - name: Install mandatory automatic renewal timer
-          ansible.builtin.copy:
-            dest: /etc/systemd/system/opsctl-certificate-renewal.timer
-            owner: root
-            group: root
-            mode: '0644'
-            content: |
-              [Unit]
-              Description=OpsCtl automatic certificate due checks
-
-              [Timer]
-              OnCalendar=*-*-* 00,06,12,18:00:00
-              RandomizedDelaySec=30m
-              Persistent=true
-
-              [Install]
-              WantedBy=timers.target
-
-        - name: Enable gateway-owned automatic renewal
-          ansible.builtin.systemd_service:
-            name: opsctl-certificate-renewal.timer
-            daemon_reload: true
-            enabled: true
-            state: started
-
-        - name: Emit sanitized automatic certificate receipt
-          ansible.builtin.debug:
-            msg: "{{ automatic_action.stdout }}"
+    - name: Execute shared automatic certificate tasks
+      ansible.builtin.include_tasks: ../tasks/traefik_automatic_certificate.yml

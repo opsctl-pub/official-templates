@@ -260,6 +260,7 @@
 - name: Initialize Traefik replacement state
   set_fact:
     traefik_replacement_started: false
+    traefik_runtime_restored: false
   no_log: true
 
 - name: Replace Traefik only when canonical identity differs or forced
@@ -375,114 +376,8 @@
       until: traefik_replacement_health.rc == 0
       no_log: "{{ traefik_gateway_sensitive }}"
   rescue:
-    - name: Restore exact prior Traefik runtime
-      shell: |
-        python3 - <<'PY'
-        import json
-        import subprocess
-
-        prior = json.loads(r'''{{ traefik_prior_runtime | to_json }}''')
-        name = prior.get('Name', '').lstrip('/') or {{ traefik_container_name | to_json }}
-        config = prior.get('Config') or {}
-        host_config = prior.get('HostConfig') or {}
-
-        subprocess.run(["docker", "rm", "-f", name], check=False,
-                       capture_output=True, text=True)
-        create = ["docker", "create", "--name", name]
-        restart = host_config.get("RestartPolicy") or {}
-        restart_name = restart.get("Name") or "no"
-        if restart_name != "no":
-            value = restart_name
-            retries = restart.get("MaximumRetryCount")
-            if restart_name == "on-failure" and retries:
-                value = f"{restart_name}:{retries}"
-            create.extend(["--restart", value])
-        network_mode = host_config.get("NetworkMode")
-        if network_mode and network_mode != "default":
-            create.extend(["--network", network_mode])
-        if config.get("WorkingDir"):
-            create.extend(["--workdir", config["WorkingDir"]])
-        if config.get("User"):
-            create.extend(["--user", config["User"]])
-        entrypoint = config.get("Entrypoint") or []
-        if entrypoint:
-            create.extend(["--entrypoint", entrypoint[0]])
-        for value in config.get("Env") or []:
-            create.extend(["--env", value])
-        for key, value in sorted((config.get("Labels") or {}).items()):
-            create.extend(["--label", f"{key}={value}"])
-        for bind in host_config.get("Binds") or []:
-            create.extend(["--volume", bind])
-        for key, bindings in sorted((host_config.get("PortBindings") or {}).items()):
-            if not isinstance(bindings, list):
-                raise RuntimeError("prior_port_bindings_invalid")
-            port, protocol = key.split("/", 1)
-            for binding in bindings:
-                host_ip = str(binding.get("HostIp") or "")
-                host_port = str(binding.get("HostPort") or "")
-                if ":" in host_ip and not host_ip.startswith("["):
-                    host_ip = f"[{host_ip}]"
-                value = f"{host_ip}:{host_port}:{port}/{protocol}" if host_ip else f"{host_port}:{port}/{protocol}"
-                create.extend(["--publish", value])
-        image = config.get("Image")
-        if not isinstance(image, str) or not image:
-            raise RuntimeError("prior_image_invalid")
-        create.append(image)
-        command = config.get("Cmd")
-        if isinstance(command, list):
-            create.extend(str(item) for item in command)
-        elif isinstance(command, str) and command:
-            create.append(command)
-        subprocess.run(create, check=True, capture_output=True, text=True)
-        subprocess.run(["docker", "start", name], check=True,
-                       capture_output=True, text=True)
-
-        current = json.loads(
-            subprocess.run(["docker", "inspect", name], check=True,
-                           capture_output=True, text=True).stdout
-        )[0]
-        current_config = current.get("Config") or {}
-        current_host = current.get("HostConfig") or {}
-        checks = {
-            "image": current_config.get("Image") == config.get("Image"),
-            "command": current_config.get("Cmd") == config.get("Cmd"),
-            "entrypoint": current_config.get("Entrypoint") == config.get("Entrypoint"),
-            "labels": current_config.get("Labels") == config.get("Labels"),
-            "network": current_host.get("NetworkMode") == host_config.get("NetworkMode"),
-            "restart": current_host.get("RestartPolicy") == host_config.get("RestartPolicy"),
-            "binds": sorted(current_host.get("Binds") or []) == sorted(host_config.get("Binds") or []),
-            "running": (current.get("State") or {}).get("Status") == "running",
-        }
-        if not all(checks.values()):
-            raise RuntimeError("prior_runtime_restore_mismatch:" + json.dumps(checks, sort_keys=True))
-        PY
-      args:
-        executable: /bin/sh
-      register: traefik_restore_result
-      changed_when: true
-      failed_when: traefik_restore_result.rc != 0
-      when:
-        - traefik_replacement_started
-        - traefik_prior_runtime_present
-      no_log: true
-
-    - name: Remove failed fresh Traefik replacement
-      shell: |
-        set -eu
-        docker rm -f "{{ traefik_container_name }}" >/dev/null 2>&1 || true
-        if docker inspect "{{ traefik_container_name }}" >/dev/null 2>&1; then
-          echo "failed_fresh_traefik_still_present" >&2
-          exit 1
-        fi
-      args:
-        executable: /bin/sh
-      register: traefik_fresh_cleanup_result
-      changed_when: true
-      failed_when: traefik_fresh_cleanup_result.rc != 0
-      when:
-        - traefik_replacement_started
-        - not traefik_prior_runtime_present
-      no_log: true
+    - name: Restore managed runtime through the shared restoration owner
+      ansible.builtin.include_tasks: traefik_gateway_runtime_restore.yml
 
     - name: Fail Traefik replacement after restoration attempt
       fail:

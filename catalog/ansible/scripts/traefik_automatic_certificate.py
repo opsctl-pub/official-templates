@@ -221,6 +221,7 @@ class TraefikAutomaticCertificate:
                     if time.monotonic() >= deadline:
                         raise AutomaticCertificateError("Automatic certificate trusted serving verification failed") from None
                     time.sleep(0.2)
+        return hashlib.sha256(leaf).hexdigest()
 
     def serving_context(self):
         """Automatic serving requires the gateway's system Web PKI trust store."""
@@ -283,14 +284,122 @@ class TraefikAutomaticCertificate:
                 atomic_write(directory / "renewal-status.json", json.dumps(status, sort_keys=True).encode())
             return result
 
-    def enroll(self, directory):
-        """Keep scheduler input local, private, and tied to verified activation."""
-        configuration = {
+    def _setup_request(self, request, *, create):
+        """Freeze one Server setup's original selection, never reacquire its CAS."""
+        if (not isinstance(request, dict)
+                or set(request) != {"identity", "operation_id", "action", "expected_binding"}
+                or request["action"] != "issue" or request["expected_binding"] is not None):
+            raise AutomaticCertificateError("Server certificate setup request is invalid")
+        identity = request["identity"]
+        if not isinstance(identity, dict) or set(identity) != IDENTITY_FIELDS:
+            raise AutomaticCertificateError("Server certificate setup identity is invalid")
+        validate_owner({**identity, "source": "automatic",
+                        "revision_id": identity["subject"]["id"], "fingerprint_sha256": "0" * 64})
+        if identity["subject"]["type"] != "server":
+            raise AutomaticCertificateError("Server certificate setup requires a Server subject")
+        operation_id = request["operation_id"]
+        if not isinstance(operation_id, str) or str(UUID(operation_id)) != operation_id:
+            raise AutomaticCertificateError("Server certificate setup operation is invalid")
+        self.identity = identity
+        directory = self.state_dir / subject_key(identity["subject"])
+        if create:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        if (directory.resolve() != directory or not directory.is_dir()
+                or directory.stat().st_mode & 0o077 or directory.stat().st_uid != 0):
+            raise AutomaticCertificateError("Server certificate setup layout is invalid")
+        path = directory / ("setup-" + operation_id + ".json")
+        input_digest = digest({"request": request, "profile": self.profile})
+        with locked(directory / ".issuer.lock"):
+            if path.exists() or path.is_symlink():
+                frozen = private_json(path)
+            elif create:
+                observed = self.selection.observe({"identity": identity, "operation_id": operation_id})
+                observed = observed["automatic_certificate_selection"]
+                frozen = {
+                    "request": {**request, "expected_binding": observed["expected_binding"]},
+                    "selection_digest": observed["digest"], "input_digest": input_digest,
+                }
+                atomic_write(path, json.dumps(frozen, sort_keys=True).encode())
+            else:
+                raise AutomaticCertificateError("Server certificate setup snapshot is unavailable")
+            if (not isinstance(frozen, dict)
+                    or set(frozen) != {"request", "selection_digest", "input_digest"}
+                    or frozen["input_digest"] != input_digest):
+                raise AutomaticCertificateError("Server certificate setup replay identity changed")
+            original = frozen["request"]
+            if (not isinstance(original, dict) or set(original) != set(request)
+                    or any(original[field] != request[field] for field in set(request) - {"expected_binding"})
+                    or (original["expected_binding"] is not None and (
+                        not isinstance(original["expected_binding"], str)
+                        or not original["expected_binding"].isascii()
+                        or len(original["expected_binding"]) > 65536))
+                    or frozen["selection_digest"] != digest({
+                        "identity": identity, "operation_id": operation_id,
+                        "expected_binding": original["expected_binding"],
+                    })):
+                raise AutomaticCertificateError("Server certificate setup snapshot changed")
+        return directory, original
+
+    def setup(self, request):
+        """Use normal issuance/activation/enrollment with the frozen root request."""
+        _, original = self._setup_request(request, create=True)
+        return self.run(original)
+
+    def verify_setup(self, request):
+        """Observe active selection and serving without issuance or reactivation."""
+        directory, original = self._setup_request(request, create=False)
+        with locked(directory / ".issuer.lock"), self.selection.locked():
+            self.assert_file_serving()
+            record = private_json(directory / (original["operation_id"] + ".json"))
+            if (not isinstance(record, dict) or set(record) != {"request_digest", "owner", "status"}
+                    or record["status"] != "active"
+                    or record["request_digest"] != digest({"request": original, "profile": self.profile})):
+                raise AutomaticCertificateError("Server certificate setup receipt is invalid")
+            owner = record["owner"]
+            validate_owner(owner)
+            if (owner["source"] != "automatic"
+                    or any(owner[field] != self.identity[field] for field in IDENTITY_FIELDS)):
+                raise AutomaticCertificateError("Server certificate setup receipt owner changed")
+            revision = self.selection.certificate_dir / ("automatic-" + subject_key(self.identity["subject"])) / owner["revision_id"]
+            observed = self.selection.observe({"identity": self.identity, "operation_id": original["operation_id"]})
+            expected = self.selection.document(owner, revision / "tls.crt", revision / "tls.key").decode("ascii")
+            if observed["automatic_certificate_selection"]["expected_binding"] != expected:
+                raise AutomaticCertificateError("Server certificate setup selection changed")
+            if private_json(directory / "renewal.json") != self._renewal_configuration():
+                raise AutomaticCertificateError("Server certificate renewal enrollment changed")
+            for command, expected_state in (("is-enabled", "enabled"), ("is-active", "active")):
+                state = subprocess.run(["systemctl", command, "opsctl-certificate-renewal.timer"],
+                                       capture_output=True, timeout=30)
+                if state.returncode or state.stdout.decode().strip() != expected_state:
+                    raise AutomaticCertificateError("Server certificate renewal timer is unavailable")
+            fingerprint = self.verify_served(owner)
+            leaf = x509.load_pem_x509_certificate((revision / "tls.crt").read_bytes())
+            receipt = {
+                "operation_id": original["operation_id"], "action": original["action"],
+                "owner": owner, "status": "active",
+                "not_after": validity(leaf, "not_valid_after").isoformat(),
+                "challenge_type": self.profile["challenge"],
+            }
+            evidence = {
+                "operation_id": original["operation_id"], "identity": self.identity,
+                "adapter_key": "traefik_acme_dns01" if self.profile["challenge"] == "dns-01" else "traefik_acme_http01",
+                "receipt": receipt, "observed_at": datetime.now(timezone.utc).isoformat(),
+                "trusted": True, "served_fingerprint_sha256": fingerprint,
+            }
+            return {**evidence, "digest": digest(evidence)}
+
+    def _renewal_configuration(self):
+        """Keep enrollment and read-only verification on the same exact contract."""
+        return {
             "identity": self.identity, "profile": self.profile,
             "certificate_dir": str(self.selection.certificate_dir),
             "dynamic_dir": str(self.selection.dynamic_dir),
             "container_name": self.container_name, "http_port": self.http_port,
         }
+
+    def enroll(self, directory):
+        """Keep scheduler input local, private, and tied to verified activation."""
+        configuration = self._renewal_configuration()
         path = directory / "renewal.json"
         previous = private_json(path) if path.exists() else None
         if previous != configuration:
@@ -455,14 +564,18 @@ def main():
         if not renew_all(os.environ["OPSCTL_ACME_STATE_DIR"]):
             raise AutomaticCertificateError("Automatic renewal failed; prior selection preserved")
         return
-    if sys.argv[1:]:
+    if sys.argv[1:] not in ([], ["setup"], ["verify-setup"]):
         raise AutomaticCertificateError("Automatic certificate action is invalid")
     value = json.loads(sys.stdin.buffer.read(131073))
     if not isinstance(value, dict) or set(value) != {"profile", "request"}:
         raise AutomaticCertificateError("Automatic certificate execution input is invalid")
     action = TraefikAutomaticCertificate(os.environ["OPSCTL_CERTIFICATE_DIR"],
         os.environ["OPSCTL_DYNAMIC_DIR"], os.environ["OPSCTL_ACME_STATE_DIR"], value["profile"])
-    result = action.run(value["request"])
+    if sys.argv[1:] == ["verify-setup"]:
+        result = action.verify_setup(value["request"])
+        print("TEMPLATE_OUTPUT_JSON=" + json.dumps({"server_dashboard_certificate": result}, sort_keys=True))
+        return
+    result = action.setup(value["request"]) if sys.argv[1:] == ["setup"] else action.run(value["request"])
     print("TEMPLATE_OUTPUT_JSON=" + json.dumps({"automatic_certificate": result}, sort_keys=True))
 
 

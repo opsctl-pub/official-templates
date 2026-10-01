@@ -12,6 +12,7 @@
     dns_challenge_token_source_file: "/var/run/opsctl/file-secret/dns-challenge-token"
     dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('unavailable') }}"
     traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
+    traefik_acme_state_dir: "/var/lib/opsctl/automatic-certificates"
     acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
     traefik_gateway_target_major: 3
     traefik_gateway_target_version: "3.7.13"
@@ -61,11 +62,13 @@
                         'traefik.enable': 'true',
                         'traefik.http.routers.' + traefik_dashboard_router + '.rule': 'Host(`' ~ traefik_dashboard_host ~ '`)',
                         'traefik.http.routers.' + traefik_dashboard_router + '.entrypoints': 'websecure',
-                        'traefik.http.routers.' + traefik_dashboard_router + '.tls.certresolver': 'letsencrypt'
+                        'traefik.http.routers.' + traefik_dashboard_router + '.tls': 'true',
+                        'traefik.http.routers.' + traefik_dashboard_router + '.service': 'api@internal'
                       },
                       {}
                     )
                 )
+                | combine({'com.opsctl.setup_operation_id': operation_id | string})
                 | combine(
                     (
                       (traefik_dashboard_enabled | default(false))
@@ -101,6 +104,32 @@
             traefik_dns01_broker_url: "{{ dns_challenge_broker_url | default('') }}"
             traefik_dns01_token_file: "{{ dns_challenge_token_file }}"
 
+        - name: Issue and enroll the Server dashboard certificate
+          ansible.builtin.include_tasks: ../tasks/traefik_automatic_certificate.yml
+          vars:
+            automatic_certificate_setup: true
+          when: traefik_dashboard_enabled | default(false)
+
+        - name: Verify fresh Server dashboard serving and renewal
+          ansible.builtin.command:
+            argv: [python3, "{{ traefik_acme_state_dir }}/runtime/traefik_automatic_certificate.py", verify-setup]
+            stdin: >-
+              {{ {'profile': automatic_certificate_profile,
+                  'request': automatic_certificate_request} | to_json }}
+          environment:
+            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
+            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
+          register: dashboard_certificate_verification
+          changed_when: false
+          no_log: true
+          when: traefik_dashboard_enabled | default(false)
+
+        - name: Emit fresh Server dashboard certificate evidence
+          ansible.builtin.debug:
+            msg: "{{ dashboard_certificate_verification.stdout }}"
+          when: traefik_dashboard_enabled | default(false)
+
         - name: OPERATION_STEP traefik:ready
           shell: |
             printf 'OPERATION_STEP={"name":"traefik:ready","status":"completed","metadata":{"display_name":"Verify Traefik proxy"}}\n'
@@ -113,6 +142,12 @@
           args:
             executable: /bin/sh
       rescue:
+        - name: Restore prior managed runtime after later setup failure
+          ansible.builtin.include_tasks: ../tasks/traefik_gateway_runtime_restore.yml
+          when:
+            - traefik_replacement_started | default(false)
+            - not (traefik_runtime_restored | default(false))
+
         - name: OPERATION_STEP traefik:failure
           shell: |
             printf 'OPERATION_STEP={"name":"traefik:failure","status":"failed","metadata":{"display_name":"Traefik proxy failed"}}\n'
@@ -125,4 +160,4 @@
 
         - name: Fail Traefik proxy converge
           fail:
-            msg: "Traefik proxy converge failed"
+            msg: "Traefik proxy converge failed; certificate selection/enrollment may have changed and requires observation"
