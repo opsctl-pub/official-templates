@@ -54,7 +54,7 @@ class NativeOriginCertificate:
                 raise ValueError("Native certificate layout is unavailable")
         self.base = certificate_dir / ("native-" + identity["deployment_id"])
         self.selection = TraefikCertificateSelection(certificate_dir, dynamic_dir)
-        self.binding = dynamic_dir / ("certificate-" + identity["deployment_id"] + ".yml")
+        self.binding = self.selection.binding(self.selection_owner(identity["revision_id"], "0" * 64))
         if self.base.is_symlink():
             raise ValueError("Native certificate layout is invalid")
         self.base.mkdir(mode=0o700, exist_ok=True)
@@ -134,8 +134,9 @@ class NativeOriginCertificate:
     def selection_owner(self, revision_id, fingerprint):
         return {
             **{field: self.identity[field] for field in (
-                "organization_id", "deployment_id", "gateway_id", "server_id", "route_hosts",
+                "organization_id", "gateway_id", "server_id", "route_hosts",
             )},
+            "subject": {"type": "deployment", "id": self.identity["deployment_id"]},
             "revision_id": revision_id, "source": "native", "fingerprint_sha256": fingerprint,
         }
 

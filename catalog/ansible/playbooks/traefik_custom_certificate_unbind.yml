@@ -7,7 +7,7 @@
     traefik_container_name: "traefik"
     traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
-    binding_file: "{{ traefik_dynamic_dir }}/certificate-{{ deployment_id }}.yml"
+    binding_file: "{{ traefik_dynamic_dir }}/certificate-deployment-{{ deployment_id }}.yml"
   pre_tasks:
     - name: Validate custom certificate unbind identity
       ansible.builtin.assert:
@@ -69,7 +69,7 @@
         certificate_selection_request:
           owner:
             organization_id: "{{ org_id }}"
-            deployment_id: "{{ deployment_id }}"
+            subject: {type: deployment, id: "{{ deployment_id }}"}
             gateway_id: "{{ gateway_id }}"
             server_id: "{{ server_id }}"
             revision_id: "{{ revision_id }}"

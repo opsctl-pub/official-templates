@@ -12,7 +12,7 @@
     revision_dir: "{{ material_dir }}/revision-{{ revision_id }}"
     certificate_file: "{{ revision_dir }}/tls.crt"
     private_key_file: "{{ revision_dir }}/tls.key"
-    binding_file: "{{ traefik_dynamic_dir }}/certificate-{{ deployment_id }}.yml"
+    binding_file: "{{ traefik_dynamic_dir }}/certificate-deployment-{{ deployment_id }}.yml"
   pre_tasks:
     - name: Validate custom certificate installation identity
       ansible.builtin.assert:
@@ -223,7 +223,7 @@
         certificate_selection_request:
           owner:
             organization_id: "{{ org_id }}"
-            deployment_id: "{{ deployment_id }}"
+            subject: {type: deployment, id: "{{ deployment_id }}"}
             gateway_id: "{{ gateway_id }}"
             server_id: "{{ server_id }}"
             revision_id: "{{ revision_id }}"

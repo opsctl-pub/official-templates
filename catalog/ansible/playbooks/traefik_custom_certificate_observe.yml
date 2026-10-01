@@ -7,7 +7,7 @@
     traefik_container_name: "traefik"
     traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
-    binding_file: "{{ traefik_dynamic_dir }}/certificate-{{ deployment_id }}.yml"
+    binding_file: "{{ traefik_dynamic_dir }}/certificate-deployment-{{ deployment_id }}.yml"
   pre_tasks:
     - name: Validate custom certificate observation identity
       ansible.builtin.assert:

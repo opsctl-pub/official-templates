@@ -21,7 +21,7 @@ import yaml
 
 HEADER = "# opsctl-certificate-selection "
 OWNER_FIELDS = {
-    "organization_id", "deployment_id", "gateway_id", "server_id", "revision_id",
+    "organization_id", "subject", "gateway_id", "server_id", "revision_id",
     "source", "route_hosts", "fingerprint_sha256",
 }
 
@@ -56,12 +56,29 @@ def sync_directory(path):
         os.close(descriptor)
 
 
+def subject_key(subject):
+    """Keep the two real certificate subjects distinct on a shared Server."""
+    if (not isinstance(subject, dict) or set(subject) != {"type", "id"}
+            or subject["type"] not in {"deployment", "server"}
+            or not isinstance(subject["id"], str)
+            or str(UUID(subject["id"])) != subject["id"]):
+        raise CertificateSelectionError("Certificate subject is invalid")
+    return subject["type"] + "-" + subject["id"]
+
+
 def validate_owner(owner):
     if not isinstance(owner, dict) or set(owner) != OWNER_FIELDS:
         raise CertificateSelectionError("Certificate selection identity is invalid")
-    for field in OWNER_FIELDS - {"source", "route_hosts", "fingerprint_sha256"}:
+    for field in ("organization_id", "server_id", "revision_id"):
         if not isinstance(owner[field], str) or str(UUID(owner[field])) != owner[field]:
             raise CertificateSelectionError("Certificate selection identity is invalid")
+    subject_key(owner["subject"])
+    if owner["subject"]["type"] == "server":
+        if owner["subject"]["id"] != owner["server_id"] or owner["gateway_id"] is not None:
+            raise CertificateSelectionError("Server certificate ownership is invalid")
+    elif (not isinstance(owner["gateway_id"], str)
+            or str(UUID(owner["gateway_id"])) != owner["gateway_id"]):
+        raise CertificateSelectionError("Deployment certificate gateway identity is invalid")
     if owner["source"] not in {"automatic", "native", "custom"}:
         raise CertificateSelectionError("Certificate selection source is invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", owner["fingerprint_sha256"]):
@@ -103,7 +120,7 @@ def validity(leaf, field):
 
 
 class TraefikCertificateSelection:
-    """One atomic owner record per Deployment; one lock for the loaded TLS pool."""
+    """One atomic record per subject; one Server-wide lock for the loaded TLS pool."""
 
     def __init__(self, certificate_dir, dynamic_dir):
         self.certificate_dir = Path(certificate_dir)
@@ -124,7 +141,7 @@ class TraefikCertificateSelection:
 
     def binding(self, owner):
         validate_owner(owner)
-        return self.dynamic_dir / f"certificate-{owner['deployment_id']}.yml"
+        return self.dynamic_dir / f"certificate-{subject_key(owner['subject'])}.yml"
 
     def material(self, owner, certificate_file, private_key_file, require_current_validity=True):
         validate_owner(owner)

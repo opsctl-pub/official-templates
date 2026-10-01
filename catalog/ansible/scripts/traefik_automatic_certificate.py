@@ -20,12 +20,12 @@ from cryptography.hazmat.primitives import hashes
 
 from traefik_certificate_selection import (
     CertificateSelectionError, TraefikCertificateSelection, atomic_write,
-    sync_directory, validate_owner, validity,
+    subject_key, sync_directory, validate_owner, validity,
 )
 
 
 LEGO_IMAGE = "goacme/lego@sha256:1944e8c36055beec47c7de6f15202b41128be75eea0ffa257f0c14d93c5155fd"
-IDENTITY_FIELDS = {"organization_id", "deployment_id", "gateway_id", "server_id", "route_hosts"}
+IDENTITY_FIELDS = {"organization_id", "subject", "gateway_id", "server_id", "route_hosts"}
 PROFILE_FIELDS = {"email", "server_url", "challenge", "broker_url", "token_file"}
 
 
@@ -109,7 +109,8 @@ class TraefikAutomaticCertificate:
         command = ["docker", "run", "--rm", "--name", name, "--network", "host",
                    "--label", "com.opsctl.component=automatic_certificate",
                    "--label", "com.opsctl.org_id=" + self.identity["organization_id"],
-                   "--label", "com.opsctl.deployment_id=" + self.identity["deployment_id"],
+                   "--label", "com.opsctl.subject_type=" + self.identity["subject"]["type"],
+                   "--label", "com.opsctl.subject_id=" + self.identity["subject"]["id"],
                    "--label", "com.opsctl.operation_id=" + operation_id,
                    "--volume", f"{directory}:{directory}"]
         token = self.profile["token_file"]
@@ -140,7 +141,8 @@ class TraefikAutomaticCertificate:
         labels = json.loads(result.stdout)[0].get("Config", {}).get("Labels") or {}
         expected = {"com.opsctl.component": "automatic_certificate",
                     "com.opsctl.org_id": self.identity["organization_id"],
-                    "com.opsctl.deployment_id": self.identity["deployment_id"],
+                    "com.opsctl.subject_type": self.identity["subject"]["type"],
+                    "com.opsctl.subject_id": self.identity["subject"]["id"],
                     "com.opsctl.operation_id": operation_id}
         if any(labels.get(key) != value for key, value in expected.items()):
             raise AutomaticCertificateError("Automatic certificate client ownership changed")
@@ -226,7 +228,7 @@ class TraefikAutomaticCertificate:
         fingerprint = leaf.fingerprint(hashes.SHA256()).hex()
         owner = {**self.identity, "source": "automatic", "fingerprint_sha256": fingerprint,
                  "revision_id": str(uuid5(NAMESPACE_URL, "opsctl:automatic:" + fingerprint))}
-        parent = self.selection.certificate_dir / ("automatic-" + self.identity["deployment_id"])
+        parent = self.selection.certificate_dir / ("automatic-" + subject_key(self.identity["subject"]))
         revision = parent / owner["revision_id"]
         if parent.resolve() != parent or revision.resolve() != revision:
             raise AutomaticCertificateError("Automatic certificate revision layout is invalid")
@@ -248,7 +250,7 @@ class TraefikAutomaticCertificate:
         if not isinstance(identity, dict) or set(identity) != IDENTITY_FIELDS:
             raise AutomaticCertificateError("Automatic certificate identity is invalid")
         self.identity = identity
-        validate_owner({**identity, "source": "automatic", "revision_id": identity["deployment_id"],
+        validate_owner({**identity, "source": "automatic", "revision_id": identity["subject"]["id"],
                         "fingerprint_sha256": "0" * 64})
         operation_id = request["operation_id"]
         if not isinstance(operation_id, str) or str(UUID(operation_id)) != operation_id:
@@ -260,7 +262,7 @@ class TraefikAutomaticCertificate:
         if expected is not None and (not isinstance(expected, str) or len(expected) > 65536):
             raise AutomaticCertificateError("Automatic certificate prior binding is invalid")
         expected = expected.encode("ascii") if expected is not None else None
-        directory = self.state_dir / identity["deployment_id"]
+        directory = self.state_dir / subject_key(identity["subject"])
         directory.mkdir(mode=0o700, exist_ok=True)
         if directory.resolve() != directory or directory.stat().st_mode & 0o077:
             raise AutomaticCertificateError("Automatic certificate owner layout is invalid")
@@ -293,7 +295,7 @@ class TraefikAutomaticCertificate:
             if not isinstance(identity, dict) or set(identity) != IDENTITY_FIELDS:
                 raise AutomaticCertificateError("Automatic renewal identity is invalid")
             self.identity = identity
-            owner = {**identity, "source": "automatic", "revision_id": identity["deployment_id"],
+            owner = {**identity, "source": "automatic", "revision_id": identity["subject"]["id"],
                      "fingerprint_sha256": "0" * 64}
             binding = self.selection.binding(owner)
             pending = directory / "renewal-request.json"
@@ -343,7 +345,7 @@ class TraefikAutomaticCertificate:
             validate_owner(owner)
             if owner["source"] != "automatic" or any(owner[field] != self.identity[field] for field in IDENTITY_FIELDS):
                 raise AutomaticCertificateError("Automatic certificate replay owner changed")
-            revision = self.selection.certificate_dir / ("automatic-" + self.identity["deployment_id"]) / owner["revision_id"]
+            revision = self.selection.certificate_dir / ("automatic-" + subject_key(self.identity["subject"])) / owner["revision_id"]
             desired = self.selection.document(owner, revision / "tls.crt", revision / "tls.key")
             if current not in (expected, desired):
                 raise AutomaticCertificateError("Automatic certificate selection changed after issuance")
@@ -393,7 +395,8 @@ def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
     failed = False
     for directory in sorted(root.iterdir()):
         try:
-            if str(UUID(directory.name)) != directory.name:
+            kind, _, identifier = directory.name.partition("-")
+            if kind not in {"deployment", "server"} or str(UUID(identifier)) != identifier:
                 continue
         except ValueError:
             continue
@@ -410,7 +413,7 @@ def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
             if (not isinstance(configuration, dict) or set(configuration) != {
                     "identity", "profile", "certificate_dir", "dynamic_dir", "container_name", "http_port"}
                     or not isinstance(configuration["identity"], dict)
-                    or configuration["identity"].get("deployment_id") != directory.name
+                    or subject_key(configuration["identity"].get("subject")) != directory.name
                     or not isinstance(configuration["container_name"], str)
                     or not configuration["container_name"]
                     or type(configuration["http_port"]) is not int
@@ -431,7 +434,7 @@ def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
         except OSError:
             status = {"observed_at": status["observed_at"], "status": "renewal_failed"}
             failed = True
-        print(json.dumps({"deployment_id": directory.name, **status}, sort_keys=True), flush=True)
+        print(json.dumps({"subject": {"type": kind, "id": identifier}, **status}, sort_keys=True), flush=True)
     return not failed
 
 
