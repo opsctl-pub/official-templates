@@ -6,6 +6,11 @@
       - (org_id | string | trim | length) > 0
       - traefik_command_args is sequence
       - traefik_command_args is not string
+      - (traefik_command_args | select('string') | list | length) == (traefik_command_args | length)
+      - >-
+        (traefik_command_args | select('match',
+        '(?i)^--(?:certificatesresolvers(?:[.=]|$)|configfile(?:=|$)|providers\.file\.filename(?:=|$)|entrypoints\.[^.]+\.http\.redirections\.)')
+        | list | length) == 0
       - traefik_gateway_policy_labels is mapping
       - >-
         ((traefik_gateway_policy_labels.keys() | list)
@@ -17,43 +22,11 @@
         | length) == 0
       - traefik_gateway_force_recreate is boolean
       - traefik_gateway_sensitive is boolean
-      - (traefik_dns01_enabled | default(false)) is boolean
-      - not (traefik_dns01_enabled | default(false)) or traefik_dns01_broker_url is match('^https://[^/?#@]+/api/v1/dns-challenge$')
-      - not (traefik_dns01_enabled | default(false)) or traefik_dns01_token_file is match('^/var/lib/traefik/broker-secrets/token-[0-9a-f-]{36}$')
-      - not (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in traefik_command_args
-      - not (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in traefik_command_args
-      - (traefik_dns01_enabled | default(false)) or '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' not in traefik_command_args
       - traefik_gateway_target_major == 3
       - traefik_gateway_target_version == '3.7.13'
       - traefik_image is match('^traefik@sha256:[0-9a-f]{64}$')
     fail_msg: "Managed Traefik runtime inputs are invalid"
   no_log: "{{ traefik_gateway_sensitive }}"
-
-- name: Build DNS challenge container environment
-  ansible.builtin.set_fact:
-    traefik_dns01_env: >-
-      {{
-        {
-          'HTTPREQ_ENDPOINT': traefik_dns01_broker_url,
-          'HTTPREQ_USERNAME': 'opsctl',
-          'HTTPREQ_PASSWORD_FILE': traefik_dns01_token_file,
-          'HTTPREQ_HTTP_TIMEOUT': '120'
-        }
-        if (traefik_dns01_enabled | default(false))
-        else {}
-      }}
-    traefik_dns01_expected_env: >-
-      {{
-        [
-          'HTTPREQ_ENDPOINT=' ~ traefik_dns01_broker_url,
-          'HTTPREQ_USERNAME=opsctl',
-          'HTTPREQ_PASSWORD_FILE=' ~ traefik_dns01_token_file,
-          'HTTPREQ_HTTP_TIMEOUT=120'
-        ] | sort
-        if (traefik_dns01_enabled | default(false))
-        else []
-      }}
-  no_log: true
 
 - name: Build managed Traefik identity
   set_fact:
@@ -66,10 +39,6 @@
         }
         | combine(traefik_gateway_policy_labels)
       }}
-    traefik_legacy_redirect_args:
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
-      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
   no_log: "{{ traefik_gateway_sensitive }}"
 
 - name: Ensure Docker packages present
@@ -91,12 +60,6 @@
     state: directory
     mode: "0755"
 
-- name: Ensure Traefik storage directory exists
-  file:
-    path: "{{ traefik_acme_dir }}"
-    state: directory
-    mode: "0755"
-
 - name: Ensure Traefik certificate directory exists
   file:
     path: "{{ traefik_certificate_dir }}"
@@ -104,26 +67,6 @@
     owner: root
     group: root
     mode: "0700"
-
-- name: Inspect Traefik ACME file without changing it
-  stat:
-    path: "{{ traefik_acme_dir }}/acme.json"
-  register: traefik_acme_file
-  no_log: true
-
-- name: Create missing Traefik ACME file
-  file:
-    path: "{{ traefik_acme_dir }}/acme.json"
-    state: touch
-    mode: "0600"
-  when: not traefik_acme_file.stat.exists
-
-- name: Refuse unsafe Traefik ACME file mode
-  assert:
-    that:
-      - traefik_acme_file.stat.get('mode', '') == '0600' or not traefik_acme_file.stat.exists
-    fail_msg: "Existing Traefik ACME file mode is not the canonical 0600 mode"
-  no_log: true
 
 - name: Verify immutable target Traefik image and binary
   shell: |
@@ -270,10 +213,14 @@
         )
         and (traefik_command_args | difference(existing_traefik_cmd) | length) == 0
         and (
-          (existing_traefik.Config.Env | default([]) | select('match', '^HTTPREQ_') | list | sort)
-          == traefik_dns01_expected_env
+          (existing_traefik.Config.Env | default([])
+          | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')
+          | list | length) == 0
         )
-        and (traefik_legacy_redirect_args | intersect(existing_traefik_cmd) | length) == 0
+        and (existing_traefik_cmd | select('match',
+          '(?i)^--(?:certificatesresolvers(?:[.=]|$)|configfile(?:=|$)|providers\.file\.filename(?:=|$)|entrypoints\.[^.]+\.http\.redirections\.)')
+          | list | length) == 0
+        and (existing_traefik_mounts | length) == 3
         and (
           existing_traefik_mounts
           | selectattr('Destination', 'equalto', '/var/run/docker.sock')
@@ -285,13 +232,6 @@
           existing_traefik_mounts
           | selectattr('Destination', 'equalto', traefik_dynamic_dir)
           | selectattr('Source', 'equalto', traefik_dynamic_dir)
-          | selectattr('RW', 'sameas', true)
-          | list | length
-        ) == 1
-        and (
-          existing_traefik_mounts
-          | selectattr('Destination', 'equalto', traefik_acme_dir)
-          | selectattr('Source', 'equalto', traefik_acme_dir)
           | selectattr('RW', 'sameas', true)
           | list | length
         ) == 1
@@ -341,10 +281,8 @@
         volumes:
           - "/var/run/docker.sock:/var/run/docker.sock:ro"
           - "{{ traefik_dynamic_dir }}:{{ traefik_dynamic_dir }}"
-          - "{{ traefik_acme_dir }}:{{ traefik_acme_dir }}"
           - "{{ traefik_certificate_dir }}:{{ traefik_certificate_dir }}:ro"
         command: "{{ traefik_command_args }}"
-        env: "{{ traefik_dns01_env }}"
         labels: "{{ traefik_managed_labels }}"
         pull: false
       no_log: "{{ traefik_gateway_sensitive }}"
@@ -393,8 +331,13 @@
             | length) == 0
           - >-
             (traefik_replacement_details.Config.Env | default([])
-            | select('match', '^HTTPREQ_') | list | sort)
-            == traefik_dns01_expected_env
+            | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')
+            | list | length) == 0
+          - >-
+            (traefik_replacement_details.Config.Cmd | select('match',
+            '(?i)^--(?:certificatesresolvers(?:[.=]|$)|configfile(?:=|$)|providers\.file\.filename(?:=|$)|entrypoints\.[^.]+\.http\.redirections\.)')
+            | list | length) == 0
+          - (traefik_replacement_details.Mounts | length) == 3
           - >-
             (traefik_replacement_details.Mounts
             | selectattr('Destination', 'equalto', '/var/run/docker.sock')
@@ -405,12 +348,6 @@
             (traefik_replacement_details.Mounts
             | selectattr('Destination', 'equalto', traefik_dynamic_dir)
             | selectattr('Source', 'equalto', traefik_dynamic_dir)
-            | selectattr('RW', 'sameas', true)
-            | list | length) == 1
-          - >-
-            (traefik_replacement_details.Mounts
-            | selectattr('Destination', 'equalto', traefik_acme_dir)
-            | selectattr('Source', 'equalto', traefik_acme_dir)
             | selectattr('RW', 'sameas', true)
             | list | length) == 1
           - >-
@@ -588,9 +525,13 @@
         | length) == 0
       - >-
         (traefik_container_details.Config.Env | default([])
-        | select('match', '^HTTPREQ_') | list | sort)
-        == traefik_dns01_expected_env
-      - (traefik_legacy_redirect_args | intersect(traefik_container_details.Config.Cmd) | length) == 0
+        | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')
+        | list | length) == 0
+      - >-
+        (traefik_container_details.Config.Cmd | select('match',
+        '(?i)^--(?:certificatesresolvers(?:[.=]|$)|configfile(?:=|$)|providers\.file\.filename(?:=|$)|entrypoints\.[^.]+\.http\.redirections\.)')
+        | list | length) == 0
+      - (traefik_container_details.Mounts | length) == 3
       - >-
         (traefik_container_details.Mounts
         | selectattr('Destination', 'equalto', '/var/run/docker.sock')
@@ -601,12 +542,6 @@
         (traefik_container_details.Mounts
         | selectattr('Destination', 'equalto', traefik_dynamic_dir)
         | selectattr('Source', 'equalto', traefik_dynamic_dir)
-        | selectattr('RW', 'sameas', true)
-        | list | length) == 1
-      - >-
-        (traefik_container_details.Mounts
-        | selectattr('Destination', 'equalto', traefik_acme_dir)
-        | selectattr('Source', 'equalto', traefik_acme_dir)
         | selectattr('RW', 'sameas', true)
         | list | length) == 1
       - >-
