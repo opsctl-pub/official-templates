@@ -11,8 +11,9 @@ import ssl
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
-from uuid import UUID, NAMESPACE_URL, uuid5
+from uuid import UUID, NAMESPACE_URL, uuid4, uuid5
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
@@ -66,7 +67,9 @@ class TraefikAutomaticCertificate:
         if not isinstance(profile, dict) or set(profile) != PROFILE_FIELDS:
             raise AutomaticCertificateError("Automatic certificate profile is invalid")
         if (not isinstance(profile["email"], str) or "@" not in profile["email"]
-                or len(profile["email"]) > 254 or profile["challenge"] not in {"http-01", "dns-01"}):
+                or profile["email"] != profile["email"].strip()
+                or not 3 <= len(profile["email"]) <= 320
+                or profile["challenge"] not in {"http-01", "dns-01"}):
             raise AutomaticCertificateError("Automatic certificate profile is invalid")
         validate_url(profile["server_url"])
         if profile["challenge"] == "dns-01":
@@ -262,7 +265,64 @@ class TraefikAutomaticCertificate:
         if directory.resolve() != directory or directory.stat().st_mode & 0o077:
             raise AutomaticCertificateError("Automatic certificate owner layout is invalid")
         with locked(directory / ".issuer.lock"):
-            return self._run_locked(directory, operation_id, action, request, expected)
+            result = self._run_locked(directory, operation_id, action, request, expected)
+            if action != "renew_due":
+                self.enroll(directory)
+            return result
+
+    def enroll(self, directory):
+        """Keep scheduler input local, private, and tied to verified activation."""
+        configuration = {
+            "identity": self.identity, "profile": self.profile,
+            "certificate_dir": str(self.selection.certificate_dir),
+            "dynamic_dir": str(self.selection.dynamic_dir),
+            "container_name": self.container_name, "http_port": self.http_port,
+        }
+        path = directory / "renewal.json"
+        previous = private_json(path) if path.exists() else None
+        if previous != configuration:
+            atomic_write(path, json.dumps(configuration, sort_keys=True).encode())
+        remove_file(directory / "renewal-request.json")
+
+    def renew_scheduled(self, directory, configuration):
+        """A failed due check retains one request; source changes never reacquire TLS."""
+        with locked(directory / ".issuer.lock"):
+            if private_json(directory / "renewal.json") != configuration:
+                raise AutomaticCertificateError("Automatic renewal configuration changed")
+            identity = configuration["identity"]
+            if not isinstance(identity, dict) or set(identity) != IDENTITY_FIELDS:
+                raise AutomaticCertificateError("Automatic renewal identity is invalid")
+            self.identity = identity
+            owner = {**identity, "source": "automatic", "revision_id": identity["deployment_id"],
+                     "fingerprint_sha256": "0" * 64}
+            binding = self.selection.binding(owner)
+            pending = directory / "renewal-request.json"
+            if not binding.exists() and not binding.is_symlink():
+                remove_file(pending)
+                return {"status": "inactive"}
+            observed = self.selection.read(binding, require_current_validity=False)["owner"]
+            if observed["source"] != "automatic":
+                remove_file(pending)
+                return {"status": "inactive"}
+            if any(observed[field] != identity[field] for field in IDENTITY_FIELDS):
+                raise AutomaticCertificateError("Automatic renewal selection identity changed")
+            request = private_json(pending) if pending.exists() else {
+                "identity": identity, "operation_id": str(uuid4()), "action": "renew_due",
+                "expected_binding": binding.read_text(encoding="ascii"),
+            }
+            if (not isinstance(request, dict)
+                    or set(request) != {"identity", "operation_id", "action", "expected_binding"}
+                    or request["identity"] != identity or request["action"] != "renew_due"
+                    or not isinstance(request["operation_id"], str)
+                    or str(UUID(request["operation_id"])) != request["operation_id"]
+                    or not isinstance(request["expected_binding"], str)
+                    or len(request["expected_binding"]) > 65536):
+                raise AutomaticCertificateError("Automatic renewal retry identity is invalid")
+            atomic_write(pending, json.dumps(request, sort_keys=True).encode())
+            result = self._run_locked(directory, request["operation_id"], "renew_due", request,
+                                      request["expected_binding"].encode("ascii"))
+            remove_file(pending)
+            return result
 
     def _run_locked(self, directory, operation_id, action, request, expected):
         self.assert_file_serving()
@@ -309,8 +369,80 @@ class TraefikAutomaticCertificate:
                 "not_after": validity(leaf, "not_valid_after").isoformat(), "challenge_type": self.profile["challenge"]}
 
 
+def private_json(path):
+    """Scheduled configuration and retry evidence are never public or symlinked."""
+    if (path.is_symlink() or path.resolve() != path or not path.is_file()
+            or path.stat().st_mode & 0o077 or path.stat().st_size > 131072):
+        raise AutomaticCertificateError("Automatic renewal record is invalid")
+    return json.loads(path.read_bytes())
+
+
+def remove_file(path):
+    if path.is_symlink():
+        raise AutomaticCertificateError("Automatic renewal record ownership changed")
+    path.unlink(missing_ok=True)
+    sync_directory(path.parent)
+
+
+def renew_all(state_dir, issuer_type=TraefikAutomaticCertificate):
+    """One local timer, isolated per-owner attempts, and sanitized durable outcomes."""
+    root = Path(state_dir)
+    if (not root.is_absolute() or root.resolve() != root or not root.is_dir()
+            or root.stat().st_mode & 0o077):
+        raise AutomaticCertificateError("Automatic renewal state layout is invalid")
+    failed = False
+    for directory in sorted(root.iterdir()):
+        try:
+            if str(UUID(directory.name)) != directory.name:
+                continue
+        except ValueError:
+            continue
+        status = {"observed_at": datetime.now(timezone.utc).isoformat(),
+                  "status": "renewal_failed"}
+        try:
+            if (directory.is_symlink() or not directory.is_dir()
+                    or directory.stat().st_mode & 0o077):
+                raise AutomaticCertificateError("Automatic renewal owner layout is invalid")
+            path = directory / "renewal.json"
+            if not path.exists() and not path.is_symlink():
+                continue
+            configuration = private_json(path)
+            if (not isinstance(configuration, dict) or set(configuration) != {
+                    "identity", "profile", "certificate_dir", "dynamic_dir", "container_name", "http_port"}
+                    or not isinstance(configuration["identity"], dict)
+                    or configuration["identity"].get("deployment_id") != directory.name
+                    or not isinstance(configuration["container_name"], str)
+                    or not configuration["container_name"]
+                    or type(configuration["http_port"]) is not int
+                    or not 1024 <= configuration["http_port"] <= 65535):
+                raise AutomaticCertificateError("Automatic renewal configuration is invalid")
+            issuer = issuer_type(configuration["certificate_dir"], configuration["dynamic_dir"],
+                                 root, configuration["profile"])
+            issuer.container_name = configuration["container_name"]
+            issuer.http_port = configuration["http_port"]
+            status.update(issuer.renew_scheduled(directory, configuration))
+        except Exception:
+            failed = True
+        # Never follow an invalid owner directory to record its failure.
+        try:
+            if (not directory.is_symlink() and directory.is_dir()
+                    and directory.resolve() == directory and not directory.stat().st_mode & 0o077):
+                atomic_write(directory / "renewal-status.json", json.dumps(status, sort_keys=True).encode())
+        except OSError:
+            status = {"observed_at": status["observed_at"], "status": "renewal_failed"}
+            failed = True
+        print(json.dumps({"deployment_id": directory.name, **status}, sort_keys=True), flush=True)
+    return not failed
+
+
 def main():
     os.umask(0o077)
+    if sys.argv[1:] == ["renew-due"]:
+        if not renew_all(os.environ["OPSCTL_ACME_STATE_DIR"]):
+            raise AutomaticCertificateError("Automatic renewal failed; prior selection preserved")
+        return
+    if sys.argv[1:]:
+        raise AutomaticCertificateError("Automatic certificate action is invalid")
     value = json.loads(sys.stdin.buffer.read(131073))
     if not isinstance(value, dict) or set(value) != {"profile", "request"}:
         raise AutomaticCertificateError("Automatic certificate execution input is invalid")
