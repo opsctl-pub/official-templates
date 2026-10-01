@@ -15,7 +15,7 @@ from cryptography import x509
 import yaml
 
 from traefik_automatic_certificate import IDENTITY_FIELDS, TraefikAutomaticCertificate, private_json
-from traefik_certificate_selection import CertificateSelectionError, TraefikCertificateSelection, subject_key, validate_owner
+from traefik_certificate_selection import CertificateSelectionError, TraefikCertificateSelection, subject_key, validate_owner, validity
 
 
 def utc(value):
@@ -93,13 +93,13 @@ def probe(host, renewal_days):
     if leaf is None:
         return value
     certificate = x509.load_der_x509_certificate(leaf)
-    due = certificate.not_valid_after_utc <= datetime.now(timezone.utc) + timedelta(days=renewal_days)
+    due = validity(certificate, "not_valid_after") <= datetime.now(timezone.utc) + timedelta(days=renewal_days)
     status = "renewal_due" if due else "active"
     if trusted is not True:
         status = "expired" if verify_code == 10 else "hostname_mismatch" if verify_code == 62 else "pending"
         trusted = False
     value.update(status=status, trusted=trusted, fingerprint_sha256=hashlib.sha256(leaf).hexdigest(),
-                 not_before=utc(certificate.not_valid_before_utc), not_after=utc(certificate.not_valid_after_utc),
+                 not_before=utc(validity(certificate, "not_valid_before")), not_after=utc(validity(certificate, "not_valid_after")),
                  renewal_due=due)
     return value
 
