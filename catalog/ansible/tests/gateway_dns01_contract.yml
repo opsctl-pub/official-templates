@@ -1,28 +1,25 @@
 ---
-- name: Prove managed Traefik challenge profiles without a provider effect
+- name: Prove file-only Traefik command and private broker secret without a provider effect
   hosts: all
   gather_facts: false
   vars:
     dns_challenge_broker_url: https://broker.example.test/api/v1/dns-challenge
     dns_challenge_token_revision_id: 11111111-1111-4111-8111-111111111111
-    traefik_gateway_acme_enabled: true
-    traefik_gateway_acme_environment: staging
-    traefik_gateway_acme_staging_url: https://acme-staging-v02.api.letsencrypt.org/directory
     traefik_gateway_dashboard_enabled: false
     traefik_gateway_target_major: 3
     traefik_gateway_target_version: "3.7.13"
-    traefik_email: acme@example.test
   tasks:
     - name: Create disposable credential directory
       ansible.builtin.tempfile:
         state: directory
       register: scratch
 
-    - name: Exercise both profiles and secret replay
+    - name: Exercise file-only command and secret replay
       block:
         - name: Set disposable credential paths
           ansible.builtin.set_fact:
             traefik_acme_dir: "{{ scratch.path }}/acme"
+            traefik_dynamic_dir: "{{ scratch.path }}/dynamic"
             dns_challenge_token_source_file: "{{ scratch.path }}/dns-challenge-token"
             dns_challenge_token_file: "{{ scratch.path }}/acme/broker-secrets/token-{{ dns_challenge_token_revision_id }}"
 
@@ -90,28 +87,15 @@
               - installed_token.stat.mode == '0600'
               - installed_token.stat.pw_name == 'root'
 
-        - name: Build default HTTP-01 command
+        - name: Build file-only command
           ansible.builtin.include_tasks: ../tasks/traefik_gateway_command.yml
-          vars:
-            traefik_gateway_acme_challenge_profile: http01
 
-        - name: Preserve HTTP-01 default contract
+        - name: Require file-only certificate command
           ansible.builtin.assert:
             that:
-              - "'--certificatesresolvers.letsencrypt.acme.httpchallenge=true' in traefik_command_args"
-              - "'--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' not in traefik_command_args"
-
-        - name: Build opt-in DNS-01 command
-          ansible.builtin.include_tasks: ../tasks/traefik_gateway_command.yml
-          vars:
-            traefik_gateway_acme_challenge_profile: dns01_broker
-
-        - name: Require only the broker DNS-01 challenge
-          ansible.builtin.assert:
-            that:
-              - "'--certificatesresolvers.letsencrypt.acme.httpchallenge=true' not in traefik_command_args"
-              - "'--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=httpreq' in traefik_command_args"
-              - "'--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json' in traefik_command_args"
+              - "('--providers.file.directory=' ~ scratch.path ~ '/dynamic') in traefik_command_args"
+              - "'--providers.file.watch=true' in traefik_command_args"
+              - "(traefik_command_args | select('match', '^--certificatesresolvers') | list | length) == 0"
 
         - name: Corrupt only the disposable installed credential
           ansible.builtin.copy:

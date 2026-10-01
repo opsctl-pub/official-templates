@@ -1045,7 +1045,7 @@
             | combine(
                 (app_traefik_https | default(true))
                 | ternary(
-                    {('traefik.http.routers.' ~ router_name ~ '.tls.certresolver'): 'letsencrypt'},
+                    {('traefik.http.routers.' ~ router_name ~ '.tls'): 'true'},
                     {}
                 )
             )
