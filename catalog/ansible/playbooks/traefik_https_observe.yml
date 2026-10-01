@@ -70,7 +70,7 @@
 
         - name: Normalize resolver and route evidence
           ansible.builtin.set_fact:
-            resolver_configured: >-
+            issuer_configured: >-
               {{
                 (resolver_email_arguments | length) == 1
                 and '--certificatesresolvers.letsencrypt.acme.storage=/var/lib/traefik/acme.json'
@@ -93,7 +93,7 @@
                   | map(attribute='Destination') | list
                 )
               }}
-            resolver_bound: >-
+            certificate_bound: >-
               {{
                 route_observation.presence == 'present'
                 and route_observation.hosts == route_hosts
@@ -106,8 +106,8 @@
       rescue:
         - name: Mark unrecognized gateway or route evidence
           ansible.builtin.set_fact:
-            resolver_configured: false
-            resolver_bound: false
+            issuer_configured: false
+            certificate_bound: false
             observation_structure_valid: false
 
     - name: Probe exact route certificates on the loopback HTTPS listener
@@ -265,8 +265,8 @@
         certificate_status: >-
           {%- set statuses = certificate_hosts | map(attribute='status') | list -%}
           {%- if not observation_structure_valid -%}unknown
-          {%- elif not resolver_configured -%}not_configured
-          {%- elif not resolver_bound -%}installation_failed
+          {%- elif not issuer_configured -%}not_configured
+          {%- elif not certificate_bound -%}installation_failed
           {%- elif 'expired' in statuses -%}expired
           {%- elif 'hostname_mismatch' in statuses -%}hostname_mismatch
           {%- elif 'installation_failed' in statuses -%}installation_failed
@@ -287,8 +287,8 @@
           mode: "{{ certificate_mode }}"
           route_hosts: "{{ route_hosts }}"
           challenge_type: "{{ challenge_type }}"
-          resolver_configured: "{{ resolver_configured | bool }}"
-          resolver_bound: "{{ resolver_bound | bool }}"
+          issuer_configured: "{{ issuer_configured | bool }}"
+          certificate_bound: "{{ certificate_bound | bool }}"
           status: "{{ certificate_status }}"
           hosts: "{{ certificate_hosts }}"
           observed_at: "{{ certificate_observed_at }}"
