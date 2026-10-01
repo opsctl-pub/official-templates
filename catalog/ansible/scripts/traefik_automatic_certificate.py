@@ -421,10 +421,15 @@ class TraefikAutomaticCertificate:
             pending = directory / "renewal-request.json"
             if not binding.exists() and not binding.is_symlink():
                 remove_file(pending)
+                remove_file(directory / "renewal.json")
                 return {"status": "inactive"}
             observed = self.selection.read(binding, require_current_validity=False)["owner"]
             if observed["source"] != "automatic":
+                if any(observed[field] != identity[field]
+                       for field in IDENTITY_FIELDS - {"route_hosts"}):
+                    raise AutomaticCertificateError("Automatic renewal selection identity changed")
                 remove_file(pending)
+                remove_file(directory / "renewal.json")
                 return {"status": "inactive"}
             if any(observed[field] != identity[field] for field in IDENTITY_FIELDS):
                 raise AutomaticCertificateError("Automatic renewal selection identity changed")
