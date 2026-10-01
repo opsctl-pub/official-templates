@@ -122,6 +122,167 @@
             that:
               - tampered_replay_refused | default(false)
               - not (tampered_replay_accepted | default(false))
+
+        - name: Bind qualified disposable dashboard inputs
+          ansible.builtin.set_fact:
+            org_id: 22222222-2222-4222-8222-222222222222
+            server_id: 33333333-3333-4333-8333-333333333333
+            traefik_dashboard_enabled: true
+            traefik_dashboard_host: dashboard.example.test
+            traefik_dashboard_auth: 'fixture:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g='
+          no_log: true
+
+        - name: Install the actual dashboard route
+          ansible.builtin.include_tasks: ../tasks/traefik_gateway_dashboard.yml
+
+        - name: Inspect private dashboard file
+          ansible.builtin.stat:
+            path: "{{ traefik_dashboard_route_file }}"
+            follow: false
+          register: dashboard_installed
+
+        - name: Capture installed dashboard bytes
+          ansible.builtin.slurp:
+            src: "{{ traefik_dashboard_route_file }}"
+          register: dashboard_bytes
+          no_log: true
+
+        - name: Decode dashboard contract
+          ansible.builtin.set_fact:
+            dashboard_text: "{{ dashboard_bytes.content | b64decode }}"
+            dashboard_document: "{{ (dashboard_bytes.content | b64decode).split('\n', 1)[1] | from_yaml }}"
+          no_log: true
+
+        - name: Require qualified private authenticated file route
+          ansible.builtin.assert:
+            that:
+              - dashboard_installed.stat.isreg and not dashboard_installed.stat.islnk
+              - dashboard_installed.stat.uid == 0 and dashboard_installed.stat.mode == '0600'
+              - dashboard_text.split('\n', 1)[0].startswith('# opsctl-server-dashboard ')
+              - (dashboard_text.split('\n', 1)[0][26:] | from_json) == traefik_dashboard_owner
+              - (dashboard_document.http.routers.keys() | list) == [traefik_dashboard_key]
+              - dashboard_document.http.routers[traefik_dashboard_key].rule == 'Host(`dashboard.example.test`)'
+              - dashboard_document.http.routers[traefik_dashboard_key].entryPoints == ['websecure']
+              - dashboard_document.http.routers[traefik_dashboard_key].service == 'api@internal'
+              - dashboard_document.http.routers[traefik_dashboard_key].tls == {}
+              - dashboard_document.http.routers[traefik_dashboard_key].middlewares == [traefik_dashboard_key ~ '-auth@file']
+              - dashboard_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.users == [traefik_dashboard_auth]
+          no_log: true
+
+        - name: Replay identical dashboard installation
+          ansible.builtin.include_tasks: ../tasks/traefik_gateway_dashboard.yml
+
+        - name: Inspect replayed dashboard identity
+          ansible.builtin.stat:
+            path: "{{ traefik_dashboard_route_file }}"
+          register: dashboard_replayed
+
+        - name: Require identical replay without replacement or write
+          ansible.builtin.assert:
+            that:
+              - not traefik_dashboard_changed
+              - traefik_dashboard_snapshot.prior == dashboard_bytes.content
+              - traefik_dashboard_snapshot.desired == dashboard_bytes.content
+              - dashboard_replayed.stat.checksum == dashboard_installed.stat.checksum
+              - dashboard_replayed.stat.inode == dashboard_installed.stat.inode
+              - dashboard_replayed.stat.mtime == dashboard_installed.stat.mtime
+          no_log: true
+
+        - name: Disable disposable dashboard
+          ansible.builtin.set_fact:
+            traefik_dashboard_enabled: false
+
+        - name: Remove the actual qualified dashboard route
+          ansible.builtin.include_tasks: ../tasks/traefik_gateway_dashboard.yml
+
+        - name: Inspect disabled dashboard absence
+          ansible.builtin.stat:
+            path: "{{ traefik_dashboard_route_file }}"
+          register: dashboard_disabled
+
+        - name: Require physical dashboard removal
+          ansible.builtin.assert:
+            that:
+              - traefik_dashboard_changed
+              - not dashboard_disabled.stat.exists
+
+        - name: Install foreign-marker fixture at the disposable path
+          ansible.builtin.copy:
+            content: "{{ dashboard_text | replace(org_id, '44444444-4444-4444-8444-444444444444') }}"
+            dest: "{{ traefik_dashboard_route_file }}"
+            owner: root
+            group: root
+            mode: '0600'
+          no_log: true
+
+        - name: Capture foreign bytes before refusal
+          ansible.builtin.slurp:
+            src: "{{ traefik_dashboard_route_file }}"
+          register: dashboard_foreign_before
+          no_log: true
+
+        - name: Require foreign dashboard removal to fail closed
+          block:
+            - name: Attempt removal of a foreign dashboard
+              ansible.builtin.include_tasks: ../tasks/traefik_gateway_dashboard.yml
+
+            - name: Record unexpected foreign dashboard acceptance
+              ansible.builtin.set_fact:
+                dashboard_foreign_accepted: true
+          rescue:
+            - name: Record expected foreign dashboard refusal
+              ansible.builtin.set_fact:
+                dashboard_foreign_refused: true
+
+        - name: Read foreign bytes after refusal
+          ansible.builtin.slurp:
+            src: "{{ traefik_dashboard_route_file }}"
+          register: dashboard_foreign_after
+          no_log: true
+
+        - name: Require foreign bytes unchanged
+          ansible.builtin.assert:
+            that:
+              - dashboard_foreign_refused | default(false)
+              - not (dashboard_foreign_accepted | default(false))
+              - dashboard_foreign_after.content == dashboard_foreign_before.content
+          no_log: true
+
+        - name: Exercise the exact restoration owner's port comparison
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import ast
+                import pathlib
+                import sys
+                import yaml
+
+                tasks = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+                task = next(item for item in tasks if item.get('name') == 'Restore exact prior Traefik runtime')
+                script = task['shell']
+                lines = [line.strip() for line in script.splitlines() if line.strip().startswith('"ports":')]
+                assert len(lines) == 1
+                expression = lines[0].split(':', 1)[1].strip().rstrip(',')
+                comparison = compile(ast.parse(expression, mode='eval'), sys.argv[1], 'eval')
+                first = {'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '19443'}]}
+                second = {'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '29443'}]}
+                cases = [(None, {}, True), ({}, None, True), (None, None, True),
+                         ({}, {}, True), (first, first, True), (first, second, False),
+                         (first, {}, False), ({}, first, False), (None, first, False)]
+                for current, prior, expected in cases:
+                    actual = eval(comparison, {'__builtins__': {}},
+                                  {'current_ports': current, 'prior_ports': prior})
+                    assert actual is expected, (current, prior, expected)
+                print('EXACT_OWNER_PORT_COMPARISON:PASS cases=' + str(len(cases)))
+              - "{{ playbook_dir }}/../tasks/traefik_gateway_runtime_restore.yml"
+          register: dashboard_port_guard
+          changed_when: false
+
+        - name: Report retained dashboard and restoration contract success
+          ansible.builtin.debug:
+            msg: "DASHBOARD_FILE_CONTRACT:PASS enabled_private_auth=true replay_identical=true disabled_absent=true foreign_unchanged=true; {{ dashboard_port_guard.stdout }}"
       always:
         - name: Remove disposable credential directory
           ansible.builtin.file:
