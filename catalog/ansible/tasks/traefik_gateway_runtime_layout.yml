@@ -211,7 +211,11 @@
           (existing_traefik_labels | combine(traefik_managed_labels))
           == existing_traefik_labels
         )
-        and (traefik_command_args | difference(existing_traefik_cmd) | length) == 0
+        and (
+          (existing_traefik_labels.keys() | select('match', '^traefik[.]') | list
+          | difference(traefik_managed_labels.keys() | list) | length) == 0
+        )
+        and traefik_command_args == existing_traefik_cmd
         and (
           (existing_traefik.Config.Env | default([])
           | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')
@@ -328,8 +332,10 @@
             | combine(traefik_managed_labels))
             == traefik_replacement_details.Config.Labels)
           - >-
-            ((traefik_command_args | difference(traefik_replacement_details.Config.Cmd))
-            | length) == 0
+            (traefik_replacement_details.Config.Labels.keys()
+            | select('match', '^traefik[.]') | list
+            | difference(traefik_managed_labels.keys() | list) | length) == 0
+          - traefik_command_args == traefik_replacement_details.Config.Cmd
           - >-
             (traefik_replacement_details.Config.Env | default([])
             | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')
@@ -416,8 +422,10 @@
         ((traefik_container_details.Config.Labels | combine(traefik_managed_labels))
         == traefik_container_details.Config.Labels)
       - >-
-        ((traefik_command_args | difference(traefik_container_details.Config.Cmd))
-        | length) == 0
+        (traefik_container_details.Config.Labels.keys()
+        | select('match', '^traefik[.]') | list
+        | difference(traefik_managed_labels.keys() | list) | length) == 0
+      - traefik_command_args == traefik_container_details.Config.Cmd
       - >-
         (traefik_container_details.Config.Env | default([])
         | select('match', '(?i)^(HTTPREQ_|TRAEFIK_CERTIFICATESRESOLVERS|TRAEFIK_CONFIGFILE=|TRAEFIK_PROVIDERS_FILE_FILENAME=|TRAEFIK_ENTRYPOINTS_.*_HTTP_REDIRECTIONS_)')

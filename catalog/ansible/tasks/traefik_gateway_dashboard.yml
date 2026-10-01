@@ -1,0 +1,138 @@
+---
+- name: Converge the owned Server dashboard route
+  block:
+    - name: Validate qualified dashboard inputs
+      ansible.builtin.assert:
+        that:
+          - org_id is string and org_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+          - server_id is string and server_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+          - (traefik_dashboard_enabled | default(false)) is boolean
+          - traefik_dynamic_dir is string and traefik_dynamic_dir is match('^/[A-Za-z0-9_./-]+$')
+          - "'..' not in traefik_dynamic_dir.split('/')"
+        fail_msg: "Dashboard route identity is invalid"
+
+    - name: Validate enabled dashboard authority and authentication
+      ansible.builtin.assert:
+        that:
+          - traefik_dashboard_host is string
+          - (traefik_dashboard_host | length) <= 253
+          - traefik_dashboard_host is match('^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+          - traefik_dashboard_auth is string
+          - traefik_dashboard_auth is match('^[^:\r\n]+:(\$[A-Za-z0-9]+\$[^\r\n]+|\{SHA\}[A-Za-z0-9+/=]+)$')
+        fail_msg: "Dashboard route host or authentication is invalid"
+      when: traefik_dashboard_enabled | default(false)
+
+    - name: Resolve qualified dashboard route identity
+      ansible.builtin.set_fact:
+        traefik_dashboard_key: "server-dashboard-{{ server_id }}"
+        traefik_dashboard_route_file: "{{ traefik_dynamic_dir }}/server-dashboard-{{ server_id }}.yml"
+        traefik_dashboard_owner: "{{ {'organization_id': org_id, 'server_id': server_id} }}"
+        traefik_dashboard_changed: false
+
+    - name: Inspect dashboard path without following links
+      ansible.builtin.stat:
+        path: "{{ traefik_dashboard_route_file }}"
+        follow: false
+      register: traefik_dashboard_stat
+
+    - name: Refuse unsafe existing dashboard path
+      ansible.builtin.assert:
+        that:
+          - not traefik_dashboard_stat.stat.exists or (traefik_dashboard_stat.stat.isreg and not traefik_dashboard_stat.stat.islnk)
+          - not traefik_dashboard_stat.stat.exists or (traefik_dashboard_stat.stat.uid == 0 and traefik_dashboard_stat.stat.mode == '0600')
+          - not traefik_dashboard_stat.stat.exists or traefik_dashboard_stat.stat.size <= 65536
+        fail_msg: "Dashboard route path is not privately owned"
+
+    - name: Read existing owned dashboard bytes
+      ansible.builtin.slurp:
+        src: "{{ traefik_dashboard_route_file }}"
+      register: traefik_dashboard_prior
+      when: traefik_dashboard_stat.stat.exists
+
+    - name: Decode existing dashboard marker and document
+      ansible.builtin.set_fact:
+        traefik_dashboard_prior_text: "{{ traefik_dashboard_prior.content | b64decode }}"
+      when: traefik_dashboard_stat.stat.exists
+
+    - name: Validate existing dashboard ownership marker
+      ansible.builtin.assert:
+        that:
+          - traefik_dashboard_prior_text.split('\n', 1)[0].startswith('# opsctl-server-dashboard ')
+          - (traefik_dashboard_prior_text.split('\n', 1)[0][26:] | from_json) == traefik_dashboard_owner
+        fail_msg: "Dashboard route owner changed"
+      when: traefik_dashboard_stat.stat.exists
+
+    - name: Decode existing dashboard route
+      ansible.builtin.set_fact:
+        traefik_dashboard_prior_document: "{{ traefik_dashboard_prior_text.split('\n', 1)[1] | from_yaml }}"
+      when: traefik_dashboard_stat.stat.exists
+
+    - name: Validate the closed existing dashboard document
+      ansible.builtin.assert:
+        that:
+          - traefik_dashboard_prior_document is mapping
+          - (traefik_dashboard_prior_document.keys() | list) == ['http']
+          - (traefik_dashboard_prior_document.http.keys() | sort) == ['middlewares', 'routers']
+          - (traefik_dashboard_prior_document.http.routers.keys() | list) == [traefik_dashboard_key]
+          - (traefik_dashboard_prior_document.http.middlewares.keys() | list) == [traefik_dashboard_key ~ '-auth']
+          - (traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].keys() | sort) == ['entryPoints', 'middlewares', 'rule', 'service', 'tls']
+          - traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].entryPoints == ['websecure']
+          - traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].service == 'api@internal'
+          - traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].tls == {}
+          - traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].middlewares == [traefik_dashboard_key ~ '-auth@file']
+          - traefik_dashboard_prior_document.http.routers[traefik_dashboard_key].rule is match('^Host\(`[a-z0-9.-]+`\)$')
+          - (traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].keys() | list) == ['basicAuth']
+          - (traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.keys() | list) == ['users']
+          - traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.users is sequence
+          - traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.users is not string
+          - (traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.users | length) == 1
+          - traefik_dashboard_prior_document.http.middlewares[traefik_dashboard_key ~ '-auth'].basicAuth.users[0] is match('^[^:\r\n]+:(\$[A-Za-z0-9]+\$[^\r\n]+|\{SHA\}[A-Za-z0-9+/=]+)$')
+        fail_msg: "Dashboard route structure is invalid"
+      when: traefik_dashboard_stat.stat.exists
+
+    - name: Build enabled authenticated dashboard bytes
+      ansible.builtin.set_fact:
+        traefik_dashboard_desired_text: |
+          # opsctl-server-dashboard {{ traefik_dashboard_owner | to_json }}
+          {{ {'http': {'routers': {traefik_dashboard_key: {
+            'rule': 'Host(`' ~ traefik_dashboard_host ~ '`)', 'entryPoints': ['websecure'],
+            'tls': {}, 'service': 'api@internal', 'middlewares': [traefik_dashboard_key ~ '-auth@file']}},
+            'middlewares': {traefik_dashboard_key ~ '-auth': {'basicAuth': {'users': [traefik_dashboard_auth]}}}}}
+          | to_nice_yaml(indent=2) }}
+      when: traefik_dashboard_enabled | default(false)
+
+    - name: Capture dashboard prior bytes and desired identity before mutation
+      ansible.builtin.set_fact:
+        traefik_dashboard_snapshot:
+          path: "{{ traefik_dashboard_route_file }}"
+          prior: "{{ traefik_dashboard_prior.content if traefik_dashboard_stat.stat.exists else none }}"
+          desired: "{{ (traefik_dashboard_desired_text | b64encode) if (traefik_dashboard_enabled | default(false)) else none }}"
+
+    - name: Mark changed dashboard policy before installation or removal
+      ansible.builtin.set_fact:
+        traefik_dashboard_changed: true
+      when: traefik_dashboard_snapshot.prior != traefik_dashboard_snapshot.desired
+
+    - name: Ensure managed dynamic directory exists
+      ansible.builtin.file:
+        path: "{{ traefik_dynamic_dir }}"
+        state: directory
+        mode: '0755'
+      when: traefik_dashboard_enabled | default(false)
+
+    - name: Atomically install the private authenticated dashboard route
+      ansible.builtin.copy:
+        content: "{{ traefik_dashboard_desired_text }}"
+        dest: "{{ traefik_dashboard_route_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+        unsafe_writes: false
+      when: (traefik_dashboard_enabled | default(false)) and traefik_dashboard_changed
+
+    - name: Remove only the qualified dashboard route when disabled
+      ansible.builtin.file:
+        path: "{{ traefik_dashboard_route_file }}"
+        state: absent
+      when: not (traefik_dashboard_enabled | default(false)) and traefik_dashboard_changed
+  no_log: true

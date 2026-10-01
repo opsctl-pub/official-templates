@@ -1,13 +1,67 @@
 ---
+- name: Restore only the captured owned dashboard file
+  block:
+    - name: Inspect dashboard restoration path without following links
+      ansible.builtin.stat:
+        path: "{{ traefik_dashboard_snapshot.path }}"
+        follow: false
+      register: traefik_dashboard_restore_stat
+
+    - name: Refuse unsafe dashboard restoration path
+      ansible.builtin.assert:
+        that:
+          - not traefik_dashboard_restore_stat.stat.exists or (traefik_dashboard_restore_stat.stat.isreg and not traefik_dashboard_restore_stat.stat.islnk)
+          - not traefik_dashboard_restore_stat.stat.exists or (traefik_dashboard_restore_stat.stat.uid == 0 and traefik_dashboard_restore_stat.stat.mode == '0600')
+          - not traefik_dashboard_restore_stat.stat.exists or traefik_dashboard_restore_stat.stat.size <= 65536
+        fail_msg: "Dashboard restoration ownership changed"
+
+    - name: Read current dashboard restoration bytes
+      ansible.builtin.slurp:
+        src: "{{ traefik_dashboard_snapshot.path }}"
+      register: traefik_dashboard_restore_bytes
+      when: traefik_dashboard_restore_stat.stat.exists
+
+    - name: Refuse restoration over a different dashboard generation
+      ansible.builtin.assert:
+        that:
+          - >-
+            (traefik_dashboard_restore_bytes.content if traefik_dashboard_restore_stat.stat.exists else none)
+            in [traefik_dashboard_snapshot.prior, traefik_dashboard_snapshot.desired]
+        fail_msg: "Dashboard route changed before restoration"
+
+    - name: Restore prior private dashboard bytes atomically
+      ansible.builtin.copy:
+        content: "{{ traefik_dashboard_snapshot.prior | b64decode }}"
+        dest: "{{ traefik_dashboard_snapshot.path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        unsafe_writes: false
+      when: traefik_dashboard_snapshot.prior is not none
+
+    - name: Restore original dashboard absence
+      ansible.builtin.file:
+        path: "{{ traefik_dashboard_snapshot.path }}"
+        state: absent
+      when: traefik_dashboard_snapshot.prior is none
+
+    - name: Mark captured dashboard restoration complete
+      ansible.builtin.set_fact:
+        traefik_dashboard_changed: false
+  when: traefik_dashboard_snapshot is defined and (traefik_dashboard_changed | default(false))
+  no_log: true
+
 - name: Inspect runtime before restoration
   community.docker.docker_container_info:
     name: "{{ traefik_container_name }}"
   register: traefik_restore_info
+  when: traefik_replacement_started | default(false)
   no_log: true
 
 - name: Read exact current restoration identity
   set_fact:
     traefik_restore_current: "{{ traefik_restore_info.container | default(none) }}"
+  when: traefik_replacement_started | default(false)
   no_log: true
 
 - name: Refuse restoration over another runtime owner
@@ -25,6 +79,7 @@
           and traefik_restore_current.Mounts == traefik_replacement_details.Mounts
         )
     fail_msg: "Traefik restoration refused: current runtime ownership changed; partial effect requires observation"
+  when: traefik_replacement_started | default(false)
   no_log: true
 
 - name: Restore exact prior Traefik runtime
@@ -105,6 +160,8 @@
     )[0]
     current_config = current.get("Config") or {}
     current_host = current.get("HostConfig") or {}
+    current_ports = current_host.get("PortBindings")
+    prior_ports = host_config.get("PortBindings")
     checks = {
         "image": current_config.get("Image") == config.get("Image"),
         "command": current_config.get("Cmd") == config.get("Cmd"),
@@ -116,7 +173,7 @@
         "environment": current_config.get("Env") == config.get("Env"),
         "user": current_config.get("User") == config.get("User"),
         "workdir": current_config.get("WorkingDir") == config.get("WorkingDir"),
-        "ports": current_host.get("PortBindings") == host_config.get("PortBindings"),
+        "ports": ({} if current_ports is None else current_ports) == ({} if prior_ports is None else prior_ports),
         "status": (current.get("State") or {}).get("Status") == (prior.get("State") or {}).get("Status"),
     }
     if not all(checks.values()):
@@ -128,7 +185,7 @@
   changed_when: true
   failed_when: traefik_restore_result.rc != 0
   when:
-    - traefik_replacement_started
+    - traefik_replacement_started | default(false)
     - traefik_prior_runtime_present
     - traefik_restore_current is none or traefik_restore_current.Id != traefik_prior_runtime.Id
   no_log: true
@@ -156,11 +213,12 @@
   changed_when: true
   failed_when: traefik_fresh_cleanup_result.rc != 0
   when:
-    - traefik_replacement_started
+    - traefik_replacement_started | default(false)
     - not traefik_prior_runtime_present
   no_log: true
 
 - name: Mark exact runtime restoration complete
   set_fact:
     traefik_runtime_restored: true
+  when: traefik_replacement_started | default(false)
   no_log: true
