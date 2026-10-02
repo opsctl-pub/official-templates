@@ -283,6 +283,97 @@
         - name: Report retained dashboard and restoration contract success
           ansible.builtin.debug:
             msg: "DASHBOARD_FILE_CONTRACT:PASS enabled_private_auth=true replay_identical=true disabled_absent=true foreign_unchanged=true; {{ dashboard_port_guard.stdout }}"
+
+        - name: Require observer compatibility with legacy and modern certificate dates
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import hashlib
+                import pathlib
+                import ssl
+                import sys
+                from contextlib import ExitStack, nullcontext
+                from datetime import datetime, timedelta, timezone
+                from types import SimpleNamespace
+                from unittest.mock import patch
+
+                from cryptography import x509
+                from cryptography.hazmat.primitives import hashes, serialization
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.x509.oid import NameOID
+
+                sys.path.insert(0, str(pathlib.Path(sys.argv[1])))
+                import traefik_automatic_certificate_observation as observer
+
+                host = 'observer.example.test'
+                now = datetime.now(timezone.utc).replace(microsecond=0)
+                not_before = now - timedelta(days=1)
+                not_after = now + timedelta(days=90)
+                key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
+                leaf = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                        .public_key(key.public_key()).serial_number(1)
+                        .not_valid_before(not_before).not_valid_after(not_after)
+                        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+                        .sign(key, hashes.SHA256()))
+                der = leaf.public_bytes(serialization.Encoding.DER)
+                x509.load_der_x509_certificate(der)
+                expected = {
+                    'hostname': host, 'status': 'active', 'trusted': True,
+                    'fingerprint_sha256': hashlib.sha256(der).hexdigest(),
+                    'not_before': not_before.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'not_after': not_after.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'renewal_due': False,
+                }
+                shapes = {
+                    'legacy': SimpleNamespace(
+                        not_valid_before=not_before.replace(tzinfo=None),
+                        not_valid_after=not_after.replace(tzinfo=None)),
+                    'modern': SimpleNamespace(
+                        not_valid_before_utc=not_before, not_valid_after_utc=not_after),
+                }
+                for shape_name, certificate in shapes.items():
+                    connection = object()
+                    calls = []
+
+                    def connect(address, timeout):
+                        assert address == ('127.0.0.1', 443) and timeout == 5
+                        calls.append('connect')
+                        return nullcontext(connection)
+
+                    def wrap(context, sock, server_hostname):
+                        assert context.verify_mode == ssl.CERT_REQUIRED
+                        assert context.check_hostname is True
+                        assert sock is connection and server_hostname == host
+                        calls.append('verified_sni')
+
+                        def peer(binary_form):
+                            assert binary_form is True
+                            return der
+
+                        return nullcontext(SimpleNamespace(getpeercert=peer))
+
+                    def parse(value):
+                        assert value == der
+                        return certificate
+
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.object(observer.socket, 'create_connection', connect))
+                        stack.enter_context(patch.object(ssl.SSLContext, 'wrap_socket', wrap))
+                        stack.enter_context(patch.object(observer.x509, 'load_der_x509_certificate', parse))
+                        actual = observer.probe(host, 30)
+                    assert actual == expected, (shape_name, actual)
+                    assert calls == ['connect', 'verified_sni']
+                print('OBSERVER_DATE_API_CONTRACT:PASS shapes=legacy,modern transport=fixture')
+              - "{{ playbook_dir }}/../scripts"
+          register: observer_date_contract
+          changed_when: false
+
+        - name: Report observer date API contract success
+          ansible.builtin.debug:
+            msg: "{{ observer_date_contract.stdout }}; legacy is a crypto41 API-shape fixture, not a crypto41 runtime claim"
       always:
         - name: Remove disposable credential directory
           ansible.builtin.file:
