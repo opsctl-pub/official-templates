@@ -144,8 +144,9 @@ class NativeOriginCertificate:
         """Verify SNI, hostname, trust and exact served leaf on the local gateway listener."""
         if not ipaddress.ip_address(address).is_loopback or type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("Native certificate listener identity is invalid")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations(cafile=str(trust_file))
+        context = ssl.create_default_context() if trust_file is None else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if trust_file is not None:
+            context.load_verify_locations(cafile=str(trust_file))
         deadline = time.monotonic() + 10
         for host in self.identity["route_hosts"]:
             while True:
@@ -161,7 +162,7 @@ class NativeOriginCertificate:
                     time.sleep(0.1)
 
     def install(self, chain_pem, trust_pem, fingerprint, trust_digest,
-                previous_revision_id, address="127.0.0.1", port=443):
+                previous_revision_id, expected_binding, address="127.0.0.1", port=443):
         """Bind validated public material, verify actual TLS, restore exact prior bytes on failure."""
         with self.lock():
             if self.revision.is_symlink() or not self.revision.is_dir():
@@ -206,7 +207,7 @@ class NativeOriginCertificate:
                     raise ValueError("Native origin chain trust is invalid")
             if self.binding.is_symlink():
                 raise ValueError("Native certificate binding ownership is invalid")
-            expected = self.binding_bytes(previous_revision_id) if previous_revision_id else None
+            expected = expected_binding.encode("ascii") if expected_binding is not None else None
             try:
                 self.selection.activate(
                     self.selection_owner(self.identity["revision_id"], fingerprint),
@@ -214,7 +215,10 @@ class NativeOriginCertificate:
                     lambda: self.verify_served(trust_path, fingerprint, address, port),
                 )
             except Exception:
-                if previous_revision_id and self.binding.is_file() and self.binding.read_bytes() == expected:
+                if (
+                    previous_revision_id and self.binding.is_file()
+                    and self.binding.read_bytes() == expected == self.binding_bytes(previous_revision_id)
+                ):
                     prior = self.base / previous_revision_id
                     old_leaf = x509.load_pem_x509_certificate((prior / "tls.crt").read_bytes())
                     self.verify_served(
@@ -245,18 +249,49 @@ class NativeOriginCertificate:
                 "classification": "serving", "observed_at": datetime.now(timezone.utc).isoformat(),
             }
 
-    def retire(self, active_revision_id, active_fingerprint):
-        """Remove a retired local revision only while its exact replacement is serving."""
+    def verify_replacement(self, active_revision_id, active_fingerprint, active_source, expected_binding):
+        """Validate exact replacement bytes, qualified material and current SNI under the caller lock."""
         if active_revision_id == self.identity["revision_id"]:
             raise ValueError("Native active revision cannot be retired")
-        desired = self.binding_bytes(active_revision_id)
-        with self.lock(), self.selection.locked():
-            if self.binding.is_symlink() or not self.binding.is_file() or self.binding.read_bytes() != desired:
-                raise ValueError("Native retirement replacement binding changed")
+        if str(UUID(active_revision_id)) != active_revision_id or active_source not in {"native", "automatic"}:
+            raise ValueError("Native replacement identity is invalid")
+        desired = (
+            expected_binding.encode("ascii") if active_source == "automatic" and expected_binding is not None
+            else self.binding_bytes(active_revision_id) if active_source == "native" else None
+        )
+        if desired is None or self.binding.is_symlink() or not self.binding.is_file() or self.binding.read_bytes() != desired:
+            raise ValueError("Native retirement replacement binding changed")
+        owner = self.selection.read(self.binding)["owner"]
+        expected_owner = self.selection_owner(active_revision_id, active_fingerprint)
+        expected_owner["source"] = active_source
+        if owner != expected_owner:
+            raise ValueError("Native retirement replacement owner changed")
+        trust_file = None
+        if active_source == "native":
             active = self.base / active_revision_id
             if active.is_symlink():
                 raise ValueError("Native active revision ownership changed")
-            self.verify_served(active / "trust.pem", active_fingerprint, "127.0.0.1", 443)
+            trust_file = active / "trust.pem"
+        self.verify_served(trust_file, active_fingerprint, "127.0.0.1", 443)
+        return desired
+
+    def observe_public(self, active_revision_id, active_fingerprint, expected_binding):
+        """Attest the public replacement before the API may revoke a native predecessor."""
+        with self.lock(), self.selection.locked():
+            desired = self.verify_replacement(
+                active_revision_id, active_fingerprint, "automatic", expected_binding,
+            )
+            return {
+                "revision_id": active_revision_id, "fingerprint_sha256": active_fingerprint,
+                "route_hosts": self.identity["route_hosts"], "trust_profile": "system_webpki",
+                "selection_digest": hashlib.sha256(desired).hexdigest(),
+                "classification": "serving", "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def retire(self, active_revision_id, active_fingerprint, active_source, expected_binding):
+        """Remove a retired local revision only while its exact replacement is serving."""
+        with self.lock(), self.selection.locked():
+            self.verify_replacement(active_revision_id, active_fingerprint, active_source, expected_binding)
             if self.revision.is_symlink():
                 raise ValueError("Native retired revision ownership changed")
             if self.revision.exists():
@@ -288,11 +323,20 @@ def main():
             request["certificate_chain_pem"], request["trust_bundle_pem"],
             request["leaf_fingerprint_sha256"], request["trust_bundle_sha256"],
             request["previous_revision_id"],
+            request["expected_binding"],
         )
     elif sys.argv[1] == "observe":
-        result = contract.observe(request["leaf_fingerprint_sha256"], request["trust_bundle_sha256"])
+        if request.get("active_source") == "automatic":
+            result = contract.observe_public(
+                request["active_revision_id"], request["active_fingerprint_sha256"], request["expected_binding"],
+            )
+        else:
+            result = contract.observe(request["leaf_fingerprint_sha256"], request["trust_bundle_sha256"])
     elif sys.argv[1] == "retire":
-        result = contract.retire(request["active_revision_id"], request["active_fingerprint_sha256"])
+        result = contract.retire(
+            request["active_revision_id"], request["active_fingerprint_sha256"],
+            request["active_source"], request["expected_binding"],
+        )
     else:
         raise ValueError("Native certificate action is invalid")
     print("TEMPLATE_OUTPUT_JSON=" + json.dumps({"native_certificate": result}, sort_keys=True))
