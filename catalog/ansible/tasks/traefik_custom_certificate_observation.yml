@@ -210,6 +210,13 @@
               and observed_leaf_fingerprint == ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
               and observed_binding_count == 1
               and observed_route_hosts == route_hosts -%}other
+          {%- elif observed_binding_count == 1
+              and observed_route_hosts == route_hosts
+              and (observed_certificate_hosts | length) == (route_hosts | length)
+              and (observed_certificate_hosts | map(attribute='hostname') | list) == route_hosts
+              and (observed_certificate_hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
+              and (observed_certificate_hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
+              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', observed_leaf_fingerprint) | list | length) == (route_hosts | length) -%}other
           {%- else -%}mixed
           {%- endif -%}
         custom_certificate_observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
