@@ -226,6 +226,49 @@ class TraefikCertificateSelection:
         ).hexdigest()
         return {"automatic_certificate_selection": result}
 
+    def observe_custom(self, request):
+        """Project custom material only from an unchanged canonical selection."""
+        if not isinstance(request, dict) or set(request) != {"identity"}:
+            raise CertificateSelectionError("Custom certificate observation request is invalid")
+        identity = request["identity"]
+        validate_identity(identity)
+        path = self.dynamic_dir / f"certificate-{subject_key(identity['subject'])}.yml"
+        snapshot = self._observation_snapshot(path, identity)
+        result = {"present": False, "expected_binding": None}
+        if snapshot is not None:
+            selected = self.read(path, require_current_validity=False)
+            owner = selected["owner"]
+            if owner["source"] != "custom" or owner["route_hosts"] != identity["route_hosts"]:
+                raise CertificateSelectionError("Custom certificate selection ownership is invalid")
+            document = json.loads(snapshot[0].decode("ascii").partition("\n")[2],
+                                  object_pairs_hook=closed_json_pairs)
+            files = document["tls"]["certificates"][0]
+            relative = Path(files["certFile"]).relative_to(self.certificate_dir)
+            if (len(relative.parts) != 3 or relative.parts[2] != "tls.crt"
+                    or not relative.parts[0].startswith("material-")
+                    or relative.parts[1] != "revision-" + owner["revision_id"]):
+                raise CertificateSelectionError("Custom certificate material layout is invalid")
+            material_id = relative.parts[0].removeprefix("material-")
+            if str(UUID(material_id)) != material_id:
+                raise CertificateSelectionError("Custom certificate material identity is invalid")
+            if Path(files["keyFile"]) != Path(files["certFile"]).with_name("tls.key"):
+                raise CertificateSelectionError("Custom certificate key identity is invalid")
+            digest = hashlib.sha256(b"opsctl-file-secret:1\0")
+            for name in ("tls.crt", "tls.key"):
+                encoded = name.encode("ascii")
+                value = Path(files["certFile"]).with_name(name).read_bytes()
+                digest.update(len(encoded).to_bytes(2, "big"))
+                digest.update(encoded)
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+            result = {"present": True, "expected_binding": snapshot[0].decode("ascii"),
+                      "material_id": material_id, "revision_id": owner["revision_id"],
+                      "route_hosts": owner["route_hosts"], "content_digest": digest.hexdigest(),
+                      "leaf_fingerprint_sha256": owner["fingerprint_sha256"]}
+        if self._observation_snapshot(path, identity) != snapshot:
+            raise CertificateSelectionError("Custom certificate evidence changed during observation")
+        return {"custom_certificate_binding": result}
+
     def material(self, owner, certificate_file, private_key_file, require_current_validity=True):
         validate_owner(owner)
         paths = [Path(certificate_file), Path(private_key_file)]
@@ -382,6 +425,9 @@ def main():
     )
     if sys.argv[1] == "observe":
         print("TEMPLATE_OUTPUT_JSON=" + json.dumps(selection.observe(request)))
+        return
+    if sys.argv[1] == "observe_custom":
+        print("TEMPLATE_OUTPUT_JSON=" + json.dumps(selection.observe_custom(request)))
         return
     owner = request["owner"]
     expected = request["expected_binding"]

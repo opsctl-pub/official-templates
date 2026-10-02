@@ -31,101 +31,40 @@
                 | list | length) == 1
             fail_msg: "Managed Traefik certificate mount is invalid"
 
-        - name: Inspect Deployment certificate binding
-          ansible.builtin.stat:
-            path: "{{ binding_file }}"
-          register: binding_stat
+        - name: Read canonical custom selected-pool evidence
+          ansible.builtin.include_tasks:
+            file: traefik_certificate_selection.yml
+          vars:
+            certificate_selection_action: observe_custom
+            certificate_selection_request:
+              identity:
+                organization_id: "{{ org_id }}"
+                subject: {type: deployment, id: "{{ deployment_id }}"}
+                gateway_id: "{{ gateway_id }}"
+                server_id: "{{ server_id }}"
+                route_hosts: "{{ route_hosts }}"
 
-        - name: Mark absent Deployment certificate binding
+        - name: Parse canonical custom selected-pool evidence
+          ansible.builtin.set_fact:
+            selected_custom_binding: >-
+              {{
+                (certificate_selection_result.stdout
+                | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
+                | from_json).custom_certificate_binding
+              }}
+
+        - name: Read installed custom certificate identity
           ansible.builtin.set_fact:
             binding_valid: true
-            binding_present: false
-            observed_material_id: null
-            observed_revision_id: null
-            observed_route_hosts: []
-            observed_binding_count: 0
+            binding_present: "{{ selected_custom_binding.present }}"
+            observed_material_id: "{{ selected_custom_binding.material_id | default(none) }}"
+            observed_revision_id: "{{ selected_custom_binding.revision_id | default(none) }}"
+            observed_route_hosts: "{{ selected_custom_binding.route_hosts | default([]) }}"
+            observed_binding_count: "{{ 1 if selected_custom_binding.present else 0 }}"
             observed_certificate_hosts: []
-            observed_content_digest: null
-            observed_leaf_fingerprint: null
-          when: not binding_stat.stat.exists
-
-        - name: Read Deployment certificate binding
-          ansible.builtin.slurp:
-            path: "{{ binding_file }}"
-          register: binding_content
-          when: binding_stat.stat.exists
-
-        - name: Parse Deployment certificate binding
-          ansible.builtin.set_fact:
-            parsed_binding: "{{ binding_content.content | b64decode | from_yaml }}"
-          when: binding_stat.stat.exists
-
-        - name: Validate Deployment certificate binding
-          ansible.builtin.assert:
-            that:
-              - parsed_binding.keys() | list == ['tls']
-              - parsed_binding.tls.keys() | list == ['certificates']
-              - parsed_binding.tls.certificates is sequence
-              - parsed_binding.tls.certificates is not string
-              - (parsed_binding.tls.certificates | length) == 1
-              - parsed_binding.tls.certificates[0].keys() | sort == ['certFile', 'keyFile']
-              - parsed_binding.tls.certificates[0].certFile is match('^/etc/traefik/certificates/opsctl/material-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/revision-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/tls[.]crt$')
-              - parsed_binding.tls.certificates[0].keyFile is match('^/etc/traefik/certificates/opsctl/material-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/revision-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/tls[.]key$')
-            fail_msg: "Deployment custom certificate binding is invalid"
-          when: binding_stat.stat.exists
-
-        - name: Extract bound certificate identities
-          ansible.builtin.set_fact:
-            observed_material_id: "{{ parsed_binding.tls.certificates[0].certFile | regex_replace('^.*/material-([0-9a-f-]{36})/.*$', '\\1') }}"
-            observed_revision_id: "{{ parsed_binding.tls.certificates[0].certFile | regex_replace('^.*/revision-([0-9a-f-]{36})/.*$', '\\1') }}"
-            observed_certificate_file: "{{ parsed_binding.tls.certificates[0].certFile }}"
-            observed_private_key_file: "{{ parsed_binding.tls.certificates[0].keyFile }}"
-          when: binding_stat.stat.exists
-
-        - name: Require matching certificate and key identities
-          ansible.builtin.assert:
-            that:
-              - observed_private_key_file == (traefik_certificate_dir ~ '/material-' ~ observed_material_id ~ '/revision-' ~ observed_revision_id ~ '/tls.key')
-            fail_msg: "Deployment custom certificate files conflict"
-          when: binding_stat.stat.exists
-
-        - name: Read normalized bound material evidence
-          ansible.builtin.command:
-            argv:
-              - python3
-              - -c
-              - |
-                import hashlib
-                import json
-                import re
-                import ssl
-                import sys
-                files = {'tls.crt': open(sys.argv[1], 'rb').read(), 'tls.key': open(sys.argv[2], 'rb').read()}
-                digest = hashlib.sha256()
-                digest.update(b'opsctl-file-secret:1\0')
-                for name in sorted(files):
-                    encoded_name = name.encode('ascii')
-                    value = files[name]
-                    digest.update(len(encoded_name).to_bytes(2, 'big'))
-                    digest.update(encoded_name)
-                    digest.update(len(value).to_bytes(8, 'big'))
-                    digest.update(value)
-                match = re.search(br'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', files['tls.crt'], re.DOTALL)
-                if match is None:
-                    raise SystemExit(3)
-                der = ssl.PEM_cert_to_DER_cert(match.group().decode('ascii'))
-                fingerprint = hashlib.sha256(der).hexdigest()
-                print(json.dumps({'content_digest': digest.hexdigest(), 'leaf_fingerprint_sha256': fingerprint}, sort_keys=True, separators=(',', ':')))
-              - "{{ observed_certificate_file }}"
-              - "{{ observed_private_key_file }}"
-          register: bound_material_evidence
-          changed_when: false
-          when: binding_stat.stat.exists
-
-        - name: Parse normalized bound material evidence
-          ansible.builtin.set_fact:
-            parsed_material_evidence: "{{ bound_material_evidence.stdout | from_json }}"
-          when: binding_stat.stat.exists
+            observed_content_digest: "{{ selected_custom_binding.content_digest | default(none) }}"
+            observed_leaf_fingerprint: "{{ selected_custom_binding.leaf_fingerprint_sha256 | default(none) }}"
+            custom_selected_binding_bytes: "{{ selected_custom_binding.expected_binding }}"
 
         - name: Probe served custom certificates
           ansible.builtin.command:
@@ -187,7 +126,7 @@
           register: served_certificate_evidence
           changed_when: false
           failed_when: false
-          when: binding_stat.stat.exists
+          when: binding_present
 
         - name: Parse served certificate evidence
           ansible.builtin.assert:
@@ -196,20 +135,40 @@
               - served_certificate_evidence.stdout is string
               - (served_certificate_evidence.stdout | length) <= 65536
             fail_msg: "Served custom certificate observation failed"
-          when: binding_stat.stat.exists
+          when: binding_present
 
         - name: Read served certificate evidence
           ansible.builtin.set_fact:
             observed_certificate_hosts: "{{ served_certificate_evidence.stdout | from_json }}"
-            observed_content_digest: "{{ parsed_material_evidence.content_digest }}"
-            observed_leaf_fingerprint: "{{ parsed_material_evidence.leaf_fingerprint_sha256 }}"
             observed_route_hosts: "{{ route_hosts }}"
             observed_binding_count: 1
             binding_present: true
             binding_valid: true
           when:
-            - binding_stat.stat.exists
+            - binding_present
             - served_certificate_evidence.rc == 0
+
+        - name: Recheck canonical selection after serving probes
+          ansible.builtin.include_tasks:
+            file: traefik_certificate_selection.yml
+          vars:
+            certificate_selection_action: observe_custom
+            certificate_selection_request:
+              identity:
+                organization_id: "{{ org_id }}"
+                subject: {type: deployment, id: "{{ deployment_id }}"}
+                gateway_id: "{{ gateway_id }}"
+                server_id: "{{ server_id }}"
+                route_hosts: "{{ route_hosts }}"
+
+        - name: Require unchanged installed selection during serving probes
+          ansible.builtin.assert:
+            that:
+              - >-
+                (certificate_selection_result.stdout
+                | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
+                | from_json).custom_certificate_binding == selected_custom_binding
+            fail_msg: "Custom certificate selection changed during observation"
 
       rescue:
         - name: Mark unrecognized custom certificate evidence
@@ -229,26 +188,26 @@
         custom_certificate_classification: >-
           {%- if not binding_valid -%}unknown
           {%- elif not binding_present -%}absent
-          {%- elif observed_material_id == material_id
-              and observed_revision_id == revision_id
+          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
+              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
               and (
-                observed_content_digest != content_digest
-                or observed_leaf_fingerprint != leaf_fingerprint_sha256
+                observed_content_digest != ((custom_observation_expected | default({})).content_digest | default(content_digest))
+                or observed_leaf_fingerprint != ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
               ) -%}unknown
-          {%- elif observed_material_id == material_id
-              and observed_revision_id == revision_id
-              and observed_content_digest == content_digest
-              and observed_leaf_fingerprint == leaf_fingerprint_sha256
+          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
+              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
+              and observed_content_digest == ((custom_observation_expected | default({})).content_digest | default(content_digest))
+              and observed_leaf_fingerprint == ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
               and observed_binding_count == 1
               and observed_route_hosts == route_hosts
               and (observed_certificate_hosts | length) == (route_hosts | length)
               and (observed_certificate_hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
               and (observed_certificate_hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length) -%}exact
-          {%- elif observed_material_id == material_id
-              and observed_revision_id == revision_id
-              and observed_content_digest == content_digest
-              and observed_leaf_fingerprint == leaf_fingerprint_sha256
+              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))) | list | length) == (route_hosts | length) -%}exact
+          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
+              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
+              and observed_content_digest == ((custom_observation_expected | default({})).content_digest | default(content_digest))
+              and observed_leaf_fingerprint == ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
               and observed_binding_count == 1
               and observed_route_hosts == route_hosts -%}other
           {%- else -%}mixed

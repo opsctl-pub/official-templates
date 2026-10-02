@@ -47,12 +47,30 @@
     - name: Read current custom certificate observation
       ansible.builtin.include_tasks:
         file: ../tasks/traefik_custom_certificate_observation.yml
+      vars:
+        custom_observation_expected: "{{ expected_custom_certificate_observation }}"
 
     - name: Require unchanged custom certificate observation
       ansible.builtin.assert:
         that:
-          - custom_certificate_observation.digest == expected_custom_certificate_observation.digest
-          - custom_certificate_observation.classification in ['absent', 'exact', 'other']
+          - >-
+            (
+              custom_certificate_observation.digest == expected_custom_certificate_observation.digest
+              and custom_certificate_observation.classification in ['absent', 'exact', 'other']
+            ) or (
+              binding_valid and binding_present
+              and custom_certificate_observation.material_id == material_id
+              and custom_certificate_observation.revision_id == revision_id
+              and custom_certificate_observation.content_digest == content_digest
+              and custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
+              and custom_certificate_observation.route_hosts == route_hosts
+              and custom_certificate_observation.binding_count == 1
+              and custom_certificate_observation.host_count == (route_hosts | length)
+              and (custom_certificate_observation.hosts | map(attribute='hostname') | list) == route_hosts
+              and (custom_certificate_observation.hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
+              and (custom_certificate_observation.hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
+              and (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
+            )
         fail_msg: "Custom certificate state changed before installation"
 
     - name: Install immutable custom certificate material
@@ -232,7 +250,7 @@
             fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
           certificate_file: "{{ certificate_file }}"
           private_key_file: "{{ private_key_file }}"
-          expected_binding: "{{ (binding_content.content | b64decode) if binding_stat.stat.exists else none }}"
+          expected_binding: "{{ custom_selected_binding_bytes }}"
 
     - name: Build custom certificate installation result
       ansible.builtin.set_fact:
