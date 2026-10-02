@@ -51,6 +51,8 @@
       python3 - <<'PY'
       import json
       import subprocess
+      import base64
+      import sys
 
       original = json.loads(r'''{{ source_replacement_original | to_json }}''')
       expected = json.loads(r'''{{ source_replacement | to_json }}''')
@@ -131,11 +133,17 @@
       health_port = expected.get("container_port")
       health = subprocess.run(
           [
-              "docker", "exec", name, "sh", "-c",
-              f"wget -q --spider http://127.0.0.1:{health_port}{health_path}",
+              sys.executable, "-c",
+              base64.b64decode({{ lookup('file', playbook_dir + '/../scripts/container_http_health.py') | b64encode | to_json }}).decode(),
+              "--container", name,
+              "--organization", str((config.get("Labels") or {}).get("com.opsctl.org_id") or ""),
+              "--deployment", str((config.get("Labels") or {}).get("com.opsctl.deployment_id") or ""),
+              "--revision", str((config.get("Labels") or {}).get("com.opsctl.revision_id") or ""),
+              "--port", str(health_port), "--path", health_path,
           ],
-          capture_output=True,
-          text=True,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+          timeout=35,
       )
       if health.returncode != 0:
           raise SystemExit("source_replacement_restore_health_failed")
@@ -1221,7 +1229,7 @@
 
     - name: Determine health verification strategy
       set_fact:
-        health_strategy: "{{ 'healthcheck' if ((docker_health_support.stdout | default('') | trim) == 'yes') else ('http' if (effective_health_mode == 'host' or health_mode in ['container', 'traefik']) else 'running') }}"
+        health_strategy: "{{ 'healthcheck' if ((docker_health_support.stdout | default('') | trim) == 'yes') else ('http' if effective_health_mode in ['host', 'container', 'traefik'] else 'running') }}"
 
     - name: OPERATION_STEP health:check
       shell: |
@@ -1257,17 +1265,23 @@
             - (docker_health_support.stdout | default('') | trim) == "yes"
 
         - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
-          shell: |
-            docker exec "{{ container_name }}" sh -c "wget -q --spider http://127.0.0.1:{{ container_health_port }}{{ health_container_path }}"
-          args:
-            executable: /bin/sh
+          ansible.builtin.script:
+            cmd: >-
+              {{ (playbook_dir + '/../scripts/container_http_health.py') | quote }}
+              --container {{ container_name | quote }}
+              --organization {{ app_org_id | quote }}
+              --deployment {{ app_deployment_id | quote }}
+              --revision {{ app_revision_id | default('', true) | quote }}
+              --port {{ container_health_port | string | quote }}
+              --path {{ health_container_path | quote }}
+            executable: python3
           register: container_health_exec
+          changed_when: false
           retries: 20
           delay: 3
           until: container_health_exec.rc == 0
           when:
             - effective_health_mode in ['container', 'traefik']
-            - health_mode != 'auto'
             - (docker_health_support.stdout | default('') | trim) != "yes"
 
         - name: OPERATION_STEP health:check complete
