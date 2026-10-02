@@ -102,6 +102,129 @@
       when: container_inspect.rc == 0
       no_log: true
 
+    - name: Observe explicitly qualified whole-deployment route
+      when: app_route_retirement is defined
+      vars: &retirement_identity
+        deployment_id: "{{ app_route_retirement.topology.deployment_id }}"
+        org_id: "{{ app_route_retirement.topology.organization_id }}"
+        server_id: "{{ app_route_retirement.topology.server_id }}"
+        target_server: "{{ app_route_retirement.topology.server_name }}"
+        traefik_container_name: traefik
+        traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+        route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+        route_key: "deployment-{{ deployment_id }}"
+      block:
+        - name: Validate opt-in route retirement identity
+          assert:
+            that:
+              - app_route_retirement is mapping
+              - app_route_retirement.version == 1
+              - app_route_retirement.topology.gateway_engine in ['traefik', 'caddy']
+              - org_id == app_org_id
+              - deployment_id == app_deployment_id
+              - app_route_retirement.topology.app_container_name == app_container_name
+              - app_route_retirement.topology.app_slug == app_slug
+              - app_route_retirement.topology.server_name == target_server
+              - app_route_retirement.topology.route_hosts | length > 0
+            fail_msg: "Whole-deployment route retirement identity is invalid"
+
+        - name: Read canonical route observation
+          block: &retirement_observer
+            - name: Observe exact Traefik watched file
+              include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
+              when: app_route_retirement.topology.gateway_engine == 'traefik'
+
+            - name: Observe exact Caddy route through its canonical helper
+              script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py observe"
+              environment:
+                OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
+                OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
+                OPSCTL_PROXY_ENGINE: caddy
+                OPSCTL_SERVER_ID: "{{ server_id }}"
+                OPSCTL_TARGET_SERVER: "{{ target_server }}"
+              register: retirement_caddy_observer
+              changed_when: false
+              when: app_route_retirement.topology.gateway_engine == 'caddy'
+
+            - name: Read canonical Caddy output envelope
+              set_fact:
+                retirement_caddy_outputs: >-
+                  {{ retirement_caddy_observer.stdout_lines | select('match', '^TEMPLATE_OUTPUT_JSON=') | list }}
+              when: app_route_retirement.topology.gateway_engine == 'caddy'
+
+            - name: Require one Caddy output envelope
+              assert:
+                that: retirement_caddy_outputs | length == 1
+                fail_msg: "Canonical Caddy route observation is unavailable"
+              when: app_route_retirement.topology.gateway_engine == 'caddy'
+
+            - name: Read typed Caddy observation without parsing route files
+              set_fact:
+                route_observation: "{{ (retirement_caddy_outputs[0] | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).deployment_route_observation }}"
+              when: app_route_retirement.topology.gateway_engine == 'caddy'
+
+        - name: Require current route to match captured ownership or absence
+          assert:
+            that:
+              - route_observation == app_route_retirement.present or route_observation == app_route_retirement.absent
+            fail_msg: "Whole-deployment route changed before retirement"
+
+        - name: Preserve fresh route comparison evidence
+          set_fact:
+            retirement_before: "{{ route_observation }}"
+
+- import_playbook: traefik_route_converge.yml
+  when: app_route_retirement is defined and app_route_retirement.topology.gateway_engine == 'traefik'
+  vars: &retirement_converge
+    deployment_id: "{{ app_route_retirement.topology.deployment_id }}"
+    org_id: "{{ app_route_retirement.topology.organization_id }}"
+    server_id: "{{ app_route_retirement.topology.server_id }}"
+    target_server: "{{ app_route_retirement.topology.server_name }}"
+    app_slug: "{{ app_route_retirement.topology.app_slug }}"
+    app_container_name: "{{ app_route_retirement.topology.app_container_name }}"
+    route_state: absent
+    route_hosts: []
+    route_port: "{{ app_route_retirement.remove_args.route_port }}"
+    route_https: false
+    redirect_http_to_https: false
+    route_middlewares: "{{ app_route_retirement.remove_args.route_middlewares }}"
+    route_tls_binding: null
+    expected_route_observation: "{{ retirement_before }}"
+    proxy_engine: caddy
+    execution_contract: configuration
+
+- import_playbook: caddy_route_converge.yml
+  when: app_route_retirement is defined and app_route_retirement.topology.gateway_engine == 'caddy'
+  vars: *retirement_converge
+
+- name: Verify qualified whole-deployment route absence
+  hosts: all
+  gather_facts: false
+  become: true
+  vars: *retirement_identity
+  tasks:
+    - name: Reobserve canonical route after retirement
+      when: app_route_retirement is defined
+      block: *retirement_observer
+
+    - name: Require exact typed route absence
+      assert:
+        that: route_observation == app_route_retirement.absent
+        fail_msg: "Whole-deployment route absence could not be verified"
+      when: app_route_retirement is defined
+
+    - name: Retain typed route absence for completed child output
+      set_fact:
+        retirement_after: "{{ route_observation }}"
+      when: app_route_retirement is defined
+
+- name: Finish exact managed container removal
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('') }}"
+  tasks:
     - name: Remove inspected immutable container identity
       command:
         argv:
@@ -112,6 +235,25 @@
       register: container_remove
       changed_when: container_remove.rc == 0
       when: container_inspect.rc == 0
+
+    - name: Record exact whole-final route retirement evidence
+      command:
+        argv:
+          - python3
+          - -c
+          - "import json,sys; print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'route_retirement': json.loads(sys.argv[1])}, separators=(',', ':')))"
+          - >-
+            {{ {'version': 1, 'identity': {
+              'organization_id': app_route_retirement.topology.organization_id,
+              'deployment_id': app_route_retirement.topology.deployment_id,
+              'server_id': app_route_retirement.topology.server_id,
+              'gateway_id': app_route_retirement.topology.gateway_id,
+              'node_id': app_route_retirement.topology.node_id,
+              'revision_id': app_route_retirement.topology.revision_id,
+              'identity_digest': app_route_retirement.topology.identity_digest
+            }, 'observation': retirement_after} | to_json }}
+      changed_when: false
+      when: app_route_retirement is defined
 
     - name: Verify inspected container identity is absent
       command:
