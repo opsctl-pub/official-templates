@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import ipaddress
@@ -9,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 from uuid import UUID
@@ -112,6 +114,74 @@ def validate_owner(owner):
         raise CertificateSelectionError("Certificate selection source is invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", owner["fingerprint_sha256"]):
         raise CertificateSelectionError("Certificate selection fingerprint is invalid")
+
+
+def layout_metadata(path):
+    """Stat one pinned path through descriptor-relative, no-follow parents."""
+    result = dict.fromkeys((
+        "exists", "is_dir", "is_regular", "is_symlink", "uid_is_root",
+        "private_mode", "canonical_path",
+    ))
+    result["code"] = "unknown"
+    if (not isinstance(path, str) or len(path) > 4096
+            or not path.startswith("/") or str(Path(path)) != path
+            or ".." in Path(path).parts or path == "/"):
+        result.update(canonical_path=False, code="noncanonical_path")
+        return result
+    result["canonical_path"] = True
+    descriptor = None
+    try:
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for part in Path(path).parts[1:-1]:
+            next_descriptor = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        value = os.stat(Path(path).name, dir_fd=descriptor, follow_symlinks=False)
+        result.update(
+            exists=True, is_dir=stat.S_ISDIR(value.st_mode),
+            is_regular=stat.S_ISREG(value.st_mode),
+            is_symlink=stat.S_ISLNK(value.st_mode), uid_is_root=value.st_uid == 0,
+            private_mode=not bool(value.st_mode & 0o077),
+            canonical_path=not stat.S_ISLNK(value.st_mode),
+            code="symlink" if stat.S_ISLNK(value.st_mode) else "observed",
+        )
+    except FileNotFoundError:
+        result.update(exists=False, code="missing")
+    except NotADirectoryError:
+        result.update(canonical_path=False, code="unsafe_parent")
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            result.update(canonical_path=False, code="unsafe_parent")
+        else:
+            result["code"] = "stat_unavailable"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return result
+
+
+def observe_layout(request, state_dir, dynamic_dir):
+    """Project only fixed-role metadata, independently of material selection."""
+    if not isinstance(request, dict) or set(request) != {"identity", "operation_id"}:
+        raise CertificateSelectionError("Certificate selection request is invalid")
+    validate_identity(request["identity"])
+    operation_id = request["operation_id"]
+    if not isinstance(operation_id, str) or str(UUID(operation_id)) != operation_id:
+        raise CertificateSelectionError("Certificate selection operation is invalid")
+    key = subject_key(request["identity"]["subject"])
+    # Preserve the configured spelling: joining must not normalize unsafe roots.
+    subject_dir = state_dir + "/" + key
+    paths = {
+        "acme_root": state_dir,
+        "subject_directory": subject_dir,
+        "renewal": subject_dir + "/renewal.json",
+        "renewal_request": subject_dir + "/renewal-request.json",
+        "selected_binding": dynamic_dir + "/certificate-" + key + ".yml",
+    }
+    return {role: layout_metadata(path) for role, path in paths.items()}
 
 
 def closed_json_pairs(pairs):
@@ -420,6 +490,12 @@ class TraefikCertificateSelection:
 
 def main():
     request = json.loads(sys.stdin.buffer.read(65537))
+    if sys.argv[1] == "observe_layout":
+        result = observe_layout(
+            request, os.environ["OPSCTL_ACME_STATE_DIR"], os.environ["OPSCTL_DYNAMIC_DIR"],
+        )
+        print("CERTIFICATE_LAYOUT_METADATA=" + json.dumps(result, sort_keys=True))
+        return
     selection = TraefikCertificateSelection(
         os.environ["OPSCTL_CERTIFICATE_DIR"], os.environ["OPSCTL_DYNAMIC_DIR"],
     )
