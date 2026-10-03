@@ -44,6 +44,33 @@
             group: root
             mode: '0700'
 
+        - name: Read bounded managed certificate layout metadata
+          ansible.builtin.command:
+            argv: [python3, "{{ selection_scratch.path }}/selection.py", observe_layout]
+            stdin: "{{ certificate_selection_request | to_json }}"
+          environment:
+            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
+            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
+            PYTHONDONTWRITEBYTECODE: '1'
+          register: selection_layout
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Require bounded safe layout metadata output
+          ansible.builtin.assert:
+            that:
+              - selection_layout.rc == 0
+              - selection_layout.stdout is string
+              - selection_layout.stdout | length <= 8192
+              - selection_layout.stdout is match('^CERTIFICATE_LAYOUT_METADATA=')
+            fail_msg: Certificate layout metadata is unavailable
+          no_log: true
+
+        - name: Emit separate safe layout metadata
+          ansible.builtin.debug:
+            msg: "{{ selection_layout.stdout }}"
+
         - name: Read selected binding and material snapshot
           ansible.builtin.command:
             argv: [python3, "{{ selection_scratch.path }}/selection.py", observe]
