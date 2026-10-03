@@ -20,8 +20,8 @@ from cryptography.hazmat.primitives import hashes
 
 from traefik_certificate_selection import (
     CertificateSelectionError, TraefikCertificateSelection, atomic_write,
-    HEADER, closed_json_pairs, subject_key, sync_directory, validate_identity,
-    validate_owner, validity,
+    HEADER, closed_json_pairs, layout_metadata, subject_key, sync_directory,
+    validate_identity, validate_owner, validity,
 )
 
 
@@ -566,6 +566,27 @@ def retirement_records(directory, identity, selection, state_dir):
     selection.material(owner, files["certFile"], files["keyFile"], require_current_validity=False)
 
 
+def retire_missing_root(request, selection, state_dir):
+    """A never-enrolled subject can retire only a freshly absent selection."""
+    if request["expected_binding"] is not None:
+        raise AutomaticCertificateError("Automatic retirement selection changed")
+    observation = {key: request[key] for key in ("identity", "operation_id")}
+    with selection.locked():
+        before = layout_metadata(os.fspath(state_dir))
+        if (before["code"] != "missing" or before["exists"] is not False
+                or before["canonical_path"] is not True):
+            raise AutomaticCertificateError("Automatic retirement state layout changed")
+        current = selection.observe(observation)["automatic_certificate_selection"]
+        if current["expected_binding"] is not None:
+            raise AutomaticCertificateError("Automatic retirement selection changed")
+        after = layout_metadata(os.fspath(state_dir))
+        if (after["code"] != "missing" or after["exists"] is not False
+                or after["canonical_path"] is not True):
+            raise AutomaticCertificateError("Automatic retirement state layout changed")
+        result = {**observation, "selection_state": "absent", "renewal_enrolled": False}
+        return {"automatic_certificate_retirement": {**result, "digest": digest(result)}}
+
+
 def retire(request, certificate_dir, dynamic_dir, state_dir):
     """Retire only exact automatic selection and qualified renewal inputs."""
     if not isinstance(request, dict) or set(request) != {"identity", "operation_id", "expected_binding"}:
@@ -579,6 +600,14 @@ def retire(request, certificate_dir, dynamic_dir, state_dir):
                 or not expected.isascii() or not 1 <= len(expected) <= 65536)):
         raise AutomaticCertificateError("Automatic retirement identity is invalid")
     root = Path(state_dir)
+    layout = layout_metadata(os.fspath(state_dir))
+    if (layout["code"] == "missing" and layout["exists"] is False
+            and layout["canonical_path"] is True):
+        return retire_missing_root(
+            request, TraefikCertificateSelection(certificate_dir, dynamic_dir), state_dir,
+        )
+    if layout["code"] != "observed" or layout["canonical_path"] is not True:
+        raise AutomaticCertificateError("Automatic retirement state layout is invalid")
     if (not root.is_absolute() or root.resolve() != root or not root.is_dir()
             or root.stat().st_mode & 0o077):
         raise AutomaticCertificateError("Automatic retirement state layout is invalid")
