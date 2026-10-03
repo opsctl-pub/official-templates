@@ -54,7 +54,8 @@ class NativeDocker:
     """File-local Popen transport; actual invoke bounds and accounting still run."""
 
     def __init__(self, value, directory, *, present=True, change=None, attachments=0,
-                 unavailable=False, inspect_failed=False, create_failed=False):
+                 unavailable=False, inspect_failed=False, create_failed=False, containers=None,
+                 container_inspect_failed=False):
         self.value = value
         self.directory = directory
         self.present = present
@@ -63,6 +64,8 @@ class NativeDocker:
         self.unavailable = unavailable
         self.inspect_failed = inspect_failed
         self.create_failed = create_failed
+        self.containers = containers or {}
+        self.container_inspect_failed = container_inspect_failed
         self.calls = []
 
     def __call__(self, argv, *, stdout, stderr, env):
@@ -70,6 +73,20 @@ class NativeDocker:
         assert argv[0] == "/usr/bin/docker"
         self.calls.append(argv)
         family, action = argv[1:3]
+        if family == "container":
+            if action == "ls":
+                assert argv[3:] == ["--all", "--quiet", "--no-trunc"]
+                output = "\n".join(self.containers).encode()
+                code = 0
+            elif action == "inspect":
+                assert argv[3:5] == ["--format", '[{{json .Id}},{{json .Mounts}}]']
+                assert argv[-2] == "--" and argv[-1] in self.containers
+                output = json.dumps([argv[-1], self.containers[argv[-1]]["mounts"]]).encode()
+                code = int(self.container_inspect_failed)
+            else:
+                raise AssertionError("Unexpected container command")
+            stdout.write(output)
+            return Process(code)
         assert family == ("volume" if self.value["kind"] == "Volume" else "network")
         code, output = 0, b""
         if self.unavailable:
@@ -101,8 +118,7 @@ class NativeDocker:
             self.present = True
             code = 1 if self.create_failed else 0
         elif action == "rm":
-            assert family == "network"
-            assert argv[3:] == ["--", "a" * 64]
+            assert argv[3:] == ["--", resource.locator(self.value) if family == "volume" else "a" * 64]
             self.present = False
         else:
             raise AssertionError("Unexpected native command")
@@ -140,7 +156,7 @@ class LocalResourceTests(unittest.TestCase):
     def transport(self, value, **kwargs):
         return NativeDocker(value, self.directory.name, **kwargs)
 
-    def test_no_paths_options_or_volume_deletion_even_before_inspection(self):
+    def test_no_paths_options_or_uncaptured_volume_deletion_before_inspection(self):
         for value in (request(action="delete"), request(locator="arbitrary"), request(driver="nfs"),
                       request(generation=True), request(requested_bytes=0), request(backing_id="bad"),
                       request("Network", backing_id=BACKING), request(server_id="bad")):
@@ -232,9 +248,9 @@ class LocalResourceTests(unittest.TestCase):
         transport = self.transport(value)
         with patch.object(resource.subprocess, "Popen", side_effect=transport):
             output = resource.execute(value)
-        self.assertEqual(transport.calls[2], ["/usr/bin/docker", "network", "rm", "--", "a" * 64])
+        self.assertEqual(transport.calls[4], ["/usr/bin/docker", "network", "rm", "--", "a" * 64])
         self.assertEqual(output["presence"], "absent")
-        self.assertEqual([argv[2] for argv in transport.calls], ["ls", "inspect", "rm", "ls"])
+        self.assertEqual([argv[2] for argv in transport.calls], ["ls", "inspect", "ls", "inspect", "rm", "ls"])
 
     def test_nonempty_network_refuses_removal(self):
         value = request("Network", action="delete", expected_incarnation="a" * 64)
@@ -243,6 +259,52 @@ class LocalResourceTests(unittest.TestCase):
             with self.assertRaisesRegex(resource.ResourceError, "in_use"):
                 resource.execute(value)
         self.assertEqual([argv[2] for argv in transport.calls], ["ls", "inspect"])
+
+    def test_volume_delete_counts_readonly_and_writable_created_exited_consumers(self):
+        value = request(action="delete", expected_incarnation="created")
+        for state in ("created", "exited", "running"):
+            for writable in (True, False):
+                container = {"state": state, "mounts": [{"Type": "volume", "Name": resource.locator(value),
+                                                          "RW": writable}]}
+                transport = self.transport(value, containers={"c" * 64: container})
+                with self.subTest(state=state, writable=writable), patch.object(
+                        resource.subprocess, "Popen", side_effect=transport):
+                    with self.assertRaisesRegex(resource.ResourceError, "local_volume_in_use"):
+                        resource.execute(value)
+                self.assertFalse(any(argv[2] == "rm" for argv in transport.calls))
+                self.assertIn(["/usr/bin/docker", "container", "ls", "--all", "--quiet", "--no-trunc"],
+                              transport.calls)
+
+    def test_volume_delete_unknown_consumer_inspection_or_mode_fails_closed(self):
+        value = request(action="delete", expected_incarnation="created")
+        for mount in ({"Type": "volume", "Name": resource.locator(value)},
+                      {"Type": "volume", "Name": resource.locator(value), "RW": "false"},
+                      {"Type": "volume", "RW": True}):
+            transport = self.transport(value, containers={"c" * 64: {"mounts": [mount]}})
+            with patch.object(resource.subprocess, "Popen", side_effect=transport):
+                with self.assertRaisesRegex(resource.ResourceError, "observation_unknown"):
+                    resource.execute(value)
+            self.assertFalse(any(argv[2] == "rm" for argv in transport.calls))
+        transport = self.transport(value, containers={"c" * 64: {"mounts": []}}, container_inspect_failed=True)
+        with patch.object(resource.subprocess, "Popen", side_effect=transport):
+            with self.assertRaisesRegex(resource.ResourceError, "observation_unknown"):
+                resource.execute(value)
+
+    def test_volume_delete_uses_exact_name_without_force_then_proves_absence(self):
+        value = request(action="delete", expected_incarnation="created")
+        transport = self.transport(value)
+        with patch.object(resource.subprocess, "Popen", side_effect=transport):
+            output = resource.execute(value)
+        self.assertEqual(output["presence"], "absent")
+        self.assertEqual(output["attachment_count"], 0)
+        self.assertTrue(output["changed"])
+        self.assertIn(["/usr/bin/docker", "volume", "rm", "--", resource.locator(value)], transport.calls)
+        self.assertFalse(any("--force" in argv or "-f" in argv for argv in transport.calls))
+        calls = len(transport.calls)
+        with patch.object(resource.subprocess, "Popen", side_effect=transport):
+            self.assertFalse(resource.execute(value)["changed"])
+        self.assertEqual(transport.calls[calls:], [["/usr/bin/docker", "volume", "ls", "--format", "{{.Name}}",
+                                                 "--filter", "name=^" + resource.locator(value) + "$"]])
 
     def test_missing_incarnation_never_allocates_replacement(self):
         value = request(expected_incarnation="old")
@@ -302,7 +364,7 @@ class IsolatedDaemonTests(unittest.TestCase):
         second = resource.invoke(docker, ["run", "--rm", "-v", native + ":/data:ro", "busybox:latest",
                                           "cat", "/data/proof"])
         self.assertTrue(second.returncode == 0 and second.stdout == b"retained-synthetic")
-        with self.assertRaisesRegex(resource.ResourceError, "retained"):
+        with self.assertRaisesRegex(resource.ResourceError, "local_volume_delete_identity_required"):
             resource.execute({**volume, "action": "delete"})
         self.assertEqual(resource.execute(volume)["incarnation"], created["incarnation"])
 

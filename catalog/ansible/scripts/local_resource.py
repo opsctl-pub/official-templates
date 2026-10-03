@@ -1,4 +1,4 @@
-"""Closed managed local Volume/Network actuator; never delete or adopt data."""
+"""Closed managed local allocation actuator; never adopt or force-detach data."""
 import argparse
 import base64
 import contextlib
@@ -43,8 +43,8 @@ def validate(request):
     if incarnation is not None and (not isinstance(incarnation, str) or not incarnation or len(incarnation) > 128):
         raise ResourceError("local_resource_invalid_request")
     if request["kind"] == "Volume":
-        if request["action"] == "delete":
-            raise ResourceError("local_volume_retained")
+        if request["action"] == "delete" and incarnation is None:
+            raise ResourceError("local_volume_delete_identity_required")
         if not isinstance(request.get("backing_id"), str) or str(UUID(request["backing_id"])) != request["backing_id"]:
             raise ResourceError("local_resource_invalid_request")
         requested = request.get("requested_bytes")
@@ -199,6 +199,48 @@ def capacity(docker, request, identity):
             os.close(descriptor)
 
 
+def volume_consumers(docker, request):
+    """Stopped and readonly containers also retain a native allocation reference."""
+    result = invoke(docker, ["container", "ls", "--all", "--quiet", "--no-trunc"])
+    if result.returncode:
+        raise ResourceError("local_resource_observation_unknown")
+    try:
+        identities = result.stdout.decode("ascii").splitlines()
+    except UnicodeError:
+        raise ResourceError("local_resource_observation_unknown") from None
+    if (len(identities) > 256 or len(set(identities)) != len(identities)
+            or any(not re.fullmatch(r"[a-f0-9]{64}", item) for item in identities)):
+        raise ResourceError("local_resource_observation_limit")
+    count = 0
+    deadline = time.monotonic() + 20
+    for identity in identities:
+        if time.monotonic() >= deadline:
+            raise ResourceError("local_resource_observation_limit")
+        result = invoke(docker, ["container", "inspect", "--format",
+                                '[{{json .Id}},{{json .Mounts}}]', "--", identity])
+        if result.returncode:
+            raise ResourceError("local_resource_observation_unknown")
+        try:
+            value = json.loads(result.stdout)
+        except (ValueError, UnicodeError):
+            raise ResourceError("local_resource_observation_unknown") from None
+        if (not isinstance(value, list) or len(value) != 2 or value[0] != identity
+                or not isinstance(value[1], list)):
+            raise ResourceError("local_resource_observation_unknown")
+        matched = False
+        for mount in value[1]:
+            if (not isinstance(mount, dict) or not isinstance(mount.get("Type"), str)
+                    or type(mount.get("RW")) is not bool):
+                raise ResourceError("local_resource_observation_unknown")
+            if mount["Type"] != "volume":
+                continue
+            if not isinstance(mount.get("Name"), str) or not mount["Name"]:
+                raise ResourceError("local_resource_observation_unknown")
+            matched = matched or mount["Name"] == locator(request)
+        count += int(matched)
+    return count
+
+
 @contextlib.contextmanager
 def exclusion(request):
     """Use the same native-resource exclusion as shared Compose transitions."""
@@ -224,7 +266,7 @@ def exclusion(request):
 
 
 def execute(request):
-    """Idempotent exact create/observe and empty-network removal; no Volume rm."""
+    """Exact allocation and protected consumer-free deletion under native exclusion."""
     validate(request)
     with exclusion(request):
         return execute_locked(request)
@@ -252,11 +294,15 @@ def execute_locked(request):
         before = after
         changed = result.returncode == 0
     elif before is not None and request["action"] == "delete":
-        if before["attachment_count"] != 0:
-            raise ResourceError("local_network_in_use")
-        result = invoke(docker, ["network", "rm", "--", before["incarnation"]])
+        count = volume_consumers(docker, request) if family == "volume" else before["attachment_count"]
+        if count != 0:
+            raise ResourceError("local_volume_in_use" if family == "volume" else "local_network_in_use")
+        if observe(docker, request) != before:
+            raise ResourceError("local_resource_incarnation_changed")
+        identity = locator(request) if family == "volume" else before["incarnation"]
+        result = invoke(docker, [family, "rm", "--", identity])
         if result.returncode:
-            raise ResourceError("local_network_removal_unknown")
+            raise ResourceError("local_resource_removal_unknown")
         if observe(docker, request) is not None:
             raise ResourceError("local_resource_incarnation_changed")
         before = None
