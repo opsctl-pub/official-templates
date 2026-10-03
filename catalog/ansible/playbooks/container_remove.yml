@@ -339,7 +339,7 @@
                     raise ValueError('drain_barrier_namespace_changed')
                 return run('nsenter', '-t', str(pid), '-n', 'iptables', '-w', *args)
             jump = ('INPUT', '-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', chain)
-            barrier_rule = '-A %s -j REJECT --reject-with tcp-reset' % chain
+            barrier_rule = '-A %s -p tcp -m tcp -j REJECT --reject-with tcp-reset' % chain
             def check_barrier():
                 if firewall('-S', chain).splitlines() != ['-N ' + chain, barrier_rule]:
                     raise ValueError('drain_barrier_changed')
@@ -438,7 +438,7 @@
                         firewall('-N', chain)
                         rules = ['-N ' + chain]
                     if rules == ['-N ' + chain]:
-                        firewall('-A', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                        firewall('-A', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
                     if not references:
                         firewall('-I', *jump)
                     deadline = time.monotonic() + contract['timeout_s']
@@ -468,7 +468,7 @@
                     if references:
                         firewall('-D', *jump)
                     if rules == ['-N ' + chain, barrier_rule]:
-                        firewall('-D', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                        firewall('-D', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
                     if rules is not None:
                         firewall('-X', chain)
                     raise
@@ -507,7 +507,10 @@
       when: app_local_runtime is defined and app_connection_drain is defined
 
     - name: Remove the shared reviewed Compose deployment
-      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/container_compose.yml"
+      ansible.builtin.include_tasks:
+        file: "{{ playbook_dir }}/../tasks/container_compose.yml"
+        apply:
+          no_log: true
       when: app_local_runtime is defined
 
     - name: Remove inspected immutable container identity
@@ -522,12 +525,8 @@
       when: container_inspect.rc == 0 and app_local_runtime is not defined
 
     - name: Record exact whole-final route retirement evidence
-      command:
-        argv:
-          - python3
-          - -c
-          - "import json,sys; print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'route_retirement': json.loads(sys.argv[1])}, separators=(',', ':')))"
-          - >-
+      set_fact:
+        removal_route_receipt: >-
             {{ {'version': 1, 'identity': {
               'organization_id': app_route_retirement.topology.organization_id,
               'deployment_id': app_route_retirement.topology.deployment_id,
@@ -536,8 +535,7 @@
               'node_id': app_route_retirement.topology.node_id,
               'revision_id': app_route_retirement.topology.revision_id,
               'identity_digest': app_route_retirement.topology.identity_digest
-            }, 'observation': retirement_after} | to_json }}
-      changed_when: false
+            }, 'observation': retirement_after} }}
       when: app_route_retirement is defined
 
     - name: Verify inspected container identity is absent
@@ -591,8 +589,75 @@
       register: drain_removal_output
       changed_when: false
       when: app_connection_drain is defined
+      no_log: true
 
-    - name: Return registered drain-bound removal receipt
+    - name: Assemble complete verified removal output
+      command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, sys
+
+            def registered(text, key):
+                lines = text.strip().splitlines()
+                prefix = 'TEMPLATE_OUTPUT_JSON='
+                if len(lines) != 1 or not lines[0].startswith(prefix):
+                    raise ValueError()
+                envelope = json.loads(lines[0][len(prefix):])
+                if not isinstance(envelope, dict) or set(envelope) != {key}:
+                    raise ValueError()
+                value = envelope[key]
+                if not isinstance(value, dict):
+                    raise ValueError()
+                return value
+
+            try:
+                request = json.loads(sys.argv[2])
+                route = json.loads(sys.argv[3])
+                drain_required = json.loads(sys.argv[5])
+                output = {}
+                if request:
+                    proof = registered(sys.argv[1], 'local_runtime')
+                    if (proof.get('protocol') != 'opsctl-local-runtime/1'
+                            or proof.get('presence') != 'absent' or proof.get('ready') is not False
+                            or any(proof.get(key) != request[key] for key in (
+                                'organization_id', 'deployment_id', 'server_id', 'operation_id', 'revision_id'))
+                            or proof.get('container_id') != request['previous']['container_id']
+                            or not isinstance(proof.get('attachments'), list)
+                            or not isinstance(proof.get('detached_attachments', []), list)):
+                        raise ValueError()
+                    output['local_runtime'] = proof
+                elif sys.argv[1]:
+                    raise ValueError()
+                if route:
+                    if (not isinstance(route, dict) or set(route) != {'version', 'identity', 'observation'}
+                            or type(route['version']) is not int or route['version'] != 1
+                            or not isinstance(route['identity'], dict) or not isinstance(route['observation'], dict)):
+                        raise ValueError()
+                    output['route_retirement'] = route
+                if drain_required:
+                    receipt = registered(sys.argv[4], 'connection_drain_removal')
+                    if set(receipt) != {'contract_digest', 'container_id', 'absent'} or receipt['absent'] is not True:
+                        raise ValueError()
+                    output['connection_drain_removal'] = receipt
+                elif sys.argv[4]:
+                    raise ValueError()
+                if output:
+                    print('TEMPLATE_OUTPUT_JSON=' + json.dumps(output, separators=(',', ':')))
+            except Exception:
+                print('Canonical removal output is invalid.', file=sys.stderr)
+                raise SystemExit(1)
+          - "{{ compose_transition.stdout | default('') if app_local_runtime is defined else '' }}"
+          - "{{ (app_local_runtime if app_local_runtime is defined else {}) | to_json }}"
+          - "{{ removal_route_receipt | default({}) | to_json }}"
+          - "{{ drain_removal_output.stdout | default('') if app_connection_drain is defined else '' }}"
+          - "{{ (app_connection_drain is defined) | to_json }}"
+      register: verified_removal_output
+      changed_when: false
+      no_log: true
+
+    - name: Return complete verified removal output
       debug:
-        msg: "{{ drain_removal_output.stdout }}"
-      when: app_connection_drain is defined
+        msg: "{{ verified_removal_output.stdout }}"
+      when: verified_removal_output.stdout | length > 0
