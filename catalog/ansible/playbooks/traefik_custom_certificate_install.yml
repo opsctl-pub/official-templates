@@ -55,8 +55,19 @@
         that:
           - >-
             (
-              custom_certificate_observation.digest == expected_custom_certificate_observation.digest
-              and custom_certificate_observation.classification in ['absent', 'exact', 'other']
+              custom_certificate_observation.classification in ['absent', 'exact', 'other']
+              and expected_custom_certificate_observation.classification in ['absent', 'exact', 'other']
+              and (
+                custom_certificate_observation
+                | dict2items
+                | rejectattr('key', 'in', ['observed_at', 'digest', 'classification'])
+                | items2dict
+              ) == (
+                expected_custom_certificate_observation
+                | dict2items
+                | rejectattr('key', 'in', ['observed_at', 'digest', 'classification'])
+                | items2dict
+              )
             ) or (
               binding_valid and binding_present
               and custom_certificate_observation.material_id == material_id
