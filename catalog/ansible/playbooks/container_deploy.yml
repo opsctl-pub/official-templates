@@ -7,7 +7,8 @@
     container_name: "{{ app_container_name | default('app') }}"
     router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
     health_path: "{{ app_health_path | default('/health') }}"
-    host_health_port: "{{ app_health_port | default(app_ports[0]) }}"
+    host_health_port: "{{ app_health_port | default((app_ports | default([]) | first) | default(none)) }}"
+    local_runtime_enabled: "{{ app_local_runtime is defined }}"
     exposure_mode: "{{ backend_exposure_mode | default('host') }}"
     loopback_backend_enabled: "{{ exposure_mode == 'loopback' }}"
     source_dual_backend_enabled: "{{ exposure_mode == 'loopback_wireguard' }}"
@@ -31,7 +32,7 @@
     health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
     health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
     published_ports: []
-    host_port_preflight_enabled: "{{ (not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled }}"
+    host_port_preflight_enabled: "{{ not local_runtime_enabled and ((not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled) }}"
     traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
     traefik_label_map: {}
     opsctl_label_map:
@@ -168,6 +169,23 @@
         that:
           - exposure_mode in ['host', 'wireguard', 'loopback', 'loopback_wireguard']
         fail_msg: "backend_exposure_mode must be host, wireguard, loopback, or loopback_wireguard"
+
+    - name: Validate opt-in local transition before legacy effects
+      assert:
+        that:
+          - app_local_runtime is mapping
+          - app_local_runtime.protocol == 'opsctl-local-runtime/1'
+          - app_local_runtime.action == 'deploy'
+          - app_local_runtime.organization_id == app_org_id
+          - app_local_runtime.deployment_id == app_deployment_id
+          - app_local_runtime.server_id == server_id
+          - app_local_runtime.revision_id == app_revision_id
+          - app_local_runtime.container_name == container_name
+          - app_local_runtime.image == app_image
+          - source_replacement is not defined
+          - not (replace_conflicts | default(false) | bool)
+        fail_msg: "Local runtime requires exact identity and excludes legacy replacement"
+      when: local_runtime_enabled
 
     - name: Validate loopback backend mapping before mutation
       assert:
@@ -1154,24 +1172,31 @@
       register: legacy_opsctl_containers_result
       changed_when: false
       failed_when: legacy_opsctl_containers_result.rc != 0
+      when: not local_runtime_enabled
 
     - name: Parse legacy OpsCtl containers list
       set_fact:
         legacy_opsctl_containers: "{{ legacy_opsctl_containers_result.stdout | default('[]') | from_json }}"
+      when: not local_runtime_enabled
 
     - name: Remove legacy OpsCtl-managed container "{{ item }}"
       command: docker rm -f "{{ item }}"
       loop: "{{ legacy_opsctl_containers | default([]) }}"
-      when: (legacy_opsctl_containers | default([]) | length) > 0
+      when: not local_runtime_enabled and (legacy_opsctl_containers | default([]) | length) > 0
 
     - name: OPERATION_STEP replace:legacy_cleanup complete
       shell: |
         printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"display_name":"Remove legacy containers","removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
       args:
         executable: /bin/sh
-      when: (legacy_opsctl_containers | default([]) | length) > 0
+      when: not local_runtime_enabled and (legacy_opsctl_containers | default([]) | length) > 0
+
+    - name: Converge the shared reviewed Compose deployment
+      ansible.builtin.include_tasks: ../tasks/container_compose.yml
+      when: local_runtime_enabled
 
     - name: Start target container
+      when: not local_runtime_enabled
       block:
         - name: Start container "{{ container_name }}"
           community.docker.docker_container:
@@ -1225,6 +1250,7 @@
       changed_when: false
       failed_when: false
       when:
+        - not local_runtime_enabled
         - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
 
     - name: Determine health verification strategy
@@ -1238,6 +1264,7 @@
         executable: /bin/sh
 
     - name: Verify target container health
+      when: not local_runtime_enabled
       block:
         - name: Verify health endpoint at {{ health_url_local }}
           uri:

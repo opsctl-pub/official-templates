@@ -5,3 +5,6 @@ baseline_docker_packages:
   - docker.io
 baseline_docker_update_cache: true
 baseline_docker_service_name: docker
+baseline_compose_version: '2.39.4'
+baseline_compose_architecture: x86_64
+baseline_compose_checksum: 'sha256:7af95166a730b87e172d4fc9aefea8725d3c6c7327d59149267b452114ddb7d4'

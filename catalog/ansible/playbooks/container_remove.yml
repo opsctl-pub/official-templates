@@ -25,6 +25,19 @@
           - expected_image_ref is none or (expected_image_ref is string and expected_image_ref | length > 0)
         fail_msg: "Managed container removal identity is invalid"
 
+    - name: Validate opt-in local removal identity
+      assert:
+        that:
+          - app_local_runtime is mapping
+          - app_local_runtime.protocol == 'opsctl-local-runtime/1'
+          - app_local_runtime.action == 'remove'
+          - app_local_runtime.organization_id == expected_org_id
+          - app_local_runtime.deployment_id == expected_deployment_id
+          - app_local_runtime.server_id == server_id
+          - app_local_runtime.container_name == container_name
+        fail_msg: "Local removal requires exact managed identity"
+      when: app_local_runtime is defined
+
     - name: OPERATION_STEP remove:start
       shell: |
         printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"display_name":"Remove container","container_name":{{ container_name | to_json }}}}\n'
@@ -225,6 +238,278 @@
   vars:
     container_name: "{{ app_container_name | default('') }}"
   tasks:
+    - name: Verify opt-in HTTP drain barrier and exact inbound-zero before removal
+      command:
+        argv:
+          - python3
+          - -c
+          - |
+            import datetime, hashlib, json, os, pathlib, re, subprocess, sys, time
+            from urllib.parse import urlsplit
+
+            packet = json.loads(sys.argv[1])
+            mode = sys.argv[2]
+            root_dir = pathlib.Path(sys.argv[3])
+            contract, previous = packet['contract'], packet['receipt']
+            def digest(value):
+                return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            def run(*args):
+                return subprocess.check_output(args, text=True).strip()
+            def confirmed_absence(identity):
+                result = subprocess.run(
+                    ['docker', 'inspect', '--type=container', identity],
+                    text=True, capture_output=True,
+                )
+                return (result.returncode == 1 and result.stdout.strip() == '[]'
+                        and result.stderr.strip() in (
+                            'Error: No such object: ' + identity,
+                            'Error response from daemon: No such container: ' + identity,
+                        ))
+            def inspect():
+                items = json.loads(run('docker', 'inspect', '--type=container', contract['container_name']))
+                if len(items) != 1:
+                    raise ValueError('drain_container_unobservable')
+                value = items[0]
+                labels = value['Config']['Labels']
+                required = {
+                    'com.opsctl.managed': 'true', 'com.opsctl.org_id': contract['organization_id'],
+                    'com.opsctl.deployment_id': contract['deployment_id'],
+                    'com.opsctl.app': contract['app_slug'], 'com.opsctl.revision_id': contract['revision_id'],
+                }
+                if any(labels.get(key) != item for key, item in required.items()):
+                    raise ValueError('drain_container_owner_changed')
+                if value['Config']['Image'] != contract['image_ref'] or not value['State']['Running']:
+                    raise ValueError('drain_container_revision_changed')
+                network_mode = value['HostConfig']['NetworkMode']
+                if network_mode == 'host' or network_mode.startswith('container:'):
+                    raise ValueError('drain_shared_namespace_unsupported')
+                return value
+            now = datetime.datetime.now(datetime.timezone.utc)
+            gateway = previous['gateway']
+            if (previous['contract_digest'] != digest(contract)
+                    or previous['digest'] != digest({k: v for k, v in previous.items() if k != 'digest'})
+                    or gateway['route_observation'] != contract['route_observation']):
+                raise ValueError('drain_gateway_authority_changed')
+            if mode == 'remove' and confirmed_absence(contract['container_name']):
+                expected = previous['runtime']
+                chain = 'ocd' + digest({'root_id': contract['root_id'], 'container_id': expected['container_id']})[:20]
+                path = root_dir / (chain + '.json')
+                if (not isinstance(expected['container_id'], str)
+                        or re.fullmatch('[0-9a-f]{64}', expected['container_id']) is None
+                        or root_dir.is_symlink() or not root_dir.is_dir()
+                        or root_dir.stat().st_uid != 0 or root_dir.stat().st_mode & 0o077
+                        or path.is_symlink() or not path.is_file()
+                        or path.stat().st_uid != 0 or path.stat().st_mode & 0o077
+                        or json.loads(path.read_text()) != previous
+                        or expected['barrier_id'] != chain
+                        or type(expected['active_inbound_connections']) is not int
+                        or expected['active_inbound_connections'] != 0
+                        or not confirmed_absence(expected['container_id'])):
+                    raise ValueError('drain_absence_replay_unqualified')
+                sys.exit(0)
+            age = (now - datetime.datetime.fromisoformat(gateway['observed_at'].replace('Z', '+00:00'))).total_seconds()
+            if not 0 <= age <= contract['timeout_s'] + 60:
+                raise ValueError('drain_gateway_authority_stale')
+            runtime = inspect()
+            container_id, pid = runtime['Id'], runtime['State']['Pid']
+            namespace = os.stat('/proc/%s/ns/net' % pid).st_ino
+            if namespace == os.stat('/proc/1/ns/net').st_ino:
+                raise ValueError('drain_host_namespace_unsupported')
+            for other_id in run('docker', 'ps', '-q').splitlines():
+                other = json.loads(run('docker', 'inspect', other_id))[0]
+                if other['Id'] != container_id and os.stat('/proc/%s/ns/net' % other['State']['Pid']).st_ino == namespace:
+                    raise ValueError('drain_namespace_is_shared')
+            endpoint = urlsplit(contract['backend_url'])
+            mappings = runtime['HostConfig']['PortBindings'] or {}
+            ports = []
+            for internal, bindings in mappings.items():
+                for binding in bindings or []:
+                    if int(binding['HostPort']) == endpoint.port and binding['HostIp'] in ('', '0.0.0.0', endpoint.hostname):
+                        if not internal.endswith('/tcp'):
+                            raise ValueError('drain_non_tcp_port')
+                        ports.append(int(internal.split('/')[0]))
+            if len(ports) != 1:
+                raise ValueError('drain_port_binding_ambiguous')
+            port = ports[0]
+            chain = 'ocd' + digest({'root_id': contract['root_id'], 'container_id': container_id})[:20]
+            def firewall(*args):
+                current = inspect()
+                if (current['Id'] != container_id or current['State']['Pid'] != pid
+                        or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
+                    raise ValueError('drain_barrier_namespace_changed')
+                return run('nsenter', '-t', str(pid), '-n', 'iptables', '-w', *args)
+            jump = ('INPUT', '-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', chain)
+            barrier_rule = '-A %s -j REJECT --reject-with tcp-reset' % chain
+            def check_barrier():
+                if firewall('-S', chain).splitlines() != ['-N ' + chain, barrier_rule]:
+                    raise ValueError('drain_barrier_changed')
+                firewall('-C', *jump)
+            def count():
+                active, listeners = 0, 0
+                for table in ('tcp', 'tcp6'):
+                    for line in pathlib.Path('/proc/%s/net/%s' % (pid, table)).read_text().splitlines()[1:]:
+                        fields = line.split()
+                        if int(fields[1].rsplit(':', 1)[1], 16) != port:
+                            continue
+                        state = fields[3]
+                        if state == '0A':
+                            listeners += 1
+                        elif state not in ('06', '07'):
+                            active += 1
+                if not listeners:
+                    raise ValueError('drain_listener_unobservable')
+                current = inspect()
+                if (current['Id'] != container_id or current['State']['Pid'] != pid
+                        or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
+                    raise ValueError('drain_runtime_changed')
+                return active
+            root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if root_dir.is_symlink() or root_dir.stat().st_uid != 0 or root_dir.stat().st_mode & 0o077:
+                raise ValueError('drain_custody_directory_invalid')
+            path = root_dir / (chain + '.json')
+            if path.is_symlink() or path.with_suffix('.tmp').is_symlink():
+                raise ValueError('drain_custody_path_invalid')
+            if path.exists():
+                if not path.is_file() or path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
+                    raise ValueError('drain_local_custody_invalid')
+                prior = json.loads(path.read_text())
+                expected = prior['runtime']
+                if (prior['contract_digest'] != digest(contract)
+                        or prior['digest'] != digest({k: v for k, v in prior.items() if k != 'digest'})
+                        or prior['gateway']['route_observation'] != gateway['route_observation']
+                        or (expected['container_id'], expected['netns_inode'], expected['listen_port'], expected['barrier_id'])
+                        != (container_id, namespace, port, chain)):
+                    raise ValueError('drain_local_owner_changed')
+            if mode == 'remove':
+                if json.loads(path.read_text()) != previous:
+                    raise ValueError('drain_local_receipt_changed')
+                expected = previous['runtime']
+                if (expected['container_id'], expected['netns_inode'], expected['listen_port'], expected['barrier_id']) != (container_id, namespace, port, chain):
+                    raise ValueError('drain_removal_binding_changed')
+                check_barrier()
+                if count() != 0:
+                    raise ValueError('drain_inbound_connections_not_zero')
+            elif mode == 'observe':
+                intent_path = root_dir / (chain + '.barrier')
+                intent = {
+                    'contract_digest': digest(contract), 'container_id': container_id,
+                    'netns_inode': namespace, 'listen_port': port, 'barrier_id': chain,
+                }
+                def chain_rules():
+                    current = inspect()
+                    if (current['Id'] != container_id or current['State']['Pid'] != pid
+                            or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
+                        raise ValueError('drain_barrier_namespace_changed')
+                    result = subprocess.run(
+                        ['nsenter', '-t', str(pid), '-n', 'iptables', '-w', '-S', chain],
+                        text=True, capture_output=True,
+                    )
+                    if result.returncode == 0:
+                        return result.stdout.strip().splitlines()
+                    if result.returncode == 1 and 'No chain/target/match by that name' in result.stderr:
+                        return None
+                    raise ValueError('drain_barrier_unobservable')
+                initial_rules = chain_rules()
+                if intent_path.exists() or intent_path.is_symlink():
+                    if (intent_path.is_symlink() or not intent_path.is_file()
+                            or intent_path.stat().st_uid != 0 or intent_path.stat().st_mode & 0o077
+                            or json.loads(intent_path.read_text()) != intent):
+                        raise ValueError('drain_barrier_custody_changed')
+                else:
+                    if initial_rules is not None:
+                        raise ValueError('drain_foreign_barrier')
+                    descriptor = os.open(str(intent_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, 'w') as stream:
+                        json.dump(intent, stream, sort_keys=True, separators=(',', ':'))
+                jump_rule = '-A ' + ' '.join(jump)
+                def owned_partial():
+                    if json.loads(intent_path.read_text()) != intent:
+                        raise ValueError('drain_barrier_custody_changed')
+                    rules = chain_rules()
+                    if rules not in (None, ['-N ' + chain], ['-N ' + chain, barrier_rule]):
+                        raise ValueError('drain_barrier_changed')
+                    references = [line for line in firewall('-S').splitlines() if '-j ' + chain in line]
+                    if references not in ([], [jump_rule]):
+                        raise ValueError('drain_barrier_references_changed')
+                    return rules, references
+                try:
+                    rules, references = owned_partial()
+                    if rules is None:
+                        firewall('-N', chain)
+                        rules = ['-N ' + chain]
+                    if rules == ['-N ' + chain]:
+                        firewall('-A', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                    if not references:
+                        firewall('-I', *jump)
+                    deadline = time.monotonic() + contract['timeout_s']
+                    while True:
+                        check_barrier()
+                        if count() == 0:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise ValueError('drain_active_inbound_timeout')
+                        time.sleep(0.25)
+                    observed = {
+                        'container_id': container_id, 'netns_inode': namespace, 'listen_port': port,
+                        'active_inbound_connections': 0, 'barrier_id': chain,
+                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                    }
+                    receipt = {'version': 1, 'contract_digest': digest(contract), 'gateway': gateway, 'runtime': observed}
+                    receipt['digest'] = digest(receipt)
+                    encoded = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
+                    temporary = path.with_suffix('.tmp')
+                    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(descriptor, 'w') as stream:
+                        stream.write(encoded)
+                    os.replace(temporary, path)
+                    print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain': receipt}, separators=(',', ':')))
+                except Exception:
+                    rules, references = owned_partial()
+                    if references:
+                        firewall('-D', *jump)
+                    if rules == ['-N ' + chain, barrier_rule]:
+                        firewall('-D', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                    if rules is not None:
+                        firewall('-X', chain)
+                    raise
+            else:
+                raise ValueError('drain_mode_invalid')
+          - "{{ app_connection_drain | to_json }}"
+          - "{{ app_connection_drain_mode | default('remove') }}"
+          - "{{ opsctl_drain_receipt_dir | default('/var/lib/opsctl/connection-drains') }}"
+      register: connection_drain_check
+      when: app_connection_drain is defined
+
+    - name: Return registered connection drain observation
+      debug:
+        msg: "{{ connection_drain_check.stdout }}"
+      when: app_connection_drain is defined and app_connection_drain_mode | default('remove') == 'observe'
+
+    - name: End observation-only drain without container removal
+      meta: end_play
+      when: app_connection_drain is defined and app_connection_drain_mode | default('remove') == 'observe'
+
+    - name: Require drain receipt to match originally inspected immutable container
+      assert:
+        that:
+          - not container_absent
+          - container_payload.Id == app_connection_drain.receipt.runtime.container_id
+        fail_msg: "Connection drain inspected container identity changed"
+      when: app_connection_drain is defined and not container_absent
+
+    - name: Bind Compose removal to the same canonical drain incarnation
+      assert:
+        that:
+          - app_local_runtime.previous.container_id == app_connection_drain.receipt.runtime.container_id
+          - app_local_runtime.previous.revision_id == app_connection_drain.contract.revision_id
+          - container_absent or app_local_runtime.previous.container_id == container_payload.Id
+        fail_msg: "Compose removal and drain receipt must name the same incarnation"
+      when: app_local_runtime is defined and app_connection_drain is defined
+
+    - name: Remove the shared reviewed Compose deployment
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/container_compose.yml"
+      when: app_local_runtime is defined
+
     - name: Remove inspected immutable container identity
       command:
         argv:
@@ -234,7 +519,7 @@
           - "{{ container_payload.Id }}"
       register: container_remove
       changed_when: container_remove.rc == 0
-      when: container_inspect.rc == 0
+      when: container_inspect.rc == 0 and app_local_runtime is not defined
 
     - name: Record exact whole-final route retirement evidence
       command:
@@ -288,3 +573,26 @@
       args:
         executable: /bin/sh
       when: container_inspect.rc == 0
+
+    - name: Record exact drain-bound verified removal
+      command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, sys
+            receipt = json.loads(sys.argv[1])
+            value = {
+                'contract_digest': receipt['contract_digest'],
+                'container_id': receipt['runtime']['container_id'], 'absent': True,
+            }
+            print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain_removal': value}, separators=(',', ':')))
+          - "{{ app_connection_drain.receipt | to_json }}"
+      register: drain_removal_output
+      changed_when: false
+      when: app_connection_drain is defined
+
+    - name: Return registered drain-bound removal receipt
+      debug:
+        msg: "{{ drain_removal_output.stdout }}"
+      when: app_connection_drain is defined

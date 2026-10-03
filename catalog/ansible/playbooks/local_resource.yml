@@ -1,0 +1,29 @@
+---
+- name: Converge one exact managed local resource
+  hosts: all
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Skip local resource effects in simulate mode
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+    - name: Require the closed local resource contract
+      ansible.builtin.assert:
+        that:
+          - local_resource is mapping
+          - local_resource.protocol == 'opsctl-local-resource/1'
+          - local_resource.server_id == server_id
+          - local_resource.organization_id == org_id
+        fail_msg: "Local resource identity is invalid"
+  tasks:
+    - name: Observe or converge exact owned local allocation
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../scripts/local_resource.py
+          --request {{ (local_resource | to_json | b64encode) | quote }}
+        executable: python3
+      register: local_resource_result
+      changed_when: (local_resource_result.stdout | from_json).changed
+    - name: Emit typed local resource observation
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ {'local_resource': (local_resource_result.stdout | from_json)} | to_json }}"
