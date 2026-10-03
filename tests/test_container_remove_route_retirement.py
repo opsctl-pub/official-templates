@@ -67,18 +67,71 @@ class ContainerRemoveRouteRetirementTests(unittest.TestCase):
 
     def test_output_is_structured_exact_identity_and_observation_not_boolean(self):
         task = next(task for task in self.plays[-1]["tasks"] if "route retirement evidence" in task["name"])
-        argv = task["command"]["argv"]
         identity = {key: "synthetic-" + key for key in (
             "organization_id", "deployment_id", "server_id", "gateway_id", "node_id", "revision_id", "identity_digest",
         )}
         env = Environment(undefined=StrictUndefined)
         env.filters["to_json"] = json.dumps
         observation = {"presence": "absent", "digest": "a" * 64}
-        argument = env.from_string(argv[-1]).render(app_route_retirement={"topology": identity}, retirement_after=observation)
-        result = subprocess.run([sys.executable, "-c", argv[2], argument], check=True, capture_output=True, text=True)
+        from jinja2.nativetypes import NativeEnvironment
+        receipt = NativeEnvironment(undefined=StrictUndefined).from_string(
+            task["set_fact"]["removal_route_receipt"]).render(
+                app_route_retirement={"topology": identity}, retirement_after=observation)
+        envelope = next(task for task in self.plays[-1]["tasks"]
+                        if task["name"] == "Assemble complete verified removal output")
+        result = subprocess.run([sys.executable, "-c", envelope["command"]["argv"][2],
+            "", "{}", json.dumps(receipt), "", "false"], check=True, capture_output=True, text=True)
         output = json.loads(result.stdout.removeprefix("TEMPLATE_OUTPUT_JSON="))
         self.assertEqual(output["route_retirement"], {"version": 1, "identity": identity, "observation": observation})
-        self.assertFalse(task["changed_when"])
+        self.assertFalse(envelope["changed_when"])
+
+    def test_authoritative_envelope_preserves_all_applicable_proofs(self):
+        task = next(task for task in self.plays[-1]["tasks"]
+                    if task["name"] == "Assemble complete verified removal output")
+        request = {key: "synthetic-" + key for key in (
+            "organization_id", "deployment_id", "server_id", "operation_id", "revision_id")}
+        request["previous"] = {"container_id": "a" * 64}
+        proof = {**{key: value for key, value in request.items() if key != "previous"},
+                 "protocol": "opsctl-local-runtime/1", "container_id": "a" * 64,
+                 "presence": "absent", "ready": False, "attachments": [], "detached_attachments": []}
+        route = {"version": 1, "identity": {"deployment_id": request["deployment_id"]},
+                 "observation": {"presence": "absent"}}
+        drain = {"contract_digest": "b" * 64, "container_id": "a" * 64, "absent": True}
+        marker = lambda value: "TEMPLATE_OUTPUT_JSON=" + json.dumps(value)
+        for runtime in (False, True):
+            for routed in (False, True):
+                for drained in (False, True):
+                    with self.subTest(runtime=runtime, routed=routed, drained=drained):
+                        result = subprocess.run([sys.executable, "-c", task["command"]["argv"][2],
+                            marker({"local_runtime": proof}) if runtime else "",
+                            json.dumps(request if runtime else {}), json.dumps(route if routed else {}),
+                            marker({"connection_drain_removal": drain}) if drained else "",
+                            json.dumps(drained)], capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        expected = {}
+                        if runtime:
+                            expected["local_runtime"] = proof
+                        if routed:
+                            expected["route_retirement"] = route
+                        if drained:
+                            expected["connection_drain_removal"] = drain
+                        if expected:
+                            self.assertEqual(result.stdout.count("TEMPLATE_OUTPUT_JSON="), 1)
+                            self.assertEqual(json.loads(result.stdout.removeprefix("TEMPLATE_OUTPUT_JSON=")), expected)
+                        else:
+                            self.assertEqual(result.stdout, "")
+
+    def test_invalid_registered_runtime_cannot_be_reconstructed_from_desired(self):
+        task = next(task for task in self.plays[-1]["tasks"]
+                    if task["name"] == "Assemble complete verified removal output")
+        for value in ("", "TEMPLATE_OUTPUT_JSON={}", "TEMPLATE_OUTPUT_JSON=null",
+                      "TEMPLATE_OUTPUT_JSON={\"local_runtime\":true}", "untrusted\nTEMPLATE_OUTPUT_JSON={}"):
+            with self.subTest(value=value):
+                result = subprocess.run([sys.executable, "-c", task["command"]["argv"][2],
+                    value, '{"previous":{}}', "{}", "", "false"], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr.strip(), "Canonical removal output is invalid.")
 
     def drain_packet(self):
         def digest(value):
