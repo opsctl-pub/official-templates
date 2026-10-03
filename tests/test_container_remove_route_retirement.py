@@ -196,6 +196,12 @@ class ContainerRemoveRouteRetirementTests(unittest.TestCase):
                     action = command[0]
                     if action == "-S":
                         return "\n".join(state["references"])
+                    if "REJECT" in command:
+                        self.assertIn(action, ("-A", "-D"))
+                        self.assertEqual(command[1:], [
+                            chain, "-p", "tcp", "-m", "tcp", "-j", "REJECT",
+                            "--reject-with", "tcp-reset",
+                        ])
                     writes.append(command)
                     if action == "-N":
                         state["rules"] = ["-N " + chain]

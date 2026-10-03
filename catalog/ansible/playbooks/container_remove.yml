@@ -339,7 +339,7 @@
                     raise ValueError('drain_barrier_namespace_changed')
                 return run('nsenter', '-t', str(pid), '-n', 'iptables', '-w', *args)
             jump = ('INPUT', '-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', chain)
-            barrier_rule = '-A %s -j REJECT --reject-with tcp-reset' % chain
+            barrier_rule = '-A %s -p tcp -m tcp -j REJECT --reject-with tcp-reset' % chain
             def check_barrier():
                 if firewall('-S', chain).splitlines() != ['-N ' + chain, barrier_rule]:
                     raise ValueError('drain_barrier_changed')
@@ -438,7 +438,7 @@
                         firewall('-N', chain)
                         rules = ['-N ' + chain]
                     if rules == ['-N ' + chain]:
-                        firewall('-A', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                        firewall('-A', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
                     if not references:
                         firewall('-I', *jump)
                     deadline = time.monotonic() + contract['timeout_s']
@@ -468,7 +468,7 @@
                     if references:
                         firewall('-D', *jump)
                     if rules == ['-N ' + chain, barrier_rule]:
-                        firewall('-D', chain, '-j', 'REJECT', '--reject-with', 'tcp-reset')
+                        firewall('-D', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
                     if rules is not None:
                         firewall('-X', chain)
                     raise
