@@ -46,7 +46,9 @@
     - name: Require unchanged removable custom certificate observation
       ansible.builtin.assert:
         that:
-          - custom_certificate_observation.digest == expected_custom_certificate_observation.digest
+          - >-
+            custom_certificate_observation.classification == 'absent' or
+            custom_certificate_observation.digest == expected_custom_certificate_observation.digest
           - custom_certificate_observation.classification in ['exact', 'other', 'absent']
           - >-
             custom_certificate_observation.classification == 'absent' or
@@ -76,7 +78,7 @@
             source: custom
             route_hosts: "{{ route_hosts }}"
             fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
-          expected_binding: "{{ binding_content.content | b64decode }}"
+          expected_binding: "{{ custom_selected_binding_bytes }}"
       when: custom_certificate_observation.classification in ['exact', 'other']
 
     - name: Read custom certificate observation after unbind

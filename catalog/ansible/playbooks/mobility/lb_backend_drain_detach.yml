@@ -16,6 +16,71 @@
       when: simulate | default(false)
 
   tasks:
+    - name: Observe strict opt-in switched gateway route authority
+      when: connection_drain is defined and connection_drain.phase == 'gateway'
+      vars:
+        org_id: "{{ connection_drain.contract.organization_id }}"
+        deployment_id: "{{ connection_drain.contract.deployment_id }}"
+        traefik_container_name: traefik
+        route_key: "deployment-{{ connection_drain.contract.deployment_id }}"
+        expected_route_observation: "{{ connection_drain.contract.route_observation }}"
+      block:
+        - name: Initialize exact remaining backend observation inputs
+          set_fact:
+            drain_remaining_backends: []
+
+        - name: Bind each immutable remaining backend URL
+          set_fact:
+            drain_remaining_backends: "{{ drain_remaining_backends + [{'url': item}] }}"
+          loop: "{{ connection_drain.contract.remaining_backends }}"
+
+        - name: Read authoritative gateway route excluding retiring backend
+          include_tasks: "{{ playbook_dir }}/../../tasks/traefik_route_observation.yml"
+          vars:
+            traefik_backends: "{{ drain_remaining_backends }}"
+
+        - name: Require exact switched route and backend exclusion
+          assert:
+            that:
+              - route_observation == connection_drain.contract.route_observation
+              - observed_backend_urls | sort == connection_drain.contract.remaining_backends
+              - connection_drain.contract.backend_url not in observed_backend_urls
+              - connection_drain.contract.gateway_server_id == server_id
+            fail_msg: "Connection drain gateway request-admission authority changed"
+
+        - name: Emit closed gateway-only receipt without asserting app drain
+          command:
+            argv:
+              - python3
+              - -c
+              - |
+                import datetime, hashlib, json, sys
+                def digest(value):
+                    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                contract, route = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+                value = {
+                    'version': 1, 'contract_digest': digest(contract), 'runtime': None,
+                    'gateway': {
+                        'container_id': sys.argv[3], 'route_observation': route,
+                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                    },
+                }
+                value['digest'] = digest(value)
+                print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain': value}, separators=(',', ':')))
+              - "{{ connection_drain.contract | to_json }}"
+              - "{{ route_observation | to_json }}"
+              - "{{ existing_traefik.Id }}"
+          register: gateway_drain_receipt
+          changed_when: false
+
+        - name: Return registered gateway route receipt
+          debug:
+            msg: "{{ gateway_drain_receipt.stdout }}"
+
+    - name: End strict gateway phase before legacy route write or sleep
+      meta: end_play
+      when: connection_drain is defined
+
     - name: Drain and detach deployment backends
       block:
         - name: OPERATION_STEP drain_detach:start
@@ -74,3 +139,15 @@
         - name: Fail drain/detach operation
           fail:
             msg: "Traefik backend drain/detach failed"
+
+- import_playbook: ../container_remove.yml
+  when: connection_drain is defined and connection_drain.phase == 'runtime'
+  vars:
+    app_connection_drain: "{{ {'contract': connection_drain.contract, 'receipt': connection_drain.receipt} }}"
+    app_connection_drain_mode: observe
+    app_container_name: "{{ connection_drain.contract.container_name }}"
+    app_managed: true
+    app_org_id: "{{ connection_drain.contract.organization_id }}"
+    app_deployment_id: "{{ connection_drain.contract.deployment_id }}"
+    app_slug: "{{ connection_drain.contract.app_slug }}"
+    app_expected_image_ref: "{{ connection_drain.contract.image_ref }}"
