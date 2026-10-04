@@ -98,13 +98,15 @@
         fail_msg: Dashboard automatic retirement failed
       no_log: true
 
-    - name: Emit separate selection evidence
+    - name: Emit complete dashboard retirement evidence
       ansible.builtin.debug:
-        msg: "{{ dashboard_retirement_selection.stdout }}"
-
-    - name: Emit separate retirement evidence
-      ansible.builtin.debug:
-        msg: "{{ dashboard_retirement_action.stdout }}"
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {
+            'automatic_certificate_selection': dashboard_retirement_observation,
+            'automatic_certificate_retirement': (dashboard_retirement_action.stdout
+              | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
+              | from_json).automatic_certificate_retirement
+          } | to_json }}
   always:
     - name: Remove transient dashboard retirement directory
       ansible.builtin.file:

@@ -2,11 +2,16 @@
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+from jinja2 import Environment, StrictUndefined
+import yaml
 
 
 SCRIPTS = Path(__file__).parents[1] / "catalog/ansible/scripts"
@@ -83,6 +88,61 @@ class AutomaticCertificateRetirementTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
         self.assertEqual(unrelated.read_bytes(), b"unrelated-owner-bytes")
         self.assertEqual(list(self.certificates.iterdir()), [self.certificates / ".selection.lock"])
+
+    def test_dashboard_task_emits_both_original_envelopes_in_one_final_marker(self):
+        task_path = SCRIPTS.parent / "tasks/traefik_server_dashboard_retirement.yml"
+        tasks = yaml.safe_load(task_path.read_text())
+        block = next(task["block"] for task in tasks if "block" in task)
+        emissions = [task for task in block if "ansible.builtin.debug" in task]
+        self.assertEqual(len(emissions), 1)
+        self.assertIs(emissions[0], block[-1])
+        template = Environment(undefined=StrictUndefined)
+        template.filters.update({
+            "regex_replace": lambda value, pattern, replacement: re.sub(
+                pattern, replacement, value,
+            ),
+            "from_json": json.loads,
+            "to_json": json.dumps,
+        })
+        identity = copy.deepcopy(self.request["identity"])
+        identity["subject"] = {"type": "server", "id": identity["server_id"]}
+        identity["gateway_id"] = None
+        for binding in (None, "opaque original selected bytes\n"):
+            with self.subTest(binding_present=binding is not None):
+                selection = {
+                    "identity": identity, "operation_id": self.request["operation_id"],
+                    "expected_binding": binding,
+                }
+                selection["digest"] = ACTOR.digest(selection)
+                retirement = {
+                    "identity": identity, "operation_id": self.request["operation_id"],
+                    "selection_state": "absent", "renewal_enrolled": False,
+                }
+                retirement["digest"] = ACTOR.digest(retirement)
+                original_selection = copy.deepcopy(selection)
+                original_retirement = copy.deepcopy(retirement)
+                rendered = template.from_string(
+                    emissions[0]["ansible.builtin.debug"]["msg"],
+                ).render(
+                    dashboard_retirement_observation=selection,
+                    dashboard_retirement_action={"stdout": "TEMPLATE_OUTPUT_JSON=" + json.dumps({
+                        "automatic_certificate_retirement": retirement,
+                    })},
+                )
+                marker, payload = rendered.split("=", 1)
+                self.assertEqual(marker, "TEMPLATE_OUTPUT_JSON")
+                output = json.loads(payload)
+                self.assertEqual(set(output), {
+                    "automatic_certificate_selection", "automatic_certificate_retirement",
+                })
+                self.assertEqual(output["automatic_certificate_selection"], original_selection)
+                self.assertEqual(output["automatic_certificate_retirement"], original_retirement)
+                self.assertEqual(selection, original_selection)
+                self.assertEqual(retirement, original_retirement)
+                for envelope in output.values():
+                    self.assertEqual(envelope["digest"], ACTOR.digest({
+                        key: value for key, value in envelope.items() if key != "digest"
+                    }))
 
     def test_closed_request_and_nonnull_expected_binding_refuse_without_state(self):
         for change in ({"extra": True}, {"operation_id": "invalid"},
