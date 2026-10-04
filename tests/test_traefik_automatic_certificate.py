@@ -298,15 +298,15 @@ class AutomaticCertificateCustomPredecessorTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return result
 
-    def write_material(self, certificate, private_key):
+    def write_material(self, certificate, private_key, expired=False):
         key = ec.generate_private_key(ec.SECP256R1())
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.identity["route_hosts"][0])])
         now = datetime.now(timezone.utc)
         leaf = (
             x509.CertificateBuilder().subject_name(name).issuer_name(name)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now - timedelta(minutes=1))
-            .not_valid_after(now + timedelta(days=1))
+            .not_valid_before(now - timedelta(days=2) if expired else now - timedelta(minutes=1))
+            .not_valid_after(now - timedelta(days=1) if expired else now + timedelta(days=1))
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName(host) for host in self.identity["route_hosts"]
             ]), critical=False).sign(key, hashes.SHA256())
@@ -438,6 +438,170 @@ class AutomaticCertificateCustomPredecessorTests(unittest.TestCase):
         self.assertTrue(self.receipt.exists())
         self.assertEqual(ACTOR.retire(request, self.certificates, self.dynamic, self.state), output)
         self.assert_custom_files_retained()
+
+
+class ExpiredOwnedCertificateTests(unittest.TestCase):
+    """Real dated PEMs and local helper effects; issuer/TLS boundaries are doubles."""
+
+    patch_boundary = AutomaticCertificateCustomPredecessorTests.patch_boundary
+    write_material = AutomaticCertificateCustomPredecessorTests.write_material
+    issue_output = AutomaticCertificateCustomPredecessorTests.issue_output
+
+    def setUp(self):
+        AutomaticCertificateCustomPredecessorTests.setUp(self)
+        self.actor.identity = copy.deepcopy(self.identity)
+        revision = self.certificates / ("automatic-" + ACTOR.subject_key(self.identity["subject"]))
+        revision = revision / self.custom_owner["revision_id"]
+        revision.mkdir(mode=0o700, parents=True)
+        self.expired_cert, self.expired_key = revision / "tls.crt", revision / "tls.key"
+        self.expired_owner, self.original = self.expired_selection(
+            self.identity, self.expired_cert, self.expired_key,
+        )
+        self.binding.write_bytes(self.original)
+        self.expired_files = (self.expired_cert.read_bytes(), self.expired_key.read_bytes())
+        self.directory.mkdir(mode=0o700)
+        self.actor.enroll(self.directory)
+        self.configuration = self.actor._renewal_configuration()
+        self.pending = self.directory / "renewal-request.json"
+        self.issue.side_effect = self.renewal_output
+        self.candidate_expired = False
+        self.original_request = None
+        leaf = x509.load_pem_x509_certificate(self.expired_cert.read_bytes())
+        self.assertLess(leaf.not_valid_after_utc, datetime.now(timezone.utc))
+        self.assertEqual(self.actor.selection.read(
+            self.binding, require_current_validity=False,
+        )["owner"], self.expired_owner)
+        with self.assertRaises(ACTOR.CertificateSelectionError):
+            self.actor.selection.read(self.binding)
+
+    def expired_selection(self, identity, certificate, private_key):
+        previous_identity = self.identity
+        self.identity = identity
+        try:
+            fingerprint = self.write_material(certificate, private_key, expired=True)
+        finally:
+            self.identity = previous_identity
+        owner = {**copy.deepcopy(identity), "source": "automatic",
+                 "revision_id": self.custom_owner["revision_id"],
+                 "fingerprint_sha256": fingerprint}
+        # Construct historical bytes, then validate through the real expired-aware reader.
+        body = {"tls": {"certificates": [{"certFile": str(certificate),
+                                           "keyFile": str(private_key)}]}}
+        raw = ("# opsctl-certificate-selection " + json.dumps(
+            owner, sort_keys=True, separators=(",", ":"),
+        ) + "\n" + json.dumps(body, sort_keys=True) + "\n").encode("ascii")
+        return owner, raw
+
+    def renewal_output(self, directory, operation_id, action):
+        self.assertEqual(action, "renew_due")
+        self.original_request = ACTOR.private_json(self.pending)
+        self.assertEqual(self.original_request["operation_id"], operation_id)
+        self.assertEqual(self.original_request["expected_binding"], self.original.decode("ascii"))
+        output = directory / "certificates"
+        output.mkdir(mode=0o700, exist_ok=True)
+        hostname = self.identity["route_hosts"][0]
+        self.write_material(output / (hostname + ".crt"), output / (hostname + ".key"),
+                            expired=self.candidate_expired)
+
+    def renew(self):
+        return self.actor.renew_scheduled(self.directory, self.configuration)
+
+    def neighbor(self, conflicting=False):
+        identity = {**copy.deepcopy(self.identity),
+                    "subject": {"type": "deployment", "id": "88888888-8888-4888-8888-888888888888"}}
+        if not conflicting:
+            identity["route_hosts"] = ["neighbor.example.test"]
+        directory = self.certificates / "neighbor"
+        directory.mkdir(mode=0o700)
+        owner, raw = self.expired_selection(identity, directory / "tls.crt", directory / "tls.key")
+        binding = self.actor.selection.binding(owner)
+        binding.write_bytes(raw)
+        return binding, raw
+
+    def test_expired_owned_renewal_requires_valid_candidate_and_original_vars_replay(self):
+        neighbor, neighbor_raw = self.neighbor()
+        result = self.renew()
+        self.assertEqual(result["status"], "active")
+        self.assertGreater(datetime.fromisoformat(result["not_after"]), datetime.now(timezone.utc))
+        desired = self.binding.read_bytes()
+        inode = self.binding.stat().st_ino
+        self.assertEqual(self.actor.run(copy.deepcopy(self.original_request)), result)
+        self.assertEqual((self.binding.read_bytes(), self.binding.stat().st_ino), (desired, inode))
+        self.assertEqual(self.issue.call_count, 1)
+        self.assertFalse(self.pending.exists())
+        self.assertEqual(neighbor.read_bytes(), neighbor_raw)
+        self.assertEqual((self.expired_cert.read_bytes(), self.expired_key.read_bytes()), self.expired_files)
+
+    def test_verify_failure_restores_expired_raw_and_reuses_issued_receipt(self):
+        self.verify.side_effect = ACTOR.AutomaticCertificateError("controlled serving refusal")
+        with self.assertRaises(ACTOR.AutomaticCertificateError):
+            self.renew()
+        request = ACTOR.private_json(self.pending)
+        receipt_path = self.directory / (request["operation_id"] + ".json")
+        receipt = ACTOR.private_json(receipt_path)
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        self.assertEqual(receipt["status"], "issued")
+        self.assertEqual(receipt["request_digest"], ACTOR.digest({
+            "request": request, "profile": self.actor.profile,
+        }))
+        self.verify.side_effect = lambda owner: owner["fingerprint_sha256"]
+        self.assertEqual(self.renew()["status"], "active")
+        self.assertEqual(self.issue.call_count, 1)
+        self.assertFalse(self.pending.exists())
+        self.assertEqual(ACTOR.private_json(receipt_path)["status"], "active")
+
+    def test_expired_candidate_refuses_before_activation_and_retains_retry(self):
+        self.candidate_expired = True
+        with self.assertRaises(ACTOR.CertificateSelectionError):
+            self.renew()
+        request = ACTOR.private_json(self.pending)
+        self.assertFalse((self.directory / (request["operation_id"] + ".json")).exists())
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        self.issue.assert_called_once()
+        self.verify.assert_not_called()
+
+    def test_expired_pool_conflict_preserves_neighbor_and_issued_receipt(self):
+        neighbor, raw = self.neighbor(conflicting=True)
+        with self.assertRaises(ACTOR.CertificateSelectionError):
+            self.renew()
+        request = ACTOR.private_json(self.pending)
+        self.assertEqual(ACTOR.private_json(
+            self.directory / (request["operation_id"] + ".json"),
+        )["status"], "issued")
+        self.assertEqual((self.binding.read_bytes(), neighbor.read_bytes()), (self.original, raw))
+        self.verify.assert_not_called()
+
+    def test_expired_removal_exact_owner_and_raw_preserves_unused_files_and_neighbor(self):
+        neighbor, raw = self.neighbor()
+        for owner, expected in (({**self.expired_owner, "source": "custom"}, self.original),
+                                (self.expired_owner, self.original + b"\n")):
+            with self.subTest(owner_changed=owner != self.expired_owner), \
+                    self.assertRaises(ACTOR.CertificateSelectionError):
+                self.actor.selection.remove(owner, expected)
+            self.assertEqual(self.binding.read_bytes(), self.original)
+        self.actor.selection.remove(self.expired_owner, self.original)
+        self.actor.selection.remove(self.expired_owner, self.original)
+        self.assertFalse(self.binding.exists())
+        self.assertEqual(neighbor.read_bytes(), raw)
+        self.assertEqual((self.expired_cert.read_bytes(), self.expired_key.read_bytes()), self.expired_files)
+        self.assertEqual(self.renew(), {"status": "inactive"})
+        self.assertFalse((self.directory / "renewal.json").exists())
+        self.issue.assert_not_called()
+
+    def test_pending_raw_drift_and_foreign_identity_refuse_before_issuer(self):
+        request = {**copy.deepcopy(self.request), "action": "renew_due",
+                   "expected_binding": self.original.decode("ascii") + "\n"}
+        ACTOR.atomic_write(self.pending, json.dumps(request).encode())
+        with self.assertRaises(ACTOR.AutomaticCertificateError):
+            self.renew()
+        self.pending.unlink()
+        header, body = self.original.split(b"\n", 1)
+        foreign = {**self.expired_owner, "organization_id": "99999999-9999-4999-8999-999999999999"}
+        self.binding.write_bytes(b"# opsctl-certificate-selection " + json.dumps(foreign).encode() + b"\n" + body)
+        with self.assertRaises(ACTOR.AutomaticCertificateError):
+            self.renew()
+        self.issue.assert_not_called()
+        self.verify.assert_not_called()
 
 
 if __name__ == "__main__":
