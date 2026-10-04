@@ -11,10 +11,14 @@ services:
 {% if app_local_runtime.memory_bytes | default(none) is not none %}
     mem_limit: {{ app_local_runtime.memory_bytes }}
 {% endif %}
+{% if app_local_runtime.env | default({}) %}
     environment:
 {% for key, value in app_local_runtime.env | default({}) | dictsort %}
       {{ key | to_json }}: {{ value | replace('$', '$$') | to_json }}
 {% endfor %}
+{% else %}
+    environment: {}
+{% endif %}
     labels:
       com.opsctl.managed: 'true'
       com.opsctl.org_id: {{ app_local_runtime.organization_id | to_json }}
