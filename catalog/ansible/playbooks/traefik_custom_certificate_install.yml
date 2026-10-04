@@ -41,8 +41,9 @@
           - target_server == (target_server | trim)
           - (target_server | length) > 0
           - >-
-            (expected_custom_certificate_observation is defined)
-            != (expected_automatic_certificate_selection is defined)
+            ((expected_custom_certificate_observation is defined) | int)
+            + ((expected_automatic_certificate_selection is defined) | int)
+            + ((expected_previous_custom_selection is defined) | int) == 1
           - >-
             (expected_custom_certificate_observation is not defined)
             or (expected_custom_certificate_observation is mapping)
@@ -77,14 +78,66 @@
               - expected_automatic_certificate_selection.digest is match('^[0-9a-f]{64}$')
             fail_msg: "Automatic predecessor selection is invalid"
 
+    - name: Qualify the closed previous custom selection
+      when: expected_previous_custom_selection is defined
+      no_log: true
+      block:
+        - name: Validate the closed previous custom envelope
+          ansible.builtin.assert:
+            that:
+              - expected_previous_custom_selection is mapping
+              - >-
+                (expected_previous_custom_selection.keys() | sort | list)
+                == ['digest', 'expected_binding', 'identity', 'operation_id']
+              - expected_previous_custom_selection.identity is mapping
+              - >-
+                (expected_previous_custom_selection.identity.keys() | sort | list)
+                == ['gateway_id', 'organization_id', 'route_hosts', 'server_id', 'subject']
+              - >-
+                expected_previous_custom_selection.identity == {
+                  'organization_id': org_id,
+                  'subject': {'type': 'deployment', 'id': deployment_id},
+                  'gateway_id': gateway_id,
+                  'server_id': server_id,
+                  'route_hosts': expected_previous_custom_selection.identity.route_hosts
+                }
+              - expected_previous_custom_selection.identity.route_hosts is sequence
+              - expected_previous_custom_selection.identity.route_hosts is not string
+              - (expected_previous_custom_selection.identity.route_hosts | length) > 0
+              - (expected_previous_custom_selection.identity.route_hosts | length) <= 100
+              - expected_previous_custom_selection.identity.route_hosts == (expected_previous_custom_selection.identity.route_hosts | unique | sort | list)
+              - >-
+                (expected_previous_custom_selection.identity.route_hosts
+                | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+                | list | length) == (expected_previous_custom_selection.identity.route_hosts | length)
+              - expected_previous_custom_selection.operation_id is string
+              - expected_previous_custom_selection.operation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+              - expected_previous_custom_selection.expected_binding is string
+              - (expected_previous_custom_selection.expected_binding | length) > 0
+              - (expected_previous_custom_selection.expected_binding | length) <= 65536
+              - expected_previous_custom_selection.digest is string
+              - expected_previous_custom_selection.digest is match('^[0-9a-f]{64}$')
+            fail_msg: "Previous custom selection is invalid"
+
+    - name: Qualify the exact registered predecessor selection
+      when: expected_automatic_certificate_selection is defined or expected_previous_custom_selection is defined
+      no_log: true
+      block:
+        - name: Select the distinct registered predecessor envelope
+          ansible.builtin.set_fact:
+            custom_predecessor_selection: >-
+              {{ expected_previous_custom_selection
+                 if expected_previous_custom_selection is defined
+                 else expected_automatic_certificate_selection }}
+
         - name: Read the canonical predecessor through the selected-pool owner
           ansible.builtin.include_tasks:
             file: ../tasks/traefik_certificate_selection.yml
           vars:
             certificate_selection_action: observe
             certificate_selection_request:
-              identity: "{{ expected_automatic_certificate_selection.identity }}"
-              operation_id: "{{ expected_automatic_certificate_selection.operation_id }}"
+              identity: "{{ custom_predecessor_selection.identity }}"
+              operation_id: "{{ custom_predecessor_selection.operation_id }}"
 
         - name: Require a bounded canonical predecessor observation
           ansible.builtin.assert:
@@ -92,15 +145,15 @@
               - certificate_selection_result.stdout is string
               - (certificate_selection_result.stdout | length) <= 131072
               - certificate_selection_result.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-            fail_msg: "Automatic predecessor selection changed before installation"
+            fail_msg: "Registered predecessor selection changed before installation"
 
-        - name: Compare the complete automatic predecessor envelope
+        - name: Compare the complete registered predecessor envelope
           ansible.builtin.set_fact:
-            automatic_predecessor_unchanged: >-
+            custom_predecessor_unchanged: >-
               {{ (certificate_selection_result.stdout
                   | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
                   | from_json) == {
-                    'automatic_certificate_selection': expected_automatic_certificate_selection
+                    'automatic_certificate_selection': custom_predecessor_selection
                   } }}
 
         - name: Capture the freshly qualified predecessor bytes for activation CAS
@@ -109,12 +162,12 @@
               {{ (certificate_selection_result.stdout
                   | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
                   | from_json).automatic_certificate_selection.expected_binding }}
-          when: automatic_predecessor_unchanged
+          when: custom_predecessor_unchanged
 
         - name: Observe only an already-requested custom replay
           ansible.builtin.include_tasks:
             file: ../tasks/traefik_custom_certificate_observation.yml
-          when: not automatic_predecessor_unchanged
+          when: not custom_predecessor_unchanged
 
         - name: Require exact requested custom serving for original-request replay
           ansible.builtin.assert:
@@ -132,15 +185,15 @@
               - (custom_certificate_observation.hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
               - (custom_certificate_observation.hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
               - (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
-            fail_msg: "Automatic predecessor changed without exact requested custom replay"
-          when: not automatic_predecessor_unchanged
+            fail_msg: "Registered predecessor changed without exact requested custom replay"
+          when: not custom_predecessor_unchanged
 
     - name: Read current custom certificate observation
       ansible.builtin.include_tasks:
         file: ../tasks/traefik_custom_certificate_observation.yml
       vars:
         custom_observation_expected: "{{ expected_custom_certificate_observation }}"
-      when: expected_automatic_certificate_selection is not defined
+      when: expected_automatic_certificate_selection is not defined and expected_previous_custom_selection is not defined
 
     - name: Require unchanged custom certificate observation
       ansible.builtin.assert:
@@ -175,7 +228,7 @@
               and (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
             )
         fail_msg: "Custom certificate state changed before installation"
-      when: expected_automatic_certificate_selection is not defined
+      when: expected_automatic_certificate_selection is not defined and expected_previous_custom_selection is not defined
 
     - name: Install immutable custom certificate material
       no_log: true

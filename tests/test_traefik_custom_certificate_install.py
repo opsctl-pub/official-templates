@@ -98,8 +98,16 @@ class CustomCertificateInstallTests(unittest.TestCase):
             return False
 
     def automatic_context(self, expected=...):
-        return {**copy.deepcopy(self.context), "expected_automatic_certificate_selection":
-                copy.deepcopy(self.expected if expected is ... else expected)}
+        selection = copy.deepcopy(self.expected if expected is ... else expected)
+        return {**copy.deepcopy(self.context), "expected_automatic_certificate_selection": selection,
+                "custom_predecessor_selection": selection}
+
+    def previous_context(self, expected=...):
+        selection = copy.deepcopy(self.expected if expected is ... else expected)
+        if expected is ...:
+            selection["identity"]["route_hosts"] = [self.context["route_hosts"][0]]
+        return {**copy.deepcopy(self.context), "expected_previous_custom_selection": selection,
+                "custom_predecessor_selection": selection}
 
     def observation(self):
         return {
@@ -155,9 +163,9 @@ class CustomCertificateInstallTests(unittest.TestCase):
             self.assertTrue(self.assertions_pass(task, self.automatic_context(value)))
 
     def test_complete_fresh_envelope_equality_and_exact_byte_capture(self):
-        compare = self.task("Compare the complete automatic predecessor envelope")
+        compare = self.task("Compare the complete registered predecessor envelope")
         capture = self.task("Capture the freshly qualified predecessor bytes for activation CAS")
-        expression = compare["ansible.builtin.set_fact"]["automatic_predecessor_unchanged"]
+        expression = compare["ansible.builtin.set_fact"]["custom_predecessor_unchanged"]
         original = copy.deepcopy(self.expected)
         context = self.automatic_context()
         context["certificate_selection_result"] = {
@@ -241,7 +249,7 @@ class CustomCertificateInstallTests(unittest.TestCase):
         replay = self.task("Observe only an already-requested custom replay")
         self.assertEqual(replay["ansible.builtin.include_tasks"]["file"],
                          "../tasks/traefik_custom_certificate_observation.yml")
-        self.assertEqual(replay["when"], "not automatic_predecessor_unchanged")
+        self.assertEqual(replay["when"], "not custom_predecessor_unchanged")
 
     def test_shared_activation_refuses_raw_byte_drift_and_retains_desired_replay(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,6 +302,171 @@ class CustomCertificateInstallTests(unittest.TestCase):
                                           "operation_id": self.expected["operation_id"]})
             self.assertEqual(selected["automatic_certificate_selection"]["expected_binding"],
                              desired.decode("ascii"))
+
+    def test_all_three_predecessor_sources_are_exclusive_and_route_to_shared_cas(self):
+        keys = ("expected_custom_certificate_observation", "expected_automatic_certificate_selection",
+                "expected_previous_custom_selection")
+        for mask in range(8):
+            context = copy.deepcopy(self.context)
+            for index, key in enumerate(keys):
+                if mask & (1 << index):
+                    context[key] = self.observation() if index == 0 else self.expected
+            self.assertEqual(self.assertions_pass(self.play["pre_tasks"][0], context),
+                             mask in (1, 2, 4))
+        select = self.task("Select the distinct registered predecessor envelope")
+        expression = select["ansible.builtin.set_fact"]["custom_predecessor_selection"]
+        for context in (self.automatic_context(), self.previous_context()):
+            self.assertEqual(self.evaluate(expression, context), context["custom_predecessor_selection"])
+            for name in ("Read current custom certificate observation", "Require unchanged custom certificate observation"):
+                self.assertFalse(self.evaluate(self.task(name)["when"], context))
+        read = self.task("Read the canonical predecessor through the selected-pool owner")
+        self.assertEqual(read["vars"]["certificate_selection_action"], "observe")
+        self.assertEqual(read["vars"]["certificate_selection_request"], {
+            "identity": "{{ custom_predecessor_selection.identity }}",
+            "operation_id": "{{ custom_predecessor_selection.operation_id }}",
+        })
+
+    def test_previous_custom_envelope_preserves_prior_hosts_and_refuses_malformed_or_foreign(self):
+        task = self.task("Validate the closed previous custom envelope")
+        original = self.previous_context()["expected_previous_custom_selection"]
+        self.assertNotEqual(original["identity"]["route_hosts"], self.context["route_hosts"])
+        self.assertTrue(self.assertions_pass(task, self.previous_context(original)))
+        bad = [None, [], {**original, "extra": True}]
+        for field in original:
+            value = copy.deepcopy(original)
+            del value[field]
+            bad.append(value)
+        for field, values in {
+            "operation_id": [None, True, "invalid"], "digest": [None, True, "D" * 64],
+            "expected_binding": [None, "", "x" * 65537],
+        }.items():
+            bad.extend({**copy.deepcopy(original), field: value} for value in values)
+        for field in original["identity"]:
+            value = copy.deepcopy(original)
+            value["identity"][field] = "foreign"
+            bad.append(value)
+        for hosts in ([], "owned.example.test", None, ["UPPER.example.test"], ["invalid host"],
+                      ["first.example.test", "first.example.test"], list(reversed(self.context["route_hosts"])),
+                      ["first.example.test"] * 101):
+            value = copy.deepcopy(original)
+            value["identity"]["route_hosts"] = hosts
+            bad.append(value)
+        value = copy.deepcopy(original)
+        value["identity"]["extra"] = True
+        bad.append(value)
+        for value in bad:
+            with self.subTest(value=value):
+                self.assertFalse(self.assertions_pass(task, self.previous_context(value)))
+
+    def domain_material(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        certificates, dynamic = root / "certificates", root / "dynamic"
+        certificates.mkdir(mode=0o700)
+        dynamic.mkdir(mode=0o700)
+        directory = certificates / ("material-" + self.context["material_id"]) / ("revision-" + self.context["revision_id"])
+        directory.mkdir(mode=0o700, parents=True)
+        cert_file, key_file = directory / "tls.crt", directory / "tls.key"
+        key = ec.generate_private_key(ec.SECP256R1())
+        now = datetime.now(timezone.utc)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.context["route_hosts"][0])])
+        leaf = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
+                .add_extension(x509.SubjectAlternativeName([
+                    x509.DNSName(host) for host in self.context["route_hosts"]]), critical=False)
+                .sign(key, hashes.SHA256()))
+        cert_file.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                                              serialization.PrivateFormat.PKCS8,
+                                              serialization.NoEncryption()))
+        cert_file.chmod(0o600)
+        key_file.chmod(0o600)
+        owner = {**copy.deepcopy(self.expected["identity"]), "source": "custom",
+                 "revision_id": self.context["revision_id"],
+                 "fingerprint_sha256": leaf.fingerprint(hashes.SHA256()).hex()}
+        return TraefikCertificateSelection(certificates, dynamic), owner, cert_file, key_file
+
+    def compare_previous(self, snapshot, output):
+        expression = self.task("Compare the complete registered predecessor envelope")["ansible.builtin.set_fact"]["custom_predecessor_unchanged"]
+        context = self.previous_context(snapshot)
+        context["certificate_selection_result"] = {"stdout": "TEMPLATE_OUTPUT_JSON=" + json.dumps(output)}
+        return self.evaluate(expression, context), context
+
+    def test_real_previous_snapshot_refuses_source_host_and_raw_drift_before_activation(self):
+        selection, owner, certificate, key = self.domain_material()
+        owner["route_hosts"] = [self.context["route_hosts"][0]]
+        path = selection.binding(owner)
+        raw = selection.document(owner, certificate, key)
+        path.write_bytes(raw)
+        request = {"identity": {field: owner[field] for field in self.expected["identity"]},
+                   "operation_id": self.expected["operation_id"]}
+        original = selection.observe(request)["automatic_certificate_selection"]
+        self.assertTrue(self.assertions_pass(self.task("Validate the closed previous custom envelope"), self.previous_context(original)))
+        unchanged, context = self.compare_previous(original, selection.observe(request))
+        self.assertTrue(unchanged)
+        capture = self.task("Capture the freshly qualified predecessor bytes for activation CAS")["ansible.builtin.set_fact"]["custom_selected_binding_bytes"]
+        self.assertEqual(self.evaluate(capture, context), raw.decode("ascii"))
+        for changed in ({**owner, "source": "native"},
+                        {**owner, "route_hosts": self.context["route_hosts"]}):
+            path.write_bytes(selection.document(changed, certificate, key))
+            self.assertFalse(self.compare_previous(original, selection.observe(request))[0])
+        drifted = raw + b"\n"
+        path.write_bytes(drifted)
+        self.assertFalse(self.compare_previous(original, selection.observe(request))[0])
+        desired = {**owner, "route_hosts": self.context["route_hosts"]}
+        verify = Mock()
+        with self.assertRaises(CertificateSelectionError):
+            selection.activate(desired, certificate, key, raw, verify)
+        verify.assert_not_called()
+        self.assertEqual(path.read_bytes(), drifted)
+
+    def test_union_target_and_current_restoration_use_fresh_snapshots_and_desired_only_replay(self):
+        selection, owner, certificate, key = self.domain_material()
+        current = {**owner, "route_hosts": self.context["route_hosts"][:1]}
+        union = owner
+        target = {**owner, "route_hosts": self.context["route_hosts"][1:]}
+        path = selection.binding(current)
+        original = selection.document(current, certificate, key)
+        path.write_bytes(original)
+        verify = Mock()
+        for previous, desired in ((current, union), (union, target), (target, current)):
+            request = {"identity": {field: previous[field] for field in self.expected["identity"]},
+                       "operation_id": self.expected["operation_id"]}
+            snapshot = selection.observe(request)["automatic_certificate_selection"]
+            self.assertTrue(self.compare_previous(snapshot, selection.observe(request))[0])
+            selection.activate(desired, certificate, key, snapshot["expected_binding"].encode("ascii"), verify)
+            selected = path.read_bytes()
+            inode = path.stat().st_ino
+            self.assertFalse(self.compare_previous(snapshot, selection.observe(request))[0])
+            selection.activate(desired, certificate, key, snapshot["expected_binding"].encode("ascii"), verify)
+            self.assertEqual((path.read_bytes(), path.stat().st_ino), (selected, inode))
+            observed = selection.observe_custom({"identity": {field: desired[field] for field in self.expected["identity"]}})
+            self.assertTrue(observed["custom_certificate_binding"]["present"])
+            self.assertEqual(observed["custom_certificate_binding"]["route_hosts"], desired["route_hosts"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(verify.call_count, 6)
+
+    def test_previous_custom_replay_requires_requested_identity_and_every_ordered_trusted_host(self):
+        task = self.task("Require exact requested custom serving for original-request replay")
+        context = {**self.previous_context(), "binding_valid": True, "binding_present": True,
+                   "custom_certificate_observation": self.observation()}
+        self.assertTrue(self.assertions_pass(task, context))
+        for field in ("material_id", "revision_id", "content_digest", "leaf_fingerprint_sha256",
+                      "route_hosts", "binding_count", "host_count", "classification"):
+            value = copy.deepcopy(context)
+            value["custom_certificate_observation"][field] = None
+            self.assertFalse(self.assertions_pass(task, value))
+        for field, changed in (("hostname", "foreign.example.test"), ("status", "expired"),
+                               ("trusted", False), ("trusted", None), ("fingerprint_sha256", "f" * 64)):
+            for index in range(2):
+                value = copy.deepcopy(context)
+                value["custom_certificate_observation"]["hosts"][index][field] = changed
+                self.assertFalse(self.assertions_pass(task, value))
+        value = copy.deepcopy(context)
+        value["custom_certificate_observation"]["hosts"].reverse()
+        self.assertFalse(self.assertions_pass(task, value))
 
 
 if __name__ == "__main__":
