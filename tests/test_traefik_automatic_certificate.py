@@ -1,6 +1,7 @@
 """Physical helper regressions; no issuer, transport or Server stand-ins."""
 
 import copy
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
@@ -10,6 +11,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from jinja2 import Environment, StrictUndefined
 import yaml
 
@@ -227,6 +232,212 @@ class AutomaticCertificateRetirementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.retire()
         self.assertEqual(enrollment.read_bytes(), b"corrupt-enrollment")
+
+
+class AutomaticCertificateCustomPredecessorTests(unittest.TestCase):
+    """Real local receipts/CAS with issuer and serving boundaries doubled."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.certificates = self.root / "certificates"
+        self.dynamic = self.root / "dynamic"
+        self.state = self.root / "state"
+        for directory in (self.certificates, self.dynamic, self.state):
+            directory.mkdir(mode=0o700)
+        self.identity = {
+            "organization_id": "11111111-1111-4111-8111-111111111111",
+            "server_id": "22222222-2222-4222-8222-222222222222",
+            "gateway_id": "33333333-3333-4333-8333-333333333333",
+            "subject": {"type": "deployment", "id": "44444444-4444-4444-8444-444444444444"},
+            "route_hosts": ["owned.example.test"],
+        }
+        profile = {
+            "email": "owner@example.test", "challenge": "http-01",
+            "server_url": "https://acme.example.test/directory",
+            "broker_url": None, "token_file": None,
+        }
+        self.actor = ACTOR.TraefikAutomaticCertificate(
+            self.certificates, self.dynamic, self.state, profile,
+        )
+        revision = self.certificates / "material-66666666-6666-4666-8666-666666666666" / (
+            "revision-77777777-7777-4777-8777-777777777777"
+        )
+        revision.mkdir(mode=0o700, parents=True)
+        self.custom_cert = revision / "tls.crt"
+        self.custom_key = revision / "tls.key"
+        fingerprint = self.write_material(self.custom_cert, self.custom_key)
+        self.custom_owner = {
+            **copy.deepcopy(self.identity), "source": "custom",
+            "revision_id": "77777777-7777-4777-8777-777777777777",
+            "fingerprint_sha256": fingerprint,
+        }
+        self.binding = self.actor.selection.binding(self.custom_owner)
+        self.original = self.actor.selection.document(
+            self.custom_owner, self.custom_cert, self.custom_key,
+        )
+        self.binding.write_bytes(self.original)
+        self.original_files = (self.custom_cert.read_bytes(), self.custom_key.read_bytes())
+        self.request = {
+            "identity": copy.deepcopy(self.identity),
+            "operation_id": "55555555-5555-4555-8555-555555555555",
+            "action": "issue", "expected_binding": self.original.decode("ascii"),
+        }
+        self.directory = self.state / ACTOR.subject_key(self.identity["subject"])
+        self.receipt = self.directory / (self.request["operation_id"] + ".json")
+        self.issue = self.patch_boundary("issue", side_effect=self.issue_output)
+        self.verify = self.patch_boundary(
+            "verify_served", side_effect=lambda owner: owner["fingerprint_sha256"],
+        )
+        self.patch_boundary("assert_file_serving")
+
+    def patch_boundary(self, name, **kwargs):
+        patcher = patch.object(self.actor, name, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def write_material(self, certificate, private_key):
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.identity["route_hosts"][0])])
+        now = datetime.now(timezone.utc)
+        leaf = (
+            x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([
+                x509.DNSName(host) for host in self.identity["route_hosts"]
+            ]), critical=False).sign(key, hashes.SHA256())
+        )
+        certificate.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        private_key.write_bytes(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        certificate.chmod(0o600)
+        private_key.chmod(0o600)
+        return leaf.fingerprint(hashes.SHA256()).hex()
+
+    def issue_output(self, directory, operation_id, action):
+        self.assertEqual((operation_id, action), (self.request["operation_id"], "issue"))
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        output = directory / "certificates"
+        output.mkdir(mode=0o700)
+        hostname = self.identity["route_hosts"][0]
+        self.write_material(output / (hostname + ".crt"), output / (hostname + ".key"))
+
+    def assert_custom_files_retained(self):
+        self.assertEqual(
+            (self.custom_cert.read_bytes(), self.custom_key.read_bytes()), self.original_files,
+        )
+
+    def test_original_custom_request_issues_once_and_replays_without_replacement(self):
+        original_request = copy.deepcopy(self.request)
+        result = self.actor.run(self.request)
+        desired = self.binding.read_bytes()
+        inode = self.binding.stat().st_ino
+        self.assertNotEqual(desired, self.original)
+        self.assertEqual(result["owner"]["source"], "automatic")
+        self.assertEqual(self.actor.run(original_request), result)
+        self.assertEqual(self.binding.read_bytes(), desired)
+        self.assertEqual(self.binding.stat().st_ino, inode)
+        self.assertEqual(self.issue.call_count, 1)
+        self.assertEqual(self.verify.call_count, 2)
+        self.assertEqual(self.request, original_request)
+        receipt = ACTOR.private_json(self.receipt)
+        self.assertEqual(receipt["status"], "active")
+        self.assertEqual(receipt["request_digest"], ACTOR.digest({
+            "request": original_request, "profile": self.actor.profile,
+        }))
+        self.assertEqual(ACTOR.private_json(self.directory / "renewal.json"),
+                         self.actor._renewal_configuration())
+        self.assert_custom_files_retained()
+
+    def test_raw_or_expected_drift_refuses_before_issuer(self):
+        for current, expected in ((self.original + b"\n", self.original),
+                                  (self.original, self.original + b"\n")):
+            with self.subTest(current_changed=current != self.original):
+                self.binding.write_bytes(current)
+                request = {**self.request, "expected_binding": expected.decode("ascii")}
+                with self.assertRaises(ACTOR.AutomaticCertificateError):
+                    self.actor.run(request)
+                self.assertEqual(self.binding.read_bytes(), current)
+                self.assertFalse(self.receipt.exists())
+                self.issue.assert_not_called()
+                self.verify.assert_not_called()
+
+    def test_verify_failure_restores_raw_and_retries_issued_receipt_without_reissue(self):
+        self.verify.side_effect = ACTOR.AutomaticCertificateError("controlled serving refusal")
+        with self.assertRaises(ACTOR.AutomaticCertificateError):
+            self.actor.run(self.request)
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        self.assertEqual(ACTOR.private_json(self.receipt)["status"], "issued")
+        self.assertFalse((self.directory / "renewal.json").exists())
+        self.assert_custom_files_retained()
+        self.verify.side_effect = lambda owner: owner["fingerprint_sha256"]
+        result = self.actor.run(copy.deepcopy(self.request))
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(self.issue.call_count, 1)
+        self.assertEqual(ACTOR.private_json(self.receipt)["status"], "active")
+
+    def test_post_issue_drift_refuses_activation_and_retains_issued_receipt(self):
+        candidate = self.actor.candidate
+        drifted = self.original + b"changed after issuance\n"
+
+        def change_after_candidate(directory):
+            result = candidate(directory)
+            self.binding.write_bytes(drifted)
+            return result
+
+        with patch.object(self.actor, "candidate", side_effect=change_after_candidate):
+            with self.assertRaises(ACTOR.CertificateSelectionError):
+                self.actor.run(self.request)
+        self.assertEqual(self.binding.read_bytes(), drifted)
+        self.assertEqual(ACTOR.private_json(self.receipt)["status"], "issued")
+        self.assertEqual(self.issue.call_count, 1)
+        self.verify.assert_not_called()
+        self.assert_custom_files_retained()
+
+    def test_conflicting_selected_pool_refuses_activation_without_removing_other_owner(self):
+        other_owner = {
+            **copy.deepcopy(self.custom_owner),
+            "subject": {"type": "deployment", "id": "88888888-8888-4888-8888-888888888888"},
+        }
+        other_binding = self.actor.selection.binding(other_owner)
+        other_bytes = self.actor.selection.document(
+            other_owner, self.custom_cert, self.custom_key,
+        )
+        other_binding.write_bytes(other_bytes)
+        with self.assertRaises(ACTOR.CertificateSelectionError):
+            self.actor.run(self.request)
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        self.assertEqual(other_binding.read_bytes(), other_bytes)
+        self.assertEqual(ACTOR.private_json(self.receipt)["status"], "issued")
+        self.verify.assert_not_called()
+        self.assert_custom_files_retained()
+
+    def test_restored_custom_retirement_preserves_files_and_clears_subject_enrollment(self):
+        self.actor.run(self.request)
+        automatic = self.binding.read_bytes()
+        self.actor.selection.activate(
+            self.custom_owner, self.custom_cert, self.custom_key, automatic, lambda: None,
+        )
+        request = {
+            "identity": self.identity, "operation_id": self.request["operation_id"],
+            "expected_binding": self.original.decode("ascii"),
+        }
+        output = ACTOR.retire(request, self.certificates, self.dynamic, self.state)
+        receipt = output["automatic_certificate_retirement"]
+        self.assertEqual(receipt["selection_state"], "preserved_nonautomatic")
+        self.assertIs(receipt["renewal_enrolled"], False)
+        self.assertEqual(self.binding.read_bytes(), self.original)
+        self.assertFalse((self.directory / "renewal.json").exists())
+        self.assertFalse((self.directory / "renewal-request.json").exists())
+        self.assertTrue(self.receipt.exists())
+        self.assertEqual(ACTOR.retire(request, self.certificates, self.dynamic, self.state), output)
+        self.assert_custom_files_retained()
 
 
 if __name__ == "__main__":
