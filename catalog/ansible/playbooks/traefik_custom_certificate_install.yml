@@ -40,15 +40,107 @@
           - target_server is string
           - target_server == (target_server | trim)
           - (target_server | length) > 0
-          - expected_custom_certificate_observation is mapping
+          - >-
+            (expected_custom_certificate_observation is defined)
+            != (expected_automatic_certificate_selection is defined)
+          - >-
+            (expected_custom_certificate_observation is not defined)
+            or (expected_custom_certificate_observation is mapping)
         fail_msg: "Custom certificate installation identity is invalid"
 
   tasks:
+    - name: Qualify the exact automatic predecessor selection
+      when: expected_automatic_certificate_selection is defined
+      no_log: true
+      block:
+        - name: Validate the closed automatic predecessor envelope
+          ansible.builtin.assert:
+            that:
+              - expected_automatic_certificate_selection is mapping
+              - >-
+                (expected_automatic_certificate_selection.keys() | sort | list)
+                == ['digest', 'expected_binding', 'identity', 'operation_id']
+              - >-
+                expected_automatic_certificate_selection.identity == {
+                  'organization_id': org_id,
+                  'subject': {'type': 'deployment', 'id': deployment_id},
+                  'gateway_id': gateway_id,
+                  'server_id': server_id,
+                  'route_hosts': route_hosts
+                }
+              - expected_automatic_certificate_selection.operation_id is string
+              - expected_automatic_certificate_selection.operation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+              - expected_automatic_certificate_selection.expected_binding is string
+              - (expected_automatic_certificate_selection.expected_binding | length) > 0
+              - (expected_automatic_certificate_selection.expected_binding | length) <= 65536
+              - expected_automatic_certificate_selection.digest is string
+              - expected_automatic_certificate_selection.digest is match('^[0-9a-f]{64}$')
+            fail_msg: "Automatic predecessor selection is invalid"
+
+        - name: Read the canonical predecessor through the selected-pool owner
+          ansible.builtin.include_tasks:
+            file: ../tasks/traefik_certificate_selection.yml
+          vars:
+            certificate_selection_action: observe
+            certificate_selection_request:
+              identity: "{{ expected_automatic_certificate_selection.identity }}"
+              operation_id: "{{ expected_automatic_certificate_selection.operation_id }}"
+
+        - name: Require a bounded canonical predecessor observation
+          ansible.builtin.assert:
+            that:
+              - certificate_selection_result.stdout is string
+              - (certificate_selection_result.stdout | length) <= 131072
+              - certificate_selection_result.stdout is match('^TEMPLATE_OUTPUT_JSON=')
+            fail_msg: "Automatic predecessor selection changed before installation"
+
+        - name: Compare the complete automatic predecessor envelope
+          ansible.builtin.set_fact:
+            automatic_predecessor_unchanged: >-
+              {{ (certificate_selection_result.stdout
+                  | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
+                  | from_json) == {
+                    'automatic_certificate_selection': expected_automatic_certificate_selection
+                  } }}
+
+        - name: Capture the freshly qualified predecessor bytes for activation CAS
+          ansible.builtin.set_fact:
+            custom_selected_binding_bytes: >-
+              {{ (certificate_selection_result.stdout
+                  | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
+                  | from_json).automatic_certificate_selection.expected_binding }}
+          when: automatic_predecessor_unchanged
+
+        - name: Observe only an already-requested custom replay
+          ansible.builtin.include_tasks:
+            file: ../tasks/traefik_custom_certificate_observation.yml
+          when: not automatic_predecessor_unchanged
+
+        - name: Require exact requested custom serving for original-request replay
+          ansible.builtin.assert:
+            that:
+              - binding_valid and binding_present
+              - custom_certificate_observation.classification == 'exact'
+              - custom_certificate_observation.material_id == material_id
+              - custom_certificate_observation.revision_id == revision_id
+              - custom_certificate_observation.content_digest == content_digest
+              - custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
+              - custom_certificate_observation.route_hosts == route_hosts
+              - custom_certificate_observation.binding_count == 1
+              - custom_certificate_observation.host_count == (route_hosts | length)
+              - (custom_certificate_observation.hosts | map(attribute='hostname') | list) == route_hosts
+              - (custom_certificate_observation.hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
+              - (custom_certificate_observation.hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
+              - (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
+            fail_msg: "Automatic predecessor changed without exact requested custom replay"
+          when: not automatic_predecessor_unchanged
+
     - name: Read current custom certificate observation
       ansible.builtin.include_tasks:
         file: ../tasks/traefik_custom_certificate_observation.yml
       vars:
         custom_observation_expected: "{{ expected_custom_certificate_observation }}"
+      when: expected_automatic_certificate_selection is not defined
 
     - name: Require unchanged custom certificate observation
       ansible.builtin.assert:
@@ -83,6 +175,7 @@
               and (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
             )
         fail_msg: "Custom certificate state changed before installation"
+      when: expected_automatic_certificate_selection is not defined
 
     - name: Install immutable custom certificate material
       no_log: true
