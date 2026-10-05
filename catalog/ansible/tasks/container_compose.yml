@@ -10,39 +10,111 @@
     state: directory
     prefix: opsctl-compose-
   register: compose_directory
+  when: app_compose_runtime is not defined
+
+- name: Select private managed Compose revision directory
+  ansible.builtin.set_fact:
+    compose_directory:
+      path: "/var/lib/opsctl/compose/{{ app_compose_runtime.deployment_id }}/{{ app_compose_runtime.revision_id }}"
+  when: app_compose_runtime is defined
+
+- name: Refuse symlinked or writable custody ancestors before file delivery
+  ansible.builtin.shell: |
+    python3 - <<'PY'
+    import json
+    import stat
+    from pathlib import Path, PurePosixPath
+    request = json.loads({{ app_compose_runtime | to_json | to_json }})
+    directory = Path({{ compose_directory.path | to_json }})
+    try:
+        paths = [directory]
+        for item in request['files']:
+            relative = PurePosixPath(item['path'])
+            if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+                raise ValueError
+            paths.append(directory / str(relative))
+        for path in paths:
+            for component in (*reversed(path.parents), path):
+                if component.is_symlink():
+                    raise ValueError
+                if component.exists():
+                    info = component.stat()
+                    if info.st_uid != 0 or info.st_mode & 0o022:
+                        raise ValueError
+                    if component != path and not stat.S_ISDIR(info.st_mode):
+                        raise ValueError
+    except Exception:
+        raise SystemExit('Compose custody identity is unavailable.')
+    PY
+  args:
+    executable: /bin/sh
+  changed_when: false
+  no_log: true
+  when: app_compose_runtime is defined
+
+- name: Preserve private revision custody for mounted regular files
+  ansible.builtin.file:
+    path: "{{ compose_directory.path }}"
+    state: directory
+    mode: '0700'
+  when: app_compose_runtime is defined
 
 - name: Run the exact shared Compose transition
   block:
+    - name: Create private reviewed source parent directories
+      ansible.builtin.file:
+        path: "{{ compose_directory.path }}/{{ item.path | dirname }}"
+        state: directory
+        mode: '0700'
+      loop: "{{ app_compose_runtime.files | default([]) }}"
+      no_log: true
+      when: app_compose_runtime is defined
+
+    - name: Deliver exact originals and reviewed additions from existing file custody
+      ansible.builtin.copy:
+        src: "/var/run/opsctl/file-secret/{{ item.name }}"
+        dest: "{{ compose_directory.path }}/{{ item.path }}"
+        mode: "{{ item.mode }}"
+        force: false
+      loop: "{{ app_compose_runtime.files | default([]) }}"
+      no_log: true
+      when: app_compose_runtime is defined
+
     - name: Render reviewed desired Compose configuration
       ansible.builtin.template:
         src: "{{ playbook_dir }}/../templates/container_compose.yml.j2"
         dest: "{{ compose_directory.path }}/compose.yml"
         mode: '0600'
       no_log: true
-      when: app_local_runtime.action == 'deploy'
+      when: app_compose_runtime is not defined and app_local_runtime.action == 'deploy'
 
     - name: Deliver the existing namespace-only HTTP verifier
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../scripts/container_http_health.py"
         dest: "{{ compose_directory.path }}/http-health.py"
         mode: '0600'
+      when: app_compose_runtime is not defined
 
     - name: Hold exclusion through Compose, readiness and final observation
       ansible.builtin.shell: |
         python3 - <<'PY'
         import contextlib
+        import hashlib
         import fcntl
         import json
         import os
         import re
         import signal
+        import shutil
         import subprocess
         import tempfile
         import time
         from pathlib import Path
         from uuid import UUID
 
-        request = json.loads({{ app_local_runtime | to_json | to_json }})
+        request = json.loads({{ (app_compose_runtime if app_compose_runtime is defined else app_local_runtime) | to_json | to_json }})
+        grouped = request['protocol'] in {'opsctl-compose-runtime/1', 'opsctl-compose-attempt-cleanup/1'}
+        prospective_cleanup = request['protocol'] == 'opsctl-compose-attempt-cleanup/1'
         directory = Path({{ compose_directory.path | to_json }})
         deadline = time.monotonic() + {{ app_compose_timeout | default(240) | int }}
         project = 'opsctl-' + UUID(request['deployment_id']).hex
@@ -53,13 +125,13 @@
         def fail(code):
             raise RuntimeError(code)
 
-        def run(arguments, *, allowed=(0,), return_code=False):
+        def run(arguments, *, allowed=(0,), return_code=False, environment=None):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail('compose_transition_timeout')
             with tempfile.TemporaryFile() as output:
                 child = subprocess.Popen(arguments, stdout=output, stderr=subprocess.DEVNULL,
-                                         start_new_session=True, pass_fds=tuple(locked))
+                                         start_new_session=True, pass_fds=tuple(locked), env=environment)
                 try:
                     while child.poll() is None:
                         if time.monotonic() >= deadline or os.fstat(output.fileno()).st_size > 1048576:
@@ -234,14 +306,255 @@
                     'detached_attachments': [attachment(mount, previous['container_id'], previous['revision_id'], 'absent')
                         for mount in previous['mounts'] if present and mount['attachment_id'] not in retained]}
 
+        def grouped_transition():
+            if request['project_name'] != project:
+                fail('compose_project_identity_changed')
+            for item in request['files']:
+                path = directory / item['path']
+                if (path.is_symlink() or not path.is_file()
+                        or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']
+                        or (path.stat().st_mode & 0o777) != int(item['mode'], 8)):
+                    fail('compose_file_changed')
+            effective = [item for item in request['files'] if item['path'].endswith('/effective.json')]
+            if len(effective) != 1:
+                fail('compose_model_missing')
+            model = json.loads((directory / effective[0]['path']).read_bytes())
+            if set(model.get('services', {})) != set(request['services']):
+                fail('compose_model_changed')
+            old = request.get('previous') or {'containers': {}, 'networks': {}}
+            base_labels = {prefix + key: request[key] for key in ('organization_id', 'deployment_id', 'server_id')}
+            base_labels[prefix + 'org_id'] = base_labels.pop(prefix + 'organization_id')
+            base_labels[prefix + 'managed'] = 'true'
+
+            def project_containers():
+                ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter',
+                           'label=com.docker.compose.project=' + project]).decode().splitlines()
+                if len(ids) > 8 or len(set(ids)) != len(ids):
+                    fail('compose_project_inventory_changed')
+                return {identity: inspect('container', identity) for identity in ids}
+
+            def group_owned(row, name, revision, identity=None):
+                labels = (row.get('Config') or {}).get('Labels') or {} if row else {}
+                if (not row or any(labels.get(key) != value for key, value in base_labels.items())
+                        or labels.get(prefix + 'revision_id') != revision
+                        or labels.get('com.docker.compose.project') != project
+                        or labels.get('com.docker.compose.service') != name
+                        or not re.fullmatch('[a-f0-9]{64}', row.get('Id', ''))
+                        or identity is not None and row['Id'] != identity):
+                    fail('compose_container_changed')
+
+            def project_networks(allowed_containers):
+                ids = run(['docker', 'network', 'ls', '--no-trunc', '-q', '--filter',
+                           'label=com.docker.compose.project=' + project]).decode().splitlines()
+                if len(ids) > 16 or len(set(ids)) != len(ids):
+                    fail('compose_network_inventory_changed')
+                result = {}
+                for identity in ids:
+                    row = inspect('network', identity)
+                    labels = row.get('Labels') or {}
+                    name = labels.get('com.docker.compose.network')
+                    expected_name = project + '-' + hashlib.sha256(str(name).encode()).hexdigest()[:16]
+                    members = row.get('Containers')
+                    if (not isinstance(name, str) or name in result or row.get('Id') != identity
+                            or row.get('Name') != expected_name or row.get('Driver') != 'bridge'
+                            or row.get('Scope') != 'local' or row.get('Options') not in ({}, None)
+                            or any(labels.get(key) != value for key, value in base_labels.items())
+                            or not isinstance(members, dict) or set(members) - allowed_containers):
+                        fail('compose_network_changed')
+                    if prospective_cleanup and name not in request['network_names']:
+                        fail('compose_network_changed')
+                    result[name] = identity
+                return result
+
+            current = project_containers()
+            if prospective_cleanup:
+                if (request['action'] != 'remove' or request.get('previous') is not None
+                        or request['attempt_operation_id'] != request['revision_id']
+                        or request['attempt_job_name'] != 'op-' + UUID(request['attempt_operation_id']).hex):
+                    fail('compose_attempt_cleanup_invalid')
+                observed_attempt = {}
+                accounted = set()
+                for name, expected in request['services'].items():
+                    row = container(expected['container_name'])
+                    if row is not None:
+                        group_owned(row, name, request['revision_id'])
+                        if (row['Id'] not in current or row['Name'] != '/' + expected['container_name']
+                                or row['Config'].get('Image') != expected['image']):
+                            fail('compose_attempt_cleanup_invalid')
+                        accounted.add(row['Id'])
+                    observed_attempt[name] = row['Id'] if row else None
+                if accounted != set(current):
+                    fail('compose_project_inventory_changed')
+                attempt_networks = project_networks(accounted)
+                old = {'revision_id': request['revision_id'],
+                       'containers': {name: identity for name, identity in observed_attempt.items()
+                                      if identity is not None}, 'networks': attempt_networks}
+            new_revision = request['action'] == 'deploy' and bool(current) and all(
+                (row.get('Config', {}).get('Labels') or {}).get(prefix + 'revision_id') == request['revision_id']
+                for row in current.values())
+            if current and new_revision and request['action'] == 'deploy':
+                if len(current) != len(request['services']):
+                    fail('compose_project_inventory_changed')
+                for name, expected in request['services'].items():
+                    row = container(expected['container_name'])
+                    group_owned(row, name, request['revision_id'])
+                    if row['Id'] not in current:
+                        fail('compose_project_inventory_changed')
+            else:
+                if set(current) != set(old['containers'].values()) and current:
+                    fail('compose_previous_identity_missing')
+                if request['action'] == 'deploy' and old['containers'] and not current:
+                    fail('compose_previous_identity_missing')
+                for name, identity in old['containers'].items():
+                    row = current.get(identity)
+                    if row is not None:
+                        group_owned(row, name, old['revision_id'], identity)
+            for name, expected in request['services'].items():
+                row = container(expected['container_name'])
+                if row is not None and row['Id'] not in current:
+                    fail('compose_container_name_conflict')
+            networks = project_networks(set(current))
+            if not new_revision and networks != old['networks']:
+                if not (request['action'] == 'remove' and not current and not networks):
+                    fail('compose_network_changed')
+            for name in request['network_names']:
+                native_name = project + '-' + hashlib.sha256(name.encode()).hexdigest()[:16]
+                ids = run(['docker', 'network', 'ls', '--no-trunc', '-q', '--filter', 'name=^' + native_name + '$']).decode().splitlines()
+                if any(identity not in networks.values() for identity in ids):
+                    fail('compose_network_name_conflict')
+            compose = ['docker', 'compose', '--project-name', project,
+                       '--project-directory', str(directory / request['project_directory'])]
+            for path in request['compose_files']:
+                compose.extend(['--file', str(directory / path)])
+            for path in request['env_files']:
+                compose.extend(['--env-file', str(directory / path)])
+            for profile in request['profiles']:
+                compose.extend(['--profile', profile])
+            environment = {key: value for key, value in os.environ.items()
+                           if key in {'PATH', 'DOCKER_HOST', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'}}
+            if request['action'] == 'deploy':
+                for name, expected in request['services'].items():
+                    image = inspect('image', expected['image'])
+                    declared = (image.get('Config') or {}).get('Volumes') or {}
+                    if not isinstance(declared, dict):
+                        fail('compose_image_storage_unknown')
+                    covered = {mount['target'] for mount in model['services'][name].get('volumes', [])
+                               if mount.get('type') == 'bind' and mount.get('read_only') is True
+                               and mount.get('source') in {item['path'] for item in request['files']}}
+                    for kind in ('configs', 'secrets'):
+                        for mount in model['services'][name].get(kind, []):
+                            resource = model.get(kind, {}).get(mount.get('source'), {})
+                            if resource.get('file') in {item['path'] for item in request['files']}:
+                                covered.add(mount.get('target') or '/' + mount['source'])
+                    if set(declared) - covered:
+                        fail('compose_image_storage_unsupported')
+                if not new_revision:
+                    run([*compose, 'up', '--detach', '--remove-orphans', '--pull', 'never'], environment=environment)
+                while True:
+                    current = project_containers()
+                    if len(current) != len(request['services']):
+                        fail('compose_project_inventory_changed')
+                    observed = {}
+                    waiting = False
+                    for name, expected in request['services'].items():
+                        row = container(expected['container_name'])
+                        group_owned(row, name, request['revision_id'])
+                        if row['Id'] not in current or row['Config'].get('Image') != expected['image']:
+                            fail('compose_image_changed')
+                        if not row.get('State', {}).get('Running'):
+                            fail('compose_not_running')
+                        if any(mount.get('Type') == 'volume' for mount in row.get('Mounts', [])):
+                            fail('compose_storage_unsupported')
+                        health = row['State'].get('Health', {}).get('Status')
+                        if expected['health_declared']:
+                            waiting = waiting or health != 'healthy'
+                        observed[name] = {'container_id': row['Id'], 'image': expected['image'],
+                                          'state': 'healthy' if expected['health_declared'] else 'started'}
+                    if not waiting:
+                        break
+                    if time.monotonic() >= deadline:
+                        fail('compose_health_failed')
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
+                retired = {name: identity for name, identity in old['containers'].items() if identity not in current}
+                if any(container(identity) is not None for identity in retired.values()):
+                    fail('compose_retired_container_present')
+                networks = project_networks(set(current))
+                for name in set(networks) - set(request['network_names']):
+                    if old['networks'].get(name) != networks[name]:
+                        fail('compose_network_changed')
+                    row = inspect('network', networks[name])
+                    if row['Containers']:
+                        fail('compose_network_in_use')
+                    run(['docker', 'network', 'rm', networks[name]])
+                networks = project_networks(set(current))
+                if set(networks) != set(request['network_names']):
+                    fail('compose_network_inventory_changed')
+                presence = 'present'
+            else:
+                if current or networks:
+                    run([*compose, 'down', '--timeout', '20'], environment=environment)
+                if project_containers() or project_networks(set()):
+                    fail('compose_removal_unknown')
+                remaining_networks = set(run(['docker', 'network', 'ls', '--no-trunc', '-q']).decode().splitlines())
+                if remaining_networks.intersection(old['networks'].values()):
+                    fail('compose_removal_unknown')
+                for name in request['network_names']:
+                    native_name = project + '-' + hashlib.sha256(name.encode()).hexdigest()[:16]
+                    if run(['docker', 'network', 'ls', '--no-trunc', '-q', '--filter',
+                            'name=^' + native_name + '$']).decode().splitlines():
+                        fail('compose_removal_unknown')
+                for name, expected in request['services'].items():
+                    identity = old['containers'].get(name)
+                    if (identity is not None and container(identity) is not None
+                            or container(expected['container_name']) is not None):
+                        fail('compose_removal_unknown')
+                networks, retired = {}, {}
+                observed = {name: {'container_id': old['containers'].get(name),
+                                  'image': expected['image'], 'state': 'absent'}
+                            for name, expected in request['services'].items()}
+                presence = 'absent'
+            obsolete_revisions = {old.get('revision_id')} - {None, request['revision_id']}
+            if request['action'] == 'remove':
+                obsolete_revisions.add(request['revision_id'])
+            custody_paths = [Path('/var/lib/opsctl/compose') / str(UUID(request['deployment_id'])) / str(UUID(revision))
+                             for revision in obsolete_revisions]
+            if custody_paths:
+                ids = run(['docker', 'ps', '-aq', '--no-trunc']).decode().splitlines()
+                if len(ids) > 1024:
+                    fail('compose_inventory_limit')
+                for identity in ids:
+                    mounts = inspect('container', identity).get('Mounts')
+                    if not isinstance(mounts, list):
+                        fail('compose_mount_observation_unknown')
+                    for mount in mounts:
+                        if not isinstance(mount, dict) or not isinstance(mount.get('Source'), str):
+                            fail('compose_mount_observation_unknown')
+                        source = Path(mount['Source'])
+                        if any(source == path or path in source.parents for path in custody_paths):
+                            fail('compose_file_custody_in_use')
+                for path in custody_paths:
+                    if path.is_symlink():
+                        fail('compose_file_custody_changed')
+                    if path.exists():
+                        shutil.rmtree(path)
+            proof = {key: request[key] for key in ('protocol', 'organization_id', 'deployment_id', 'server_id',
+                                                  'operation_id', 'revision_id', 'effective_digest', 'project_name')}
+            proof.update(presence=presence, services=observed, networks=networks, retired_containers=retired)
+            if prospective_cleanup:
+                proof.pop('retired_containers')
+                proof.update(attempt_operation_id=request['attempt_operation_id'],
+                             attempt_job_uid=request['attempt_job_uid'],
+                             networks={name: attempt_networks.get(name) for name in request['network_names']})
+            print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'compose_runtime': proof}, sort_keys=True))
+
         try:
             with contextlib.ExitStack() as stack:
                 root = Path('/run/lock/opsctl-compose')
                 root.mkdir(mode=0o700, parents=True, exist_ok=True)
                 keys = {'deployment-' + UUID(request['deployment_id']).hex}
-                keys.update('volume-' + UUID(mount['backing_id']).hex for mount in request['mounts'] + previous['mounts'])
+                keys.update('volume-' + UUID(mount['backing_id']).hex for mount in request.get('mounts', []) + previous.get('mounts', []))
                 keys.update('network-' + UUID(network['id']).hex
-                            for network in request['networks'] + previous.get('networks', []))
+                            for network in request.get('networks', []) + (previous.get('networks', []) if not grouped else []))
                 for key in sorted(keys):
                     fd = os.open(root / key, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                     stack.callback(os.close, fd)
@@ -254,6 +567,9 @@
                                 fail('compose_lock_timeout')
                             time.sleep(0.05)
                     locked.append(fd)
+                if grouped:
+                    grouped_transition()
+                    raise SystemExit(0)
                 allocations()
                 current = container(request['container_name'])
                 project_ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter',
@@ -293,8 +609,13 @@
                     allocations()
                     proof = observation(current)
                 print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'local_runtime': proof}, sort_keys=True))
-        except Exception:
-            print('Compose transition could not establish exact runtime evidence.', file=__import__('sys').stderr)
+        except Exception as error:
+            code = 'compose_transition_unknown'
+            if (isinstance(error, RuntimeError) and len(error.args) == 1
+                    and isinstance(error.args[0], str)
+                    and re.fullmatch(r'compose_[a-z_]{1,56}', error.args[0])):
+                code = error.args[0]
+            print(code, file=__import__('sys').stderr)
             raise SystemExit(1)
         PY
       args:
@@ -302,6 +623,15 @@
       register: compose_transition
       no_log: true
       changed_when: false
+      failed_when: false
+
+    - name: Require exact Compose transition evidence
+      ansible.builtin.fail:
+        msg: >-
+          {{ compose_transition.stderr
+             if compose_transition.stderr is match('^compose_[a-z_]{1,56}$')
+             else 'compose_transition_unknown' }}
+      when: compose_transition.rc != 0
 
     - name: Publish value-free Compose observation
       ansible.builtin.debug:
@@ -311,3 +641,4 @@
       ansible.builtin.file:
         path: "{{ compose_directory.path }}"
         state: absent
+      when: app_compose_runtime is not defined

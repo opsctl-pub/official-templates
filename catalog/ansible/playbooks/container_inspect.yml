@@ -8,6 +8,156 @@
     expected_org_id: "{{ app_org_id | default('') }}"
     expected_project_id: "{{ app_project_id | default('') }}"
     expected_app_slug: "{{ app_slug | default(container_name) }}"
+  pre_tasks:
+    - name: Observe only the exact captured Compose group revision
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import ipaddress
+        import json
+        import os
+        import re
+        import subprocess
+        import tempfile
+        import time
+
+        request = json.loads({{ app_compose_inspect | default({}) | to_json | to_json }})
+        deadline = time.monotonic() + 60
+
+        def run(arguments):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError
+            with tempfile.TemporaryFile() as output:
+                child = subprocess.Popen(arguments, stdout=output, stderr=subprocess.DEVNULL)
+                try:
+                    while child.poll() is None:
+                        if time.monotonic() >= deadline or os.fstat(output.fileno()).st_size > 1048576:
+                            raise ValueError
+                        time.sleep(0.05)
+                    if child.returncode != 0:
+                        raise ValueError
+                    output.seek(0)
+                    value = output.read(1048577)
+                    if len(value) > 1048576:
+                        raise ValueError
+                    return value
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait()
+
+        def inspect(identity):
+            value = json.loads(run(['docker', 'container', 'inspect', '--', identity]))
+            if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+                raise ValueError
+            return value[0]
+
+        try:
+            if request['protocol'] != 'opsctl-compose-inspection/1':
+                raise ValueError
+            services = request['services']
+            if not isinstance(services, dict) or not 1 <= len(services) <= 8:
+                raise ValueError
+            if set(services) != set(request['containers']):
+                raise ValueError
+            listing_format = {{ '{{.ID}} {{.Names}}' | to_json }}
+            listing = run(['docker', 'ps', '-a', '--no-trunc', '--format', listing_format]).decode().splitlines()
+            if len(listing) > 1024:
+                raise ValueError
+            native_names = {}
+            for line in listing:
+                identity, name = line.split(' ', 1)
+                if not re.fullmatch('[a-f0-9]{64}', identity) or name in native_names:
+                    raise ValueError
+                native_names[name] = identity
+            ids = set(native_names.values())
+            if len(ids) != len(native_names):
+                raise ValueError
+            project_ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter',
+                               'label=com.docker.compose.project=' + request['project_name']]).decode().splitlines()
+            if len(set(project_ids)) != len(project_ids) or set(project_ids) - set(request['containers'].values()):
+                raise ValueError
+            observed = {}
+            for name, expected in services.items():
+                identity = request['containers'][name]
+                row = inspect(identity) if identity in ids else None
+                named = native_names.get(expected['container_name'])
+                if row is None:
+                    if named:
+                        raise ValueError
+                    observed[name] = {'container_id': None, 'image': None, 'state': 'missing', 'ports': []}
+                    continue
+                labels = (row.get('Config') or {}).get('Labels') or {}
+                required = {
+                    'com.opsctl.managed': 'true', 'com.opsctl.org_id': request['organization_id'],
+                    'com.opsctl.deployment_id': request['deployment_id'],
+                    'com.opsctl.server_id': request['server_id'], 'com.opsctl.revision_id': request['revision_id'],
+                    'com.docker.compose.project': request['project_name'], 'com.docker.compose.service': name,
+                }
+                state = row.get('State')
+                image = (row.get('Config') or {}).get('Image')
+                if (row.get('Id') != identity or row.get('Name') != '/' + expected['container_name']
+                        or named != identity or identity not in project_ids
+                        or any(labels.get(key) != value for key, value in required.items())
+                        or not isinstance(state, dict) or type(state.get('Running')) is not bool
+                        or not isinstance(image, str) or not re.fullmatch(r'[^\s@]+@sha256:[a-f0-9]{64}', image)):
+                    raise ValueError
+                health = (state.get('Health') or {}).get('Status')
+                if health not in (None, 'healthy', 'unhealthy', 'starting'):
+                    raise ValueError
+                status = 'stopped' if not state['Running'] else health or 'started'
+                bindings = (row.get('NetworkSettings') or {}).get('Ports') or {}
+                if not isinstance(bindings, dict):
+                    raise ValueError
+                ports = set()
+                for container_port, published in bindings.items():
+                    if not re.fullmatch(r'[0-9]+/tcp', container_port):
+                        if published:
+                            raise ValueError
+                        continue
+                    if published is None:
+                        continue
+                    if not isinstance(published, list):
+                        raise ValueError
+                    for item in published:
+                        host = ipaddress.ip_address(item['HostIp']).compressed
+                        host_port, target = int(item['HostPort']), int(container_port.split('/')[0])
+                        if not 1 <= host_port <= 65535 or not 1 <= target <= 65535:
+                            raise ValueError
+                        ports.add((host, host_port, target))
+                observed[name] = {
+                    'container_id': identity, 'image': image, 'state': status,
+                    'ports': [{'host_ip': host, 'host_port': port, 'container_port': target}
+                              for host, port, target in sorted(ports)],
+                }
+            proof = {key: request[key] for key in (
+                'protocol', 'organization_id', 'deployment_id', 'server_id', 'operation_id',
+                'revision_id', 'project_name', 'effective_digest',
+            )}
+            proof['services'] = observed
+            print('OPERATION_STEP=' + json.dumps({
+                'name': 'inspect:result', 'status': 'completed',
+                'metadata': {'display_name': 'Compose inspection complete', 'compose_inspection': proof},
+            }, sort_keys=True))
+        except Exception:
+            print('Compose inspection could not establish exact observation.', file=__import__('sys').stderr)
+            raise SystemExit(1)
+        PY
+      args:
+        executable: /bin/sh
+      register: compose_inspection
+      no_log: true
+      changed_when: false
+      when: app_compose_inspect is defined
+
+    - name: Publish safe named-service inspection
+      ansible.builtin.debug:
+        msg: "{{ compose_inspection.stdout }}"
+      when: app_compose_inspect is defined
+
+    - name: Finish the group observation without singular inspection
+      ansible.builtin.meta: end_play
+      when: app_compose_inspect is defined
   tasks:
     - name: Attest an explicitly bound private backend revision
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/private_http_verification.yml"

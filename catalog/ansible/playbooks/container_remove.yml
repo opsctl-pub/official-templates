@@ -9,6 +9,29 @@
     expected_app_slug: "{{ app_slug | default('') }}"
     expected_deployment_id: "{{ app_deployment_id | default('') }}"
     expected_image_ref: "{{ app_expected_image_ref | default(none) }}"
+  pre_tasks:
+    - name: Validate exact reviewed Compose group removal
+      ansible.builtin.assert:
+        that:
+          - app_compose_runtime is mapping
+          - app_compose_runtime.protocol in ['opsctl-compose-runtime/1', 'opsctl-compose-attempt-cleanup/1']
+          - app_compose_runtime.action == 'remove'
+          - app_compose_runtime.organization_id == app_org_id
+          - app_compose_runtime.deployment_id == app_deployment_id
+          - app_compose_runtime.server_id == server_id
+          - app_compose_runtime.revision_id == app_revision_id
+          - app_route_retirement is not defined
+          - app_connection_drain is not defined
+        fail_msg: "Compose group removal requires exact supported identity"
+      when: app_compose_runtime is defined
+
+    - name: Remove exact reviewed group through shared Compose exclusion
+      ansible.builtin.include_tasks: ../tasks/container_compose.yml
+      when: app_compose_runtime is defined
+
+    - name: End grouped removal before single-container effects
+      ansible.builtin.meta: end_play
+      when: app_compose_runtime is defined
   tasks:
     - name: Validate canonical removal identity before inspection
       assert:
@@ -215,6 +238,10 @@
   gather_facts: false
   become: true
   vars: *retirement_identity
+  pre_tasks:
+    - name: Exclude grouped removal from single-container route verification
+      ansible.builtin.meta: end_play
+      when: app_compose_runtime is defined
   tasks:
     - name: Reobserve canonical route after retirement
       when: app_route_retirement is defined
@@ -237,6 +264,10 @@
   become: true
   vars:
     container_name: "{{ app_container_name | default('') }}"
+  pre_tasks:
+    - name: Exclude already-verified grouped removal from single-container completion
+      ansible.builtin.meta: end_play
+      when: app_compose_runtime is defined
   tasks:
     - name: Verify opt-in HTTP drain barrier and exact inbound-zero before removal
       command:
