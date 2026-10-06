@@ -12,6 +12,13 @@
   register: compose_directory
   when: app_compose_runtime is not defined
 
+- name: Identify verification-only prospective cleanup
+  ansible.builtin.set_fact:
+    compose_verify_absence: >-
+      {{ app_compose_runtime is defined
+         and app_compose_runtime.protocol == 'opsctl-compose-attempt-cleanup/2'
+         and (app_compose_runtime.cleanup_mode | default('witness')) == 'verify_absence' }}
+
 - name: Select private managed Compose revision directory
   ansible.builtin.set_fact:
     compose_directory:
@@ -50,14 +57,14 @@
     executable: /bin/sh
   changed_when: false
   no_log: true
-  when: app_compose_runtime is defined
+  when: app_compose_runtime is defined and not compose_verify_absence
 
 - name: Preserve private revision custody for mounted regular files
   ansible.builtin.file:
     path: "{{ compose_directory.path }}"
     state: directory
     mode: '0700'
-  when: app_compose_runtime is defined
+  when: app_compose_runtime is defined and not compose_verify_absence
 
 - name: Run the exact shared Compose transition
   block:
@@ -68,7 +75,7 @@
         mode: '0700'
       loop: "{{ app_compose_runtime.files | default([]) }}"
       no_log: true
-      when: app_compose_runtime is defined
+      when: app_compose_runtime is defined and not compose_verify_absence
 
     - name: Deliver exact originals and reviewed additions from existing file custody
       ansible.builtin.copy:
@@ -78,7 +85,7 @@
         force: false
       loop: "{{ app_compose_runtime.files | default([]) }}"
       no_log: true
-      when: app_compose_runtime is defined
+      when: app_compose_runtime is defined and not compose_verify_absence
 
     - name: Render reviewed desired Compose configuration
       ansible.builtin.template:
@@ -325,7 +332,7 @@
               workspace = Path(request['workspace'])
               old = request.get('previous') or {'inventory': {'services': {}, 'networks': {}, 'volumes': {}},
                                                 'owned_networks': [], 'owned_volumes': []}
-              if native_cleanup:
+              if native_cleanup and request.get('cleanup_mode', 'witness') == 'witness':
                   old = {'inventory': request['attempt']['partial'],
                          'owned_networks': request['attempt']['owned_networks'],
                          'owned_volumes': request['attempt']['owned_volumes']}
@@ -429,6 +436,70 @@
                   selected = {name: native_volumes[name] for name in names if name in native_volumes}
                   return {'services': services, 'networks': networks, 'volumes': selected}
 
+              if native_cleanup and request.get('cleanup_mode', 'witness') == 'verify_absence':
+                  def absence_inventory():
+                      found = []
+                      explicit = {item['container_name'] for item in request['services'].values()
+                                  if item.get('container_name')}
+                      ids = run(['docker', 'ps', '-aq', '--no-trunc']).decode().splitlines()
+                      if len(ids) > 4096 or len(set(ids)) != len(ids):
+                          fail('compose_instance_inventory_unknown')
+                      for identity in ids:
+                          row = inspect('container', identity)
+                          name = row['Name'].removeprefix('/')
+                          if (name in explicit or (row.get('Config', {}).get('Labels') or {}).get(
+                                  'com.docker.compose.project') == project):
+                              found.append({'kind': 'container', 'name': name})
+                      observed = {'services': {name: {} for name in request['services']},
+                                  'networks': {}, 'volumes': {}}
+                      for kind, native_kind in (('networks', 'network'), ('volumes', 'volume')):
+                          arguments = ['docker', native_kind, 'ls', '--quiet']
+                          if kind == 'networks':
+                              arguments.append('--no-trunc')
+                          identities = run(arguments).decode().splitlines()
+                          if len(identities) > 4096 or len(set(identities)) != len(identities):
+                              fail('compose_resource_inventory_unknown')
+                          desired = {item['name']: item for item in request[kind].values()}
+                          for identity in identities:
+                              row = inspect(native_kind, identity)
+                              name = row['Name']
+                              labelled = (row.get('Labels') or {}).get('com.docker.compose.project') == project
+                              intent = desired.get(name)
+                              if labelled or intent and intent['ownership'] != 'external':
+                                  found.append({'kind': native_kind, 'name': name})
+                              elif intent and intent['ownership'] == 'external':
+                                  if kind == 'networks':
+                                      observed[kind][row['Id']] = {'native_id': row['Id'], 'name': name,
+                                                                 'driver': row['Driver']}
+                                  else:
+                                      observed[kind][name] = volume(row)
+                      if found:
+                          safe = []
+                          for item in found[:64]:
+                              if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,255}', item['name']):
+                                  fail('compose_resource_identity_unknown')
+                              safe.append(item)
+                          print('OPERATION_STEP=' + json.dumps({
+                              'name': 'compose:cleanup-verification', 'status': 'failed',
+                              'metadata': {'display_name': 'Prospective Compose resources remain',
+                                           'code': 'compose_attempt_resources_present',
+                                           'resources': safe, 'resource_count': len(found),
+                                           'truncated': len(found) > len(safe)},
+                          }, sort_keys=True), flush=True)
+                          fail('compose_attempt_resources_present')
+                      return observed
+                  before = absence_inventory()
+                  after = absence_inventory()
+                  if before != after:
+                      fail('compose_reference_resource_changed')
+                  proof = {key: request[key] for key in (
+                      'protocol', 'organization_id', 'deployment_id', 'server_id', 'operation_id',
+                      'revision_id', 'effective_digest', 'project_name', 'attempt_operation_id',
+                      'attempt_job_uid', 'execution_revision_id', 'inventory_digest',
+                  )}
+                  proof.update(cleanup_mode='verify_absence', before=before, after=after)
+                  print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'compose_runtime': proof}, sort_keys=True))
+                  return
               before = inventory()
               if native_cleanup and (set(before['networks']) - set(old['inventory']['networks'])
                                      or set(before['volumes']) - set(old['inventory']['volumes'])):
@@ -695,7 +766,8 @@
                                                     'operation_id', 'revision_id', 'effective_digest', 'project_name')}
               if native_cleanup:
                   proof.update(attempt_operation_id=request['attempt_operation_id'],
-                               attempt_job_uid=request['attempt_job_uid'], before=before, after=after)
+                               attempt_job_uid=request['attempt_job_uid'],
+                               cleanup_mode=request.get('cleanup_mode', 'witness'), before=before, after=after)
                   print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'compose_runtime': proof}, sort_keys=True))
                   return
               network_intents = {item['name']: item for item in request['networks'].values()}
