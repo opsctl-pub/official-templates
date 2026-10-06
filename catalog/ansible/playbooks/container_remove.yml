@@ -14,7 +14,7 @@
       ansible.builtin.assert:
         that:
           - app_compose_runtime is mapping
-          - app_compose_runtime.protocol in ['opsctl-compose-runtime/1', 'opsctl-compose-attempt-cleanup/1']
+          - app_compose_runtime.protocol in ['opsctl-compose-runtime/1', 'opsctl-compose-runtime/2', 'opsctl-compose-attempt-cleanup/1', 'opsctl-compose-attempt-cleanup/2']
           - app_compose_runtime.action == 'remove'
           - app_compose_runtime.organization_id == app_org_id
           - app_compose_runtime.deployment_id == app_deployment_id

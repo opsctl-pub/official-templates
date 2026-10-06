@@ -154,7 +154,7 @@
       ansible.builtin.assert:
         that:
           - app_compose_runtime is mapping
-          - app_compose_runtime.protocol == 'opsctl-compose-runtime/1'
+          - app_compose_runtime.protocol == 'opsctl-compose-runtime/2'
           - app_compose_runtime.action == 'deploy'
           - app_compose_runtime.organization_id == app_org_id
           - app_compose_runtime.deployment_id == app_deployment_id
@@ -164,17 +164,6 @@
           - source_replacement is not defined
           - not (replace_conflicts | default(false) | bool)
         fail_msg: "Compose group requires exact reviewed identity"
-      when: app_compose_runtime is defined
-
-    - name: Prepare every reviewed Compose service image before workload changes
-      ansible.builtin.include_tasks: ../tasks/container_image_prepare.yml
-      vars:
-        app_image: "{{ compose_service.value.image }}"
-        compose_image_service: "{{ compose_service.key }}"
-      loop: "{{ app_compose_runtime.services | default({}) | dict2items }}"
-      loop_control:
-        loop_var: compose_service
-        label: "{{ compose_service.key }}"
       when: app_compose_runtime is defined
 
     - name: Execute the reviewed Compose group through the shared transition

@@ -19,6 +19,8 @@
         import subprocess
         import tempfile
         import time
+        from datetime import datetime
+        from uuid import UUID
 
         request = json.loads({{ app_compose_inspect | default({}) | to_json | to_json }})
         deadline = time.monotonic() + 60
@@ -52,8 +54,94 @@
                 raise ValueError
             return value[0]
 
+        def native_observation():
+            captured = request['captured']
+            known = {row['container_id'] for replicas in captured['services'].values() for row in replicas.values()}
+            ids = set(run(['docker', 'ps', '-aq', '--no-trunc']).decode().splitlines())
+            current = set(run(['docker', 'ps', '-aq', '--no-trunc', '--filter',
+                               'label=com.docker.compose.project=' + request['project_name']]).decode().splitlines())
+            if len(ids) > 4096 or current - known:
+                raise ValueError
+            services = {name: {} for name in request['services']}
+            for name, replicas in captured['services'].items():
+                for replica, expected in replicas.items():
+                    identity = expected['container_id']
+                    if identity not in ids:
+                        continue
+                    row = inspect(identity)
+                    labels = (row.get('Config') or {}).get('Labels') or {}
+                    if (row['Id'] != identity or row['Name'] != '/' + expected['container_name']
+                            or identity not in current
+                            or labels.get('com.docker.compose.project') != request['project_name']
+                            or labels.get('com.docker.compose.service') != name
+                            or labels.get('com.docker.compose.container-number') != replica):
+                        raise ValueError
+                    image = json.loads(run(['docker', 'image', 'inspect', '--', row['Image']]))
+                    if len(image) != 1 or image[0]['Id'] != row['Image']:
+                        raise ValueError
+                    ports = []
+                    for target, bindings in ((row.get('NetworkSettings') or {}).get('Ports') or {}).items():
+                        number, protocol = target.rsplit('/', 1)
+                        for binding in bindings or []:
+                            ports.append({'protocol': protocol, 'host_ip': ipaddress.ip_address(binding['HostIp']).compressed,
+                                          'host_port': int(binding['HostPort']), 'container_port': int(number)})
+                    mounts = [{'kind': mount['Type'], 'target': mount['Destination'],
+                               'source': mount.get('Source', ''), 'read_only': not mount['RW'],
+                               'volume_name': mount.get('Name') if mount['Type'] == 'volume' else None}
+                              for mount in row.get('Mounts', [])]
+                    state = row['State']
+                    services[name][replica] = {
+                        'container_id': identity, 'container_name': expected['container_name'],
+                        'revision_id': str(UUID(labels['com.opsctl.revision_id'])),
+                        'config_image_id': row['Image'], 'repo_digests': sorted(image[0].get('RepoDigests') or []),
+                        'state': state['Status'], 'health': (state.get('Health') or {}).get('Status', 'none'),
+                        'exit_code': state['ExitCode'], 'ports': ports, 'mounts': mounts,
+                        'restart_policy': ((row.get('HostConfig') or {}).get('RestartPolicy') or {}).get('Name') or 'no',
+                        'image_volume_targets': sorted((image[0].get('Config') or {}).get('Volumes') or {}),
+                        'networks': {name: value['NetworkID'] for name, value in
+                                     ((row.get('NetworkSettings') or {}).get('Networks') or {}).items()},
+                    }
+            networks = {}
+            ids = set(run(['docker', 'network', 'ls', '--quiet', '--no-trunc']).decode().splitlines())
+            for key, expected in captured['networks'].items():
+                if expected['native_id'] not in ids:
+                    continue
+                rows = json.loads(run(['docker', 'network', 'inspect', '--', expected['native_id']]))
+                if len(rows) != 1:
+                    raise ValueError
+                row = rows[0]
+                networks[key] = {'native_id': row['Id'], 'name': row['Name'], 'driver': row['Driver']}
+            volumes = {}
+            names = set(run(['docker', 'volume', 'ls', '--quiet']).decode().splitlines())
+            for key, expected in captured['volumes'].items():
+                if expected['name'] not in names:
+                    continue
+                rows = json.loads(run(['docker', 'volume', 'inspect', '--', expected['name']]))
+                if len(rows) != 1:
+                    raise ValueError
+                row = rows[0]
+                options = json.dumps(row.get('Options') or {}, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
+                created_at = row.get('CreatedAt')
+                if created_at:
+                    created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00')).isoformat().replace('+00:00', 'Z')
+                volumes[key] = {'name': row['Name'], 'driver': row['Driver'], 'created_at': created_at,
+                                'options_fingerprint': __import__('hashlib').sha256(options).hexdigest()}
+            return {'services': services, 'networks': networks, 'volumes': volumes}
+
         failure_code = 'compose_inspection_request_invalid'
         try:
+            if request['protocol'] == 'opsctl-compose-inspection/2':
+                failure_code = 'compose_inspection_receipt_invalid'
+                proof = {key: request[key] for key in (
+                    'protocol', 'organization_id', 'deployment_id', 'server_id', 'operation_id',
+                    'revision_id', 'project_name', 'effective_digest',
+                )}
+                proof['inventory'] = native_observation()
+                print('OPERATION_STEP=' + json.dumps({
+                    'name': 'inspect:result', 'status': 'completed',
+                    'metadata': {'display_name': 'Compose inspection complete', 'compose_inspection': proof},
+                }, sort_keys=True))
+                raise SystemExit(0)
             if request['protocol'] != 'opsctl-compose-inspection/1':
                 raise ValueError
             services = request['services']
