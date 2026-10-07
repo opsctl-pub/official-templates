@@ -189,7 +189,8 @@
             ('reused' if prior | length > 0 and prior[0].presence == 'present' and prior[0].id == id else 'unknown'))) %}
           {% set networks.values = networks.values + [{'id': id, 'name': result.compose_network_name,
             'origin': origin, 'presence': 'absent' if not result.exists else
-              ('unknown' if known | length > 0 and known[0].id != id else 'present')}] %}
+              ('unknown' if known | length > 0 and known[0].id != id and not
+                (compose_action == 'deploy' and compose_allow_new_instances | default(false)) else 'present')}] %}
           {% endif %}
           {% endfor %}
           {{ networks.values }}

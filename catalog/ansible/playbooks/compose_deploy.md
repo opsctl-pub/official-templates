@@ -107,6 +107,11 @@ after backend authority/quiescence checks, not success or name-based adoption.
 Existing resource incarnations preserve recorded origins; complete absence before
 and presence after establishes created; native external declarations stay external;
 otherwise references are reused/unknown. Templates return no backend attribution IDs.
+After native apply, including partial-apply rescue, an observed replacement network
+is present with its new ID. Its origin remains unknown unless independent creation
+or external evidence establishes otherwise; the old ID's created authority never
+transfers. Pre-apply, inspect and remove still treat recorded-ID replacement as
+incomplete observation. Volume incarnation handling is unchanged.
 
 ## Example
 
