@@ -11,7 +11,7 @@
   tasks:
     - name: Attest an explicitly bound private backend revision
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/private_http_verification.yml"
-      when: private_verification is defined
+      when: verification_kind is defined
 
     - name: OPERATION_STEP inspect:start
       shell: |

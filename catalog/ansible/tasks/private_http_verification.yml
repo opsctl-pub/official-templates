@@ -1,27 +1,174 @@
 ---
-- name: Collect authenticated private verification evidence
-  ansible.builtin.script:
-    cmd: "{{ playbook_dir }}/../scripts/private_http_verification.py {{ private_verification | to_json | b64encode }}"
-    executable: python3
-  become: true
-  register: private_verification_result
-  changed_when: false
-  failed_when: false
-  no_log: true
+- name: Initialize unavailable verification facts
+  ansible.builtin.set_fact:
+    _verification_code: routing_input_invalid
+    _verification_phase: validate
+    _verification_facts:
+      outcome: incomplete
+      observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      kind: "{{ verification_kind }}"
+      passed: false
+      status: null
+      body_match: null
+      gateway_container_id: null
+      router_name: null
+      upstream: null
+      container_id: null
+      image_id: null
+      started_at: null
+      tls: null
+      destination: null
+      origin_tls_observed: null
+      cache_headers: null
 
-- name: Fail with bounded private verification reason
-  ansible.builtin.fail:
-    msg: "Private upstream verification failed: {{ (private_verification_result.stdout | trim | from_json).error_code }}"
-  when: private_verification_result.rc != 0
+- name: Observe the requested verification primitive
+  block:
+    - name: Validate the explicit runtime selection
+      ansible.builtin.assert:
+        that:
+          - verification_kind in ['runtime_before', 'gateway', 'public_edge', 'runtime_after']
+          - not (simulate | default(false) | bool)
+          - verification_target is mapping
+          - >-
+            ({'verification_kind': verification_kind, 'verification_target': verification_target}
+             | to_json | b64encode | length) <= 349528
+          - verification_target.container_name is string
+          - verification_target.container_name | length > 0
+          - verification_target.expected_container_id is match('^[a-f0-9]{64}$')
+          - verification_target.image_ref is string
+          - verification_target.image_ref | length > 0
+          - verification_target.container_port is integer
+          - verification_target.container_port >= 1
+          - verification_target.container_port <= 65535
+        fail_msg: Routing procedure inputs are invalid. Refresh the review.
+      no_log: true
 
-- name: Emit sanitized private verification result
+    - name: Mark native observation phase
+      ansible.builtin.set_fact:
+        _verification_code: native_tool_unavailable
+        _verification_phase: observe
+
+    - name: Observe the selected runtime with Docker
+      community.docker.docker_container_info:
+        name: "{{ verification_target.container_name }}"
+      register: _verification_runtime
+      become: true
+      no_log: true
+      when: verification_kind in ['runtime_before', 'runtime_after']
+
+    - name: Retain available native runtime identity
+      ansible.builtin.set_fact:
+        _verification_facts: >-
+          {{ _verification_facts | combine({
+            'container_id': _verification_runtime.container.Id,
+            'image_id': _verification_runtime.container.Image,
+            'started_at': _verification_runtime.container.State.StartedAt
+          }) }}
+      when: verification_kind in ['runtime_before', 'runtime_after'] and _verification_runtime.exists
+
+    - name: Mark exact runtime identity check
+      ansible.builtin.set_fact:
+        _verification_code: verification_identity_changed
+
+    - name: Require the original running incarnation
+      ansible.builtin.assert:
+        that:
+          - _verification_runtime.exists
+          - _verification_facts.container_id == verification_target.expected_container_id
+          - _verification_facts.container_id is match('^[a-f0-9]{64}$')
+          - _verification_facts.image_id is match('^sha256:[a-f0-9]{64}$')
+          - _verification_runtime.container.Config.Image == verification_target.image_ref
+          - _verification_runtime.container.State.Running is sameas true
+          - _verification_runtime.container.State.StartedAt is string
+          - _verification_runtime.container.State.StartedAt is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T')
+        fail_msg: Runtime identity changed during verification. Refresh the current runtime observation.
+      no_log: true
+      when: verification_kind in ['runtime_before', 'runtime_after']
+
+    - name: Record successful runtime-only observation
+      ansible.builtin.set_fact:
+        _verification_facts: >-
+          {{ _verification_facts | combine({'outcome': 'succeeded', 'passed': true,
+            'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')}) }}
+      when: verification_kind in ['runtime_before', 'runtime_after']
+
+    - name: Observe gateway and request correlation
+      when: verification_kind in ['gateway', 'public_edge']
+      block:
+        - name: Mark native gateway observation
+          ansible.builtin.set_fact:
+            _verification_code: native_tool_unavailable
+
+        - name: Observe this template's native gateway
+          community.docker.docker_container_info:
+            name: "{{ traefik_container_name | default('traefik') }}"
+          register: _verification_gateway
+          become: true
+          no_log: true
+
+        - name: Require an observed running gateway
+          ansible.builtin.assert:
+            that:
+              - _verification_gateway.exists
+              - _verification_gateway.container.State.Running is sameas true
+              - _verification_gateway.container.Id is match('^[a-f0-9]{64}$')
+            fail_msg: Required Server tooling is unavailable. Correct Server setup before retrying.
+          no_log: true
+
+        - name: Collect bounded HTTP and native telemetry facts
+          ansible.builtin.script:
+            cmd: >-
+              {{ playbook_dir }}/../scripts/private_http_verification.py
+              {{ {'verification_kind': verification_kind, 'verification_target': verification_target,
+                  'gateway_container_id': _verification_gateway.container.Id} | to_json | b64encode }}
+            executable: python3
+          become: true
+          register: _verification_probe
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Retain the actual request observation
+          ansible.builtin.set_fact:
+            _verification_result: "{{ _verification_probe.stdout | trim | from_json }}"
+          no_log: true
+
+        - name: Retain available request facts and refusal
+          ansible.builtin.set_fact:
+            _verification_facts: "{{ _verification_result.deployment_verification }}"
+            _verification_code: "{{ (_verification_result.procedure_error | default({})).code | default('verification_failed') }}"
+            _verification_phase: "{{ (_verification_result.procedure_error | default({})).phase | default('probe') }}"
+
+        - name: Require the observed request to pass
+          ansible.builtin.assert:
+            that:
+              - _verification_probe.rc == 0
+              - _verification_facts.passed is sameas true
+              - _verification_facts.outcome == 'succeeded'
+            fail_msg: The required request check failed. Review the observed status and target health.
+
+  rescue:
+    - name: Emit available verification facts before refusal
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'deployment_verification': _verification_facts | combine({
+            'passed': false, 'outcome': 'failed', 'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')}),
+            'procedure_error': {'phase': _verification_phase, 'code': _verification_code}} | to_json }}
+
+    - name: Refuse incomplete or changed verification
+      ansible.builtin.fail:
+        msg: >-
+          {{ {
+            'routing_input_invalid': 'Routing procedure inputs are invalid. Refresh the review.',
+            'native_tool_unavailable': 'Required Server tooling is unavailable. Correct Server setup before retrying.',
+            'verification_identity_changed': 'Runtime identity changed during verification. Refresh the current runtime observation.',
+            'verification_failed': 'The required request check failed. Review the observed status and target health.',
+            'verification_upstream_unverified': 'The request could not be correlated to the required upstream. Review gateway telemetry and routing.'
+          }.get(_verification_code, 'The required request check failed. Review the observed status and target health.') }}
+
+- name: Emit successful plain verification facts
   ansible.builtin.debug:
-    msg: "TEMPLATE_OUTPUT_JSON={{ {'private_verification': (private_verification_result.stdout | trim | from_json)} | to_json }}"
+    msg: "TEMPLATE_OUTPUT_JSON={{ {'deployment_verification': _verification_facts} | to_json }}"
 
-- name: Emit private health completion
-  ansible.builtin.debug:
-    msg: "OPERATION_STEP={{ {'name': 'health:complete', 'status': 'completed', 'metadata': {'mode': 'http', 'expected_status': private_verification.challenge.expected_status, 'observed_status': private_verification.challenge.expected_status, 'body_match': true, 'error_code': 'none'}} | to_json }}"
-  when: private_verification.action == 'gateway'
-
-- name: Stop after private verification
+- name: Stop after explicit verification
   ansible.builtin.meta: end_play
