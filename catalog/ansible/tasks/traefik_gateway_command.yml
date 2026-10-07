@@ -32,7 +32,7 @@
           '--accesslog.fields.names.RequestPath=keep',
           '--accesslog.fields.names.TLSVersion=keep',
           '--accesslog.fields.headers.defaultmode=drop',
-          '--accesslog.fields.headers.names.X-Opsctl-Verification-Nonce=keep',
+          '--accesslog.fields.headers.names.X-Opsctl-Request-Id=keep',
           '--entrypoints.web.observability.accesslogs=false',
           '--entrypoints.websecure.observability.accesslogs=false',
           '--entrypoints.web.address=:80',

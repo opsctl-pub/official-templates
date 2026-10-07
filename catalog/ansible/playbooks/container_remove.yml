@@ -111,114 +111,57 @@
       when: app_previous_container_id is defined
       no_log: true
 
-    - name: Observe explicitly qualified whole-deployment route
+    - name: Require public route withdrawal on the same image target
+      ansible.builtin.assert:
+        that:
+          - app_route_retirement is mapping
+          - app_route_retirement.route_state == 'absent'
+          - app_route_retirement.org_id == app_org_id
+          - app_route_retirement.deployment_id == app_deployment_id
+          - app_route_retirement.target_server == target_server
+          - app_route_retirement.simulate == false
+        fail_msg: Whole-deployment route retirement inputs are invalid.
       when: app_route_retirement is defined
-      vars: &retirement_identity
-        deployment_id: "{{ app_route_retirement.topology.deployment_id }}"
-        org_id: "{{ app_route_retirement.topology.organization_id }}"
-        server_id: "{{ app_route_retirement.topology.server_id }}"
-        target_server: "{{ app_route_retirement.topology.server_name }}"
-        traefik_container_name: traefik
-        traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
-        route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
-        route_key: "deployment-{{ deployment_id }}"
-      block:
-        - name: Validate opt-in route retirement identity
-          assert:
-            that:
-              - app_route_retirement is mapping
-              - app_route_retirement.version == 1
-              - app_route_retirement.topology.gateway_engine in ['traefik', 'caddy']
-              - org_id == app_org_id
-              - deployment_id == app_deployment_id
-              - app_route_retirement.topology.app_container_name == app_container_name
-              - app_route_retirement.topology.app_slug == app_slug
-              - app_route_retirement.topology.server_name == target_server
-              - app_route_retirement.topology.route_hosts | length > 0
-            fail_msg: "Whole-deployment route retirement identity is invalid"
-
-        - name: Read canonical route observation
-          block: &retirement_observer
-            - name: Observe exact Traefik watched file
-              include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
-              when: app_route_retirement.topology.gateway_engine == 'traefik'
-
-            - name: Observe exact Caddy route through its canonical helper
-              script: "{{ playbook_dir }}/../scripts/caddy_route_contract.py observe"
-              environment:
-                OPSCTL_DEPLOYMENT_ID: "{{ deployment_id }}"
-                OPSCTL_ORGANIZATION_ID: "{{ org_id }}"
-                OPSCTL_PROXY_ENGINE: caddy
-                OPSCTL_SERVER_ID: "{{ server_id }}"
-                OPSCTL_TARGET_SERVER: "{{ target_server }}"
-              register: retirement_caddy_observer
-              changed_when: false
-              when: app_route_retirement.topology.gateway_engine == 'caddy'
-
-            - name: Read canonical Caddy output envelope
-              set_fact:
-                retirement_caddy_outputs: >-
-                  {{ retirement_caddy_observer.stdout_lines | select('match', '^TEMPLATE_OUTPUT_JSON=') | list }}
-              when: app_route_retirement.topology.gateway_engine == 'caddy'
-
-            - name: Require one Caddy output envelope
-              assert:
-                that: retirement_caddy_outputs | length == 1
-                fail_msg: "Canonical Caddy route observation is unavailable"
-              when: app_route_retirement.topology.gateway_engine == 'caddy'
-
-            - name: Read typed Caddy observation without parsing route files
-              set_fact:
-                route_observation: "{{ (retirement_caddy_outputs[0] | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).deployment_route_observation }}"
-              when: app_route_retirement.topology.gateway_engine == 'caddy'
-
-        - name: Require current route to match captured ownership or absence
-          assert:
-            that:
-              - route_observation == app_route_retirement.present or route_observation == app_route_retirement.absent
-            fail_msg: "Whole-deployment route changed before retirement"
-
-        - name: Preserve fresh route comparison evidence
-          set_fact:
-            retirement_before: "{{ route_observation }}"
+      no_log: true
 
 - import_playbook: traefik_route_converge.yml
-  when: app_route_retirement is defined and app_route_retirement.topology.gateway_engine == 'traefik'
+  when: app_route_retirement is defined
   vars: &retirement_converge
-    deployment_id: "{{ app_route_retirement.topology.deployment_id }}"
-    org_id: "{{ app_route_retirement.topology.organization_id }}"
-    server_id: "{{ app_route_retirement.topology.server_id }}"
-    target_server: "{{ app_route_retirement.topology.server_name }}"
-    app_slug: "{{ app_route_retirement.topology.app_slug }}"
-    app_container_name: "{{ app_route_retirement.topology.app_container_name }}"
-    route_state: absent
-    route_hosts: []
-    route_port: "{{ app_route_retirement.remove_args.route_port }}"
-    route_https: false
-    redirect_http_to_https: false
-    route_middlewares: "{{ app_route_retirement.remove_args.route_middlewares }}"
-    route_tls_binding: null
-    expected_route_observation: "{{ retirement_before }}"
-    proxy_engine: caddy
-    execution_contract: configuration
-
-- import_playbook: caddy_route_converge.yml
-  when: app_route_retirement is defined and app_route_retirement.topology.gateway_engine == 'caddy'
-  vars: *retirement_converge
+    deployment_id: "{{ app_route_retirement.deployment_id }}"
+    org_id: "{{ app_route_retirement.org_id }}"
+    server_id: "{{ app_route_retirement.server_id }}"
+    target_server: "{{ app_route_retirement.target_server }}"
+    target_server_ip: "{{ app_route_retirement.target_server_ip }}"
+    route_state: "{{ app_route_retirement.route_state }}"
+    route_hosts: "{{ app_route_retirement.route_hosts }}"
+    route_port: "{{ app_route_retirement.route_port }}"
+    route_https: "{{ app_route_retirement.route_https }}"
+    redirect_http_to_https: "{{ app_route_retirement.redirect_http_to_https }}"
+    route_middlewares: "{{ app_route_retirement.route_middlewares }}"
+    traefik_backends: "{{ app_route_retirement.traefik_backends }}"
+    expected_route: "{{ app_route_retirement.expected_route }}"
+    simulate: "{{ app_route_retirement.simulate }}"
 
 - name: Verify qualified whole-deployment route absence
   hosts: all
   gather_facts: false
   become: true
-  vars: *retirement_identity
+  vars:
+    <<: *retirement_converge
+    traefik_container_name: traefik
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_key: "deployment-{{ deployment_id }}"
   tasks:
     - name: Reobserve canonical route after retirement
       when: app_route_retirement is defined
-      block: *retirement_observer
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
 
     - name: Require exact typed route absence
       assert:
-        that: route_observation == app_route_retirement.absent
+        that:
+          - route_observation.outcome == 'succeeded'
+          - route_observation.presence == 'absent'
         fail_msg: "Whole-deployment route absence could not be verified"
       when: app_route_retirement is defined
 
@@ -234,264 +177,140 @@
   vars:
     container_name: "{{ app_container_name | default('') }}"
   tasks:
-    - name: Verify opt-in HTTP drain barrier and exact inbound-zero before removal
-      command:
-        argv:
-          - python3
-          - -c
-          - |
-            import datetime, hashlib, json, os, pathlib, re, subprocess, sys, time
-            from urllib.parse import urlsplit
+    - name: Observe and drain only the admitted retiring incarnation
+      when: drain_before_remove is defined
+      block:
+        - name: Validate bounded drain inputs
+          ansible.builtin.assert:
+            that:
+              - drain_before_remove is mapping
+              - drain_before_remove.keys() | difference(['container_id', 'container_port', 'timeout_s']) | length == 0
+              - drain_before_remove.container_id is match('^[0-9a-f]{64}$')
+              - drain_before_remove.container_port is integer
+              - drain_before_remove.container_port >= 1
+              - drain_before_remove.container_port <= 65535
+              - drain_before_remove.timeout_s | default(120) is integer
+              - drain_before_remove.timeout_s | default(120) >= 1
+              - drain_before_remove.timeout_s | default(120) <= 120
+            fail_msg: Routing procedure inputs are invalid. Refresh the review.
+          no_log: true
 
-            packet = json.loads(sys.argv[1])
-            mode = sys.argv[2]
-            root_dir = pathlib.Path(sys.argv[3])
-            contract, previous = packet['contract'], packet['receipt']
-            def digest(value):
-                return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-            def run(*args):
-                return subprocess.check_output(args, text=True).strip()
-            def confirmed_absence(identity):
-                result = subprocess.run(
-                    ['docker', 'inspect', '--type=container', identity],
-                    text=True, capture_output=True,
-                )
-                return (result.returncode == 1 and result.stdout.strip() == '[]'
-                        and result.stderr.strip() in (
-                            'Error: No such object: ' + identity,
-                            'Error response from daemon: No such container: ' + identity,
-                        ))
-            def inspect():
-                items = json.loads(run('docker', 'inspect', '--type=container', contract['container_name']))
-                if len(items) != 1:
-                    raise ValueError('drain_container_unobservable')
-                value = items[0]
-                labels = value['Config']['Labels']
-                required = {
-                    'com.opsctl.managed': 'true', 'com.opsctl.org_id': contract['organization_id'],
-                    'com.opsctl.deployment_id': contract['deployment_id'],
-                    'com.opsctl.app': contract['app_slug'], 'com.opsctl.revision_id': contract['revision_id'],
-                }
-                if any(labels.get(key) != item for key, item in required.items()):
-                    raise ValueError('drain_container_owner_changed')
-                if value['Config']['Image'] != contract['image_ref'] or not value['State']['Running']:
-                    raise ValueError('drain_container_revision_changed')
-                network_mode = value['HostConfig']['NetworkMode']
-                if network_mode == 'host' or network_mode.startswith('container:'):
-                    raise ValueError('drain_shared_namespace_unsupported')
-                return value
-            now = datetime.datetime.now(datetime.timezone.utc)
-            gateway = previous['gateway']
-            if (previous['contract_digest'] != digest(contract)
-                    or previous['digest'] != digest({k: v for k, v in previous.items() if k != 'digest'})
-                    or gateway['route_observation'] != contract['route_observation']):
-                raise ValueError('drain_gateway_authority_changed')
-            if mode == 'remove' and confirmed_absence(contract['container_name']):
-                expected = previous['runtime']
-                chain = 'ocd' + digest({'root_id': contract['root_id'], 'container_id': expected['container_id']})[:20]
-                path = root_dir / (chain + '.json')
-                if (not isinstance(expected['container_id'], str)
-                        or re.fullmatch('[0-9a-f]{64}', expected['container_id']) is None
-                        or root_dir.is_symlink() or not root_dir.is_dir()
-                        or root_dir.stat().st_uid != 0 or root_dir.stat().st_mode & 0o077
-                        or path.is_symlink() or not path.is_file()
-                        or path.stat().st_uid != 0 or path.stat().st_mode & 0o077
-                        or json.loads(path.read_text()) != previous
-                        or expected['barrier_id'] != chain
-                        or type(expected['active_inbound_connections']) is not int
-                        or expected['active_inbound_connections'] != 0
-                        or not confirmed_absence(expected['container_id'])):
-                    raise ValueError('drain_absence_replay_unqualified')
-                sys.exit(0)
-            age = (now - datetime.datetime.fromisoformat(gateway['observed_at'].replace('Z', '+00:00'))).total_seconds()
-            if not 0 <= age <= contract['timeout_s'] + 60:
-                raise ValueError('drain_gateway_authority_stale')
-            runtime = inspect()
-            container_id, pid = runtime['Id'], runtime['State']['Pid']
-            namespace = os.stat('/proc/%s/ns/net' % pid).st_ino
-            if namespace == os.stat('/proc/1/ns/net').st_ino:
-                raise ValueError('drain_host_namespace_unsupported')
-            for other_id in run('docker', 'ps', '-q').splitlines():
-                other = json.loads(run('docker', 'inspect', other_id))[0]
-                if other['Id'] != container_id and os.stat('/proc/%s/ns/net' % other['State']['Pid']).st_ino == namespace:
-                    raise ValueError('drain_namespace_is_shared')
-            endpoint = urlsplit(contract['backend_url'])
-            mappings = runtime['HostConfig']['PortBindings'] or {}
-            ports = []
-            for internal, bindings in mappings.items():
-                for binding in bindings or []:
-                    if int(binding['HostPort']) == endpoint.port and binding['HostIp'] in ('', '0.0.0.0', endpoint.hostname):
-                        if not internal.endswith('/tcp'):
-                            raise ValueError('drain_non_tcp_port')
-                        ports.append(int(internal.split('/')[0]))
-            if len(ports) != 1:
-                raise ValueError('drain_port_binding_ambiguous')
-            port = ports[0]
-            chain = 'ocd' + digest({'root_id': contract['root_id'], 'container_id': container_id})[:20]
-            def firewall(*args):
-                current = inspect()
-                if (current['Id'] != container_id or current['State']['Pid'] != pid
-                        or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
-                    raise ValueError('drain_barrier_namespace_changed')
-                return run('nsenter', '-t', str(pid), '-n', 'iptables', '-w', *args)
-            jump = ('INPUT', '-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', chain)
-            barrier_rule = '-A %s -p tcp -m tcp -j REJECT --reject-with tcp-reset' % chain
-            def check_barrier():
-                if firewall('-S', chain).splitlines() != ['-N ' + chain, barrier_rule]:
-                    raise ValueError('drain_barrier_changed')
-                firewall('-C', *jump)
-            def count():
-                active, listeners = 0, 0
-                for table in ('tcp', 'tcp6'):
-                    for line in pathlib.Path('/proc/%s/net/%s' % (pid, table)).read_text().splitlines()[1:]:
-                        fields = line.split()
-                        if int(fields[1].rsplit(':', 1)[1], 16) != port:
-                            continue
-                        state = fields[3]
-                        if state == '0A':
-                            listeners += 1
-                        elif state not in ('06', '07'):
-                            active += 1
-                if not listeners:
-                    raise ValueError('drain_listener_unobservable')
-                current = inspect()
-                if (current['Id'] != container_id or current['State']['Pid'] != pid
-                        or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
-                    raise ValueError('drain_runtime_changed')
-                return active
-            root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if root_dir.is_symlink() or root_dir.stat().st_uid != 0 or root_dir.stat().st_mode & 0o077:
-                raise ValueError('drain_custody_directory_invalid')
-            path = root_dir / (chain + '.json')
-            if path.is_symlink() or path.with_suffix('.tmp').is_symlink():
-                raise ValueError('drain_custody_path_invalid')
-            if path.exists():
-                if not path.is_file() or path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
-                    raise ValueError('drain_local_custody_invalid')
-                prior = json.loads(path.read_text())
-                expected = prior['runtime']
-                if (prior['contract_digest'] != digest(contract)
-                        or prior['digest'] != digest({k: v for k, v in prior.items() if k != 'digest'})
-                        or prior['gateway']['route_observation'] != gateway['route_observation']
-                        or (expected['container_id'], expected['netns_inode'], expected['listen_port'], expected['barrier_id'])
-                        != (container_id, namespace, port, chain)):
-                    raise ValueError('drain_local_owner_changed')
-            if mode == 'remove':
-                if json.loads(path.read_text()) != previous:
-                    raise ValueError('drain_local_receipt_changed')
-                expected = previous['runtime']
-                if (expected['container_id'], expected['netns_inode'], expected['listen_port'], expected['barrier_id']) != (container_id, namespace, port, chain):
-                    raise ValueError('drain_removal_binding_changed')
-                check_barrier()
-                if count() != 0:
-                    raise ValueError('drain_inbound_connections_not_zero')
-            elif mode == 'observe':
-                intent_path = root_dir / (chain + '.barrier')
-                intent = {
-                    'contract_digest': digest(contract), 'container_id': container_id,
-                    'netns_inode': namespace, 'listen_port': port, 'barrier_id': chain,
-                }
-                def chain_rules():
-                    current = inspect()
-                    if (current['Id'] != container_id or current['State']['Pid'] != pid
-                            or os.stat('/proc/%s/ns/net' % pid).st_ino != namespace):
-                        raise ValueError('drain_barrier_namespace_changed')
-                    result = subprocess.run(
-                        ['nsenter', '-t', str(pid), '-n', 'iptables', '-w', '-S', chain],
-                        text=True, capture_output=True,
-                    )
-                    if result.returncode == 0:
-                        return result.stdout.strip().splitlines()
-                    if result.returncode == 1 and 'No chain/target/match by that name' in result.stderr:
-                        return None
-                    raise ValueError('drain_barrier_unobservable')
-                initial_rules = chain_rules()
-                if intent_path.exists() or intent_path.is_symlink():
-                    if (intent_path.is_symlink() or not intent_path.is_file()
-                            or intent_path.stat().st_uid != 0 or intent_path.stat().st_mode & 0o077
-                            or json.loads(intent_path.read_text()) != intent):
-                        raise ValueError('drain_barrier_custody_changed')
-                else:
-                    if initial_rules is not None:
-                        raise ValueError('drain_foreign_barrier')
-                    descriptor = os.open(str(intent_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(descriptor, 'w') as stream:
-                        json.dump(intent, stream, sort_keys=True, separators=(',', ':'))
-                jump_rule = '-A ' + ' '.join(jump)
-                def owned_partial():
-                    if json.loads(intent_path.read_text()) != intent:
-                        raise ValueError('drain_barrier_custody_changed')
-                    rules = chain_rules()
-                    if rules not in (None, ['-N ' + chain], ['-N ' + chain, barrier_rule]):
-                        raise ValueError('drain_barrier_changed')
-                    references = [line for line in firewall('-S').splitlines() if '-j ' + chain in line]
-                    if references not in ([], [jump_rule]):
-                        raise ValueError('drain_barrier_references_changed')
-                    return rules, references
-                try:
-                    rules, references = owned_partial()
-                    if rules is None:
-                        firewall('-N', chain)
-                        rules = ['-N ' + chain]
-                    if rules == ['-N ' + chain]:
-                        firewall('-A', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
-                    if not references:
-                        firewall('-I', *jump)
-                    deadline = time.monotonic() + contract['timeout_s']
-                    while True:
-                        check_barrier()
-                        if count() == 0:
-                            break
-                        if time.monotonic() >= deadline:
-                            raise ValueError('drain_active_inbound_timeout')
-                        time.sleep(0.25)
-                    observed = {
-                        'container_id': container_id, 'netns_inode': namespace, 'listen_port': port,
-                        'active_inbound_connections': 0, 'barrier_id': chain,
-                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    }
-                    receipt = {'version': 1, 'contract_digest': digest(contract), 'gateway': gateway, 'runtime': observed}
-                    receipt['digest'] = digest(receipt)
-                    encoded = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
-                    temporary = path.with_suffix('.tmp')
-                    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(descriptor, 'w') as stream:
-                        stream.write(encoded)
-                    os.replace(temporary, path)
-                    print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain': receipt}, separators=(',', ':')))
-                except Exception:
-                    rules, references = owned_partial()
-                    if references:
-                        firewall('-D', *jump)
-                    if rules == ['-N ' + chain, barrier_rule]:
-                        firewall('-D', chain, '-p', 'tcp', '-m', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset')
-                    if rules is not None:
-                        firewall('-X', chain)
-                    raise
-            else:
-                raise ValueError('drain_mode_invalid')
-          - "{{ app_connection_drain | to_json }}"
-          - "{{ app_connection_drain_mode | default('remove') }}"
-          - "{{ opsctl_drain_receipt_dir | default('/var/lib/opsctl/connection-drains') }}"
-      register: connection_drain_check
-      when: app_connection_drain is defined
+        - name: Inspect recorded full runtime identity without adoption
+          community.docker.docker_container_info:
+            name: "{{ drain_before_remove.container_id }}"
+          register: drain_container_info
+          no_log: true
 
-    - name: Return registered connection drain observation
-      debug:
-        msg: "{{ connection_drain_check.stdout }}"
-      when: app_connection_drain is defined and app_connection_drain_mode | default('remove') == 'observe'
+        - name: Require matching isolated running incarnation or exact absence
+          ansible.builtin.assert:
+            that:
+              - container_absent == (not drain_container_info.exists)
+              - container_absent or drain_container_info.container.Id == container_payload.Id
+              - container_absent or drain_container_info.container.State.Running
+              - container_absent or drain_container_info.container.State.Pid > 0
+              - container_absent or drain_container_info.container.HostConfig.NetworkMode != 'host'
+              - container_absent or not drain_container_info.container.HostConfig.NetworkMode.startswith('container:')
+            fail_msg: Runtime connections could not be observed. Runtime removal was not performed.
+          no_log: true
 
-    - name: End observation-only drain without container removal
-      meta: end_play
-      when: app_connection_drain is defined and app_connection_drain_mode | default('remove') == 'observe'
+        - name: Capture admitted finite grace deadline
+          ansible.builtin.command:
+            argv:
+              - date
+              - --utc
+              - "--date=+{{ drain_before_remove.timeout_s | default(120) }} seconds"
+              - '+%Y-%m-%dT%H:%M:%S.000000Z'
+          register: drain_deadline
+          changed_when: false
+          when: not container_absent
 
-    - name: Require drain receipt to match originally inspected immutable container
-      assert:
-        that:
-          - not container_absent
-          - container_payload.Id == app_connection_drain.receipt.runtime.container_id
-        fail_msg: "Connection drain inspected container identity changed"
-      when: app_connection_drain is defined and not container_absent
+        - name: Poll read-only connections until clear or grace expiry
+          ansible.builtin.script:
+            cmd: >-
+              {{ playbook_dir }}/../scripts/container_connection_drain.py
+              --pid {{ drain_container_info.container.State.Pid }}
+              --container-id {{ drain_before_remove.container_id }}
+              --port {{ drain_before_remove.container_port }}
+            executable: python3
+          register: drain_sample
+          changed_when: false
+          until: >-
+            drain_sample.rc != 0 or
+            (drain_sample.stdout | from_json).active_inbound_connections == 0 or
+            (drain_sample.stdout | from_json).observed_at >= drain_deadline.stdout
+          retries: "{{ (drain_before_remove.timeout_s | default(120)) + 1 }}"
+          delay: 1
+          when: not container_absent
+          no_log: true
+
+        - name: Require observable count without treating elapsed time as absence
+          ansible.builtin.assert:
+            that:
+              - drain_sample.rc == 0
+              - (drain_sample.stdout | from_json).container_id == drain_before_remove.container_id
+              - (drain_sample.stdout | from_json).active_inbound_connections is integer
+              - (drain_sample.stdout | from_json).active_inbound_connections >= 0
+            fail_msg: Runtime connections could not be observed. Runtime removal was not performed.
+          when: not container_absent
+          no_log: true
+
+        - name: Recheck incarnation immediately before normal removal
+          community.docker.docker_container_info:
+            name: "{{ drain_before_remove.container_id }}"
+          register: drain_recheck
+          when: not container_absent
+          no_log: true
+
+        - name: Refuse changed incarnation before stopping
+          ansible.builtin.assert:
+            that:
+              - drain_recheck.exists
+              - drain_recheck.container.Id == drain_container_info.container.Id
+              - drain_recheck.container.State.Pid == drain_container_info.container.State.Pid
+              - drain_recheck.container.State.StartedAt == drain_container_info.container.State.StartedAt
+              - drain_recheck.container.Image == drain_container_info.container.Image
+              - drain_recheck.container.State.Running
+            fail_msg: Runtime connections could not be observed. Runtime removal was not performed.
+          when: not container_absent
+          no_log: true
+
+        - name: Timestamp confirmed prior absence without inventing a count
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+          register: drain_absent_time
+          changed_when: false
+          when: container_absent
+
+        - name: Retain last observed runtime drain facts
+          ansible.builtin.set_fact:
+            removal_drain_facts:
+              outcome: succeeded
+              observed_at: "{{ drain_absent_time.stdout if container_absent else (drain_sample.stdout | from_json).observed_at }}"
+              phase: runtime
+              state: "{{ 'unknown' if container_absent else ('clear' if (drain_sample.stdout | from_json).active_inbound_connections == 0 else 'timed_out') }}"
+              remaining_backends: null
+              container_id: "{{ drain_before_remove.container_id }}"
+              active_inbound_connections: "{{ none if container_absent else (drain_sample.stdout | from_json).active_inbound_connections }}"
+          no_log: true
+      rescue:
+        - name: Timestamp unavailable runtime observation
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+          register: drain_failure_time
+          changed_when: false
+
+        - name: Publish bounded refusal without native error details
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'connection_drain': {
+                'outcome': 'incomplete', 'observed_at': drain_failure_time.stdout,
+                'phase': 'runtime', 'state': 'unknown', 'remaining_backends': none,
+                'container_id': none, 'active_inbound_connections': none},
+                'procedure_error': {'phase': 'drain', 'code': 'drain_unobservable'}} | to_json }}
+
+        - name: Refuse unobservable drain without removal
+          ansible.builtin.fail:
+            msg: Runtime connections could not be observed. Runtime removal was not performed.
 
     - name: Remove inspected immutable container identity
       community.docker.docker_container:
@@ -502,20 +321,6 @@
       register: container_remove
       when: container_inspect.rc == 0
       no_log: true
-
-    - name: Record exact whole-final route retirement evidence
-      set_fact:
-        removal_route_receipt: >-
-            {{ {'version': 1, 'identity': {
-              'organization_id': app_route_retirement.topology.organization_id,
-              'deployment_id': app_route_retirement.topology.deployment_id,
-              'server_id': app_route_retirement.topology.server_id,
-              'gateway_id': app_route_retirement.topology.gateway_id,
-              'node_id': app_route_retirement.topology.node_id,
-              'revision_id': app_route_retirement.topology.revision_id,
-              'identity_digest': app_route_retirement.topology.identity_digest
-            }, 'observation': retirement_after} }}
-      when: app_route_retirement is defined
 
     - name: Verify inspected container identity is absent
       command:
@@ -551,31 +356,11 @@
         executable: /bin/sh
       when: container_inspect.rc == 0
 
-    - name: Record exact drain-bound verified removal
-      command:
-        argv:
-          - python3
-          - -c
-          - |
-            import json, sys
-            receipt = json.loads(sys.argv[1])
-            value = {
-                'contract_digest': receipt['contract_digest'],
-                'container_id': receipt['runtime']['container_id'], 'absent': True,
-            }
-            print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain_removal': value}, separators=(',', ':')))
-          - "{{ app_connection_drain.receipt | to_json }}"
-      register: drain_removal_output
-      changed_when: false
-      when: app_connection_drain is defined
-      no_log: true
-
     - name: Assemble complete verified removal output
       ansible.builtin.set_fact:
         verified_removal_output: >-
-          {{ ({'route_retirement': removal_route_receipt} if app_route_retirement is defined else {}) |
-            combine((drain_removal_output.stdout | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json)
-              if app_connection_drain is defined else {}) }}
+          {{ ({'deployment_route_observation': retirement_after} if app_route_retirement is defined else {}) |
+            combine({'connection_drain': removal_drain_facts} if drain_before_remove is defined else {}) }}
       no_log: true
 
     - name: Observe retained native resources and exact predecessor absence
@@ -593,7 +378,7 @@
 
     - name: Bound complete removal output
       ansible.builtin.assert:
-        that: verified_removal_output | to_json | length <= 262144
+        that: verified_removal_output | to_json | length <= (131072 if (drain_before_remove is defined or app_route_retirement is defined) else 262144)
         fail_msg: Native removal observation exceeds the supported output limit.
       no_log: true
 

@@ -8,11 +8,11 @@
     wireguard_requested_state: "{{ wireguard_state | default('present') }}"
     wireguard_requested_listen_port: "{{ wireguard_listen_port | default(51820) }}"
     short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
-    wireguard_interface_name: "wg-{{ short_deployment_id }}"
+    wireguard_interface_name: "{{ gateway_interface | default('wg-' ~ short_deployment_id) }}"
     wireguard_private_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.key"
     wireguard_public_key_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.pub"
     wireguard_config_path: "{{ wireguard_base_dir }}/{{ wireguard_interface_name }}.conf"
-    wireguard_service_name: "wg-quick@{{ wireguard_interface_name }}"
+    wireguard_service_name: "{{ gateway_service.name if gateway_service is defined else ('wg-quick@' ~ wireguard_interface_name ~ '.service') }}"
     wireguard_requested_peers: "{{ wireguard_peers | default([]) }}"
   pre_tasks:
     - name: Skip WireGuard ensure when running in simulate mode
@@ -26,6 +26,17 @@
           - (expected_public_key is defined) == (expected_wireguard_ip is defined)
           - expected_public_key is not defined or wireguard_requested_state == 'absent'
           - require_absent is not defined or wireguard_requested_state == 'present'
+          - wireguard_requested_state != 'absent' or gateway_interface is defined
+          - wireguard_requested_state != 'absent' or gateway_service is defined
+          - gateway_service is not defined or gateway_service.manager == 'systemd'
+          - wireguard_interface_name is string
+          - wireguard_interface_name | length > 0
+          - wireguard_interface_name | length <= 15
+          - wireguard_interface_name is match('^[A-Za-z0-9_.-]+$')
+          - wireguard_service_name is string
+          - wireguard_service_name | length > 0
+          - wireguard_service_name | length <= 255
+          - wireguard_service_name is match('^[A-Za-z0-9_.@-]+$')
         fail_msg: "WireGuard ownership guard is invalid"
 
     - name: Inspect fresh WireGuard interface before mutation
@@ -46,7 +57,7 @@
       when: require_absent | default(false)
 
     - name: Inspect fresh WireGuard service before mutation
-      command: "systemctl is-active {{ wireguard_service_name }}.service"
+      command: "systemctl is-active {{ wireguard_service_name }}"
       register: fresh_wireguard_service
       changed_when: false
       failed_when: false
@@ -146,9 +157,25 @@
                 fail_msg: "Owned WireGuard interface remains after cleanup"
               when: expected_public_key is defined
 
+            - name: Observe exact recorded WireGuard service after cleanup
+              ansible.builtin.systemd_service:
+                name: "{{ wireguard_service_name }}"
+              register: removed_wireguard_service
+              changed_when: false
+              failed_when: false
+              when: expected_public_key is defined
+
+            - name: Require observed inactive service before releasing references
+              assert:
+                that:
+                  - removed_wireguard_service.status is defined
+                  - removed_wireguard_service.status.ActiveState | default('unknown') == 'inactive'
+                fail_msg: "Owned WireGuard service absence is unknown"
+              when: expected_public_key is defined
+
             - name: Emit owned WireGuard cleanup evidence
               debug:
-                msg: "TEMPLATE_OUTPUT_JSON={{ {'wireguard_absent': true, 'wireguard_ip': expected_wireguard_ip, 'wireguard_public_key': expected_public_key} | to_json }}"
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'wireguard_absent': true, 'wireguard_ip': expected_wireguard_ip, 'wireguard_public_key': expected_public_key, 'wireguard_interface': wireguard_interface_name, 'wireguard_service': {'manager': 'systemd', 'name': wireguard_service_name, 'state': removed_wireguard_service.status.ActiveState}} | to_json }}"
               when: expected_public_key is defined
 
             - name: OPERATION_STEP wireguard:complete absent
@@ -177,7 +204,7 @@
 
         - name: Capture exact WireGuard systemd unit state
           ansible.builtin.systemd_service:
-            name: "{{ wireguard_service_name }}.service"
+            name: "{{ wireguard_service_name }}"
           register: wireguard_service_query
           changed_when: false
           failed_when: false
@@ -425,6 +452,11 @@
             wireguard_output_payload:
               wireguard_public_key: "{{ wireguard_candidate_public_key.stdout | trim }}"
               wireguard_ip: "{{ wireguard_ip }}"
+              wireguard_interface: "{{ wireguard_interface_name }}"
+              wireguard_service:
+                manager: systemd
+                name: "{{ wireguard_service_name }}"
+                state: "{{ 'active' if wireguard_service_status.status.ActiveState == 'active' else 'inactive' }}"
 
         - name: OPERATION_STEP wireguard:ready
           shell: |

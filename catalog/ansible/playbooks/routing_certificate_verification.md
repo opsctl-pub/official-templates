@@ -216,3 +216,79 @@ actual custom selection and all-host matched/trusted facts; automatic retirement
 is not inferred. Unreachable hosts report served=unreachable with null trust/leaf
 and failed outcome, retaining available selected material. Native CSR success
 means only public CSR/key identity, never serving readiness.
+
+## Routes And Temporary Canaries
+
+Common inputs identify the Deployment, organization and target Server through
+the existing inventory. Ports are strict integers 1..65535; normalized hosts are
+sorted/unique (maximum 100), private/loopback endpoints unique (maximum 64).
+Middleware references are opaque strings (maximum 255 characters, 50 entries).
+`simulate=true` changes nothing and supplies no consumed success.
+
+`traefik_route_observe` needs only its subject and optional recorded WireGuard
+references. `traefik_route_converge` adds explicit `route_state=present|absent`,
+`route_hosts`, `route_port`, `route_https`, `redirect_http_to_https`,
+`route_middlewares` (default `[]`), `traefik_backends=[{url}]` and `expected_route`.
+Present requires hosts/backends; absent requires empty lists; redirect requires
+HTTPS. The expected snapshot has exactly `presence`, `hosts`, `route_port`,
+`https`, `redirect_http_to_https`, `middlewares`, `backends`, `router_name`.
+Absence has empty lists and null scalar fields. Unknown never authorizes a write.
+
+Return `deployment_route_observation` with those fields plus `outcome` and
+`observed_at`. Compare the complete snapshot immediately before writing; stage,
+validate and atomically activate only this subject, then reobserve. On failure,
+restore its prior file where possible and report actual restored/unknown facts.
+Paths and native layout belong to the public procedure, not the backend input.
+The official defaults are gateway container `traefik` and watched directory
+`/etc/traefik/dynamic/opsctl`; overrides may use their own layout.
+
+`traefik_backend_canary` adds `action=observe|converge_present|converge_absent`,
+`promotion_id`, `gateway_id`, `target_node_id`, `target_revision_id`, one admitted
+temporary `route_hosts` entry, `canary_router` naming intent, `route_port` and
+one approved `traefik_backends` entry. Mutations require `expected_canary` with
+exactly `presence`, `host`, `router_name`, `backends`; observe has no expectation.
+Return `promotion_canary_observation` with that snapshot plus outcome/time.
+Absent/unknown uses null host/router and empty backends. Keep the temporary
+router private-only. Never recompute a backend naming digest in an override.
+The full observed provider reference is opaque; neither configured presence nor
+successful publication establishes active serving (see Verification).
+
+## WireGuard References
+
+Ensure returns actual `wireguard_interface` and `wireguard_service` alongside
+the existing IP/key. Route/bootstrap observation returns
+`gateway_bootstrap_observation={interface,ipv4,public_key,service,route_backend_urls,observed_at}`;
+service is `{manager,name,state:active|inactive|unknown}`. Interface/name/manager
+limits are 15/255/32 characters. Subsequent observation/cleanup receives recorded
+`gateway_interface`/`gateway_service`; never reconstruct Deployment-prefix names.
+Missing references are unknown. Observe address/key/backends and active state;
+absence must be consumed before removing the recorded gateway entry.
+
+## Drain And Image Removal
+
+Gateway `lb_backend_drain_detach` takes `phase=gateway`, `retiring_backend`,
+nonempty `remaining_backends`, `expected_route` and the route subject. Observe
+the already-switched route and exact exclusion; no sleep-as-drained result.
+Ordinary detach first converges its approved remaining route, then observes it.
+
+Only after consumed exclusion, the normal `container_remove` child takes optional
+`drain_before_remove={container_id,container_port,timeout_s}` with exact full ID,
+strict port and timeout default 120s, allowed 1..120. Preserve ordinary image
+removal/resource retention inputs documented in `container_remove.md`.
+Ansible polls read-only counts, rechecks the incarnation, then performs normal
+Docker stop/remove with separate stop_timeout 10s. The count helper only reads;
+it never waits, changes namespaces/firewalls, or removes a container.
+Unknown identity/count refuses removal. Already observed absent is idempotent
+without inventing a count. At grace expiry, a known positive count permits normal
+termination and is reported honestly as the last pre-stop observation.
+
+Return `connection_drain` with outcome/time, `phase=gateway|runtime`,
+`state=clear|timed_out|unknown|failed`, nullable `remaining_backends`, full
+`container_id` and `active_inbound_connections`. Gateway clear has nonempty
+remaining backends and null runtime fields; runtime clear has exact ID/count 0;
+timed_out has known positive count; unknown count is null. Final removal also
+requires complete `image_runtime` absence in the SAME named-output object,
+including empty unmanaged resource lists. Counts are last observed, not live or
+an exact tally of disconnected clients. No barrier/netns/digest receipt is input
+or output. Emit available facts plus closed `procedure_error` on refusal; missing
+facts, unknown state and exit zero alone never authorize lifecycle advancement.

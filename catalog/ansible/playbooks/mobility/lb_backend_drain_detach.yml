@@ -1,153 +1,100 @@
 ---
-- name: Drain and detach deployment backends through managed Traefik
+- name: Validate approved gateway exclusion inputs
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Skip gateway exclusion in simulation
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+
+    - name: Require exact nonempty serving counterpart and captured route
+      ansible.builtin.assert:
+        that:
+          - phase is not defined or phase == 'gateway'
+          - retiring_backend is string
+          - remaining_backends is sequence
+          - remaining_backends is not string
+          - remaining_backends | length > 0
+          - remaining_backends | length <= 64
+          - remaining_backends | unique | list | length == remaining_backends | length
+          - retiring_backend not in remaining_backends
+          - expected_route is mapping
+          - expected_route.presence == 'present'
+        fail_msg: Routing procedure inputs are invalid. Refresh the review.
+      no_log: true
+
+- import_playbook: ../traefik_route_converge.yml
+  when: phase is not defined and not (simulate | default(false))
+  vars:
+    route_state: present
+    traefik_backends: >-
+      {% set backends = [] %}
+      {% for url in remaining_backends %}
+      {% set _ = backends.append({'url': url}) %}
+      {% endfor %}
+      {{ backends }}
+
+- name: Observe actual gateway exclusion without claiming runtime drain
   hosts: all
   gather_facts: false
   become: true
   vars:
-    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    traefik_container_name: traefik
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
-    route_template_path: "{{ playbook_dir }}/../../templates/traefik_deployment_route.yml.j2"
-    timeout_s: "{{ timeout_s | default(60) | int }}"
-    traefik_backends: "{{ traefik_backends | default([]) }}"
-    effective_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
-  pre_tasks:
-    - name: Skip drain/detach when running in simulate mode
-      meta: end_play
+    route_key: "deployment-{{ deployment_id }}"
+  tasks:
+    - name: Skip gateway observation in simulation
+      ansible.builtin.meta: end_play
       when: simulate | default(false)
 
-  tasks:
-    - name: Observe strict opt-in switched gateway route authority
-      when: connection_drain is defined and connection_drain.phase == 'gateway'
-      vars:
-        org_id: "{{ connection_drain.contract.organization_id }}"
-        deployment_id: "{{ connection_drain.contract.deployment_id }}"
-        traefik_container_name: traefik
-        route_key: "deployment-{{ connection_drain.contract.deployment_id }}"
-        expected_route_observation: "{{ connection_drain.contract.route_observation }}"
+    - name: Qualify exact observed route and backend exclusion
       block:
-        - name: Initialize exact remaining backend observation inputs
-          set_fact:
-            drain_remaining_backends: []
+        - name: Read actual configured native route
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/traefik_route_observation.yml"
 
-        - name: Bind each immutable remaining backend URL
-          set_fact:
-            drain_remaining_backends: "{{ drain_remaining_backends + [{'url': item}] }}"
-          loop: "{{ connection_drain.contract.remaining_backends }}"
-
-        - name: Read authoritative gateway route excluding retiring backend
-          include_tasks: "{{ playbook_dir }}/../../tasks/traefik_route_observation.yml"
-          vars:
-            traefik_backends: "{{ drain_remaining_backends }}"
-
-        - name: Require exact switched route and backend exclusion
-          assert:
+        - name: Require live configured serving counterparts and exclusion
+          ansible.builtin.assert:
             that:
-              - route_observation == connection_drain.contract.route_observation
-              - observed_backend_urls | sort == connection_drain.contract.remaining_backends
-              - connection_drain.contract.backend_url not in observed_backend_urls
-              - connection_drain.contract.gateway_server_id == server_id
-            fail_msg: "Connection drain gateway request-admission authority changed"
+              - route_observation.outcome == 'succeeded'
+              - route_observation.presence == 'present'
+              - route_observation.backends | sort == remaining_backends | sort
+              - retiring_backend not in route_observation.backends
+              - phase is not defined or route_observation_base == expected_route
+              - phase is defined or route_observation.hosts == (route_hosts | sort)
+              - phase is defined or route_observation.route_port == route_port
+              - phase is defined or route_observation.https == route_https
+              - phase is defined or route_observation.redirect_http_to_https == redirect_http_to_https
+              - phase is defined or route_observation.middlewares == (route_middlewares | default([]))
+            fail_msg: Server configuration changed. Refresh its observation before retrying.
+          no_log: true
 
-        - name: Emit closed gateway-only receipt without asserting app drain
-          command:
-            argv:
-              - python3
-              - -c
-              - |
-                import datetime, hashlib, json, sys
-                def digest(value):
-                    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-                contract, route = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-                value = {
-                    'version': 1, 'contract_digest': digest(contract), 'runtime': None,
-                    'gateway': {
-                        'container_id': sys.argv[3], 'route_observation': route,
-                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    },
-                }
-                value['digest'] = digest(value)
-                print('TEMPLATE_OUTPUT_JSON=' + json.dumps({'connection_drain': value}, separators=(',', ':')))
-              - "{{ connection_drain.contract | to_json }}"
-              - "{{ route_observation | to_json }}"
-              - "{{ existing_traefik.Id }}"
-          register: gateway_drain_receipt
+        - name: Return plain configured exclusion and complete native route facts
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {
+                'deployment_route_observation': route_observation,
+                'connection_drain': {'outcome': 'succeeded',
+                  'observed_at': route_observation.observed_at, 'phase': 'gateway',
+                  'state': 'clear', 'remaining_backends': route_observation.backends,
+                  'container_id': none, 'active_inbound_connections': none}} | to_json }}
+      rescue:
+        - name: Timestamp unknown gateway exclusion
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+          register: gateway_failure_time
           changed_when: false
 
-        - name: Return registered gateway route receipt
-          debug:
-            msg: "{{ gateway_drain_receipt.stdout }}"
+        - name: Report unknown exclusion without native diagnostic leakage
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'connection_drain': {
+                'outcome': 'incomplete', 'observed_at': gateway_failure_time.stdout,
+                'phase': 'gateway', 'state': 'unknown', 'remaining_backends': none,
+                'container_id': none, 'active_inbound_connections': none},
+                'procedure_error': {'phase': 'observe', 'code': 'route_observation_incomplete'}} | to_json }}
 
-    - name: End strict gateway phase before legacy route write or sleep
-      meta: end_play
-      when: connection_drain is defined
-
-    - name: Drain and detach deployment backends
-      block:
-        - name: OPERATION_STEP drain_detach:start
-          shell: |
-            printf 'OPERATION_STEP={"name":"drain_detach:start","status":"running","metadata":{"display_name":"Drain load balancer backends","deployment_id":"%s","backend_count":%s,"timeout_s":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}" "{{ timeout_s }}"
-          args:
-            executable: /bin/sh
-
-        - name: Validate drain/detach inputs
-          assert:
-            that:
-              - deployment_id is defined
-              - (deployment_id | string | length) > 0
-              - timeout_s >= 1
-              - (traefik_backends | length) > 0
-            fail_msg: "deployment_id, timeout_s, and at least one remaining backend are required for drain/detach"
-
-        - name: Ensure Traefik dynamic directory exists
-          file:
-            path: "{{ traefik_dynamic_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0755"
-
-        - name: Render route file with remaining backends
-          template:
-            src: "{{ route_template_path }}"
-            dest: "{{ route_file_path }}"
-            owner: root
-            group: root
-            mode: "0644"
-
-        - name: Wait for drain timeout
-          pause:
-            seconds: "{{ timeout_s }}"
-
-        - name: OPERATION_STEP drain_detach:drained
-          shell: |
-            printf 'OPERATION_STEP={"name":"drain_detach:drained","status":"completed","metadata":{"display_name":"Drain timeout complete","deployment_id":"%s","backend_count":%s,"timeout_s":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}" "{{ timeout_s }}"
-          args:
-            executable: /bin/sh
-
-        - name: OPERATION_STEP drain_detach:complete
-          shell: |
-            printf 'OPERATION_STEP={"name":"drain_detach:complete","status":"completed","metadata":{"display_name":"Backends detached","deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
-          args:
-            executable: /bin/sh
-      rescue:
-        - name: OPERATION_STEP drain_detach:failure
-          shell: |
-            printf 'OPERATION_STEP={"name":"drain_detach:failure","status":"failed","metadata":{"display_name":"Backend detach failed","deployment_id":"%s"}}\n' "{{ deployment_id }}"
-          args:
-            executable: /bin/sh
-
-        - name: Fail drain/detach operation
-          fail:
-            msg: "Traefik backend drain/detach failed"
-
-- import_playbook: ../container_remove.yml
-  when: connection_drain is defined and connection_drain.phase == 'runtime'
-  vars:
-    app_connection_drain: "{{ {'contract': connection_drain.contract, 'receipt': connection_drain.receipt} }}"
-    app_connection_drain_mode: observe
-    app_container_name: "{{ connection_drain.contract.container_name }}"
-    app_managed: true
-    app_org_id: "{{ connection_drain.contract.organization_id }}"
-    app_deployment_id: "{{ connection_drain.contract.deployment_id }}"
-    app_slug: "{{ connection_drain.contract.app_slug }}"
-    app_expected_image_ref: "{{ connection_drain.contract.image_ref }}"
+        - name: Refuse unqualified gateway exclusion
+          ansible.builtin.fail:
+            msg: Route state could not be observed. Resolve connectivity or native configuration.

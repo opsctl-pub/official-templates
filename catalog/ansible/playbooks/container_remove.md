@@ -26,9 +26,25 @@ Omitting the predecessor variable retains the ordinary label-qualified removal
 path. New managed attachment callers supply it explicitly. Observations include
 stopped users; read-only mounts remain users, not permission to delete data.
 
-The separate existing route-retirement and promotion-drain inputs remain owned
-by their routing procedures. Their output keys are preserved separately from
-`image_runtime`; image resource observation is not route or connection evidence.
+Whole-image retirement supplies `app_route_retirement`, containing only the
+public `RouteConvergeInput` documented in [routing procedures](routing_certificate_verification.md),
+with `route_state=absent` and the full consumed `expected_route` snapshot.
+This same child checks the snapshot, withdraws the route and reobserves absence
+before removing the image. Already-observed absence is idempotent; unknown or
+changed present routes refuse removal. Caddy retirement is unsupported here.
+Sibling `deployment_route_observation` and `image_runtime` are native facts,
+not versioned topology/digest receipts or identity echoes. Internal topology and
+child/source authority never enter the public carrier.
+
+Promotion removal supplies `drain_before_remove={container_id,container_port,
+timeout_s}` only after qualified gateway exclusion. The full ID is required;
+timeout defaults to 120 seconds, allowed 1..120. This SAME child polls read-only
+counts, rechecks the incarnation, then performs normal ten-second stop/removal.
+Unknown counts refuse removal; a positive count at grace expiry is reported as
+`timed_out` before normal termination. Already absent has no invented count.
+Sibling `connection_drain` records last-observed count/time/outcome, not a live
+count or exact disconnected-client tally. Combined E/image output is bounded
+to 128 KiB. No gateway receipt, firewall barrier or namespace mutation is input.
 
 ## Procedure And Retention
 

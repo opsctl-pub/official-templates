@@ -6,11 +6,8 @@
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     canary_file_path: "{{ traefik_dynamic_dir }}/promotion-canary-{{ promotion_id }}.yml"
     canary_backend_url: "{{ traefik_backends[0].url }}"
-    canary_identity_seed: "{{ org_id }}:{{ deployment_id }}:{{ promotion_id }}:{{ gateway_id }}:{{ target_node_id }}:{{ target_revision_id }}:{{ route_port }}:{{ canary_backend_url }}"
-    canary_identity_digest: "{{ canary_identity_seed | hash('sha256') }}"
-    canary_host: "opsctl-canary-{{ canary_identity_digest[:24] }}.invalid"
-    canary_router: "opsctl-canary-{{ canary_identity_digest[:24] }}"
-    canary_service: "opsctl-canary-{{ canary_identity_digest[:24] }}"
+    canary_host: "{{ route_hosts[0] }}"
+    canary_service: "{{ canary_router }}"
   pre_tasks:
     - name: Validate canary identity before mutation
       ansible.builtin.assert:
@@ -24,21 +21,22 @@
           - org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
           - gateway_id is string
           - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - gateway_server_id is string
-          - gateway_server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
           - target_node_id is string
           - target_node_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
           - target_revision_id is string
           - target_revision_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - overlay_cidr is string
-          - overlay_cidr is match('^[0-9a-fA-F:.]+/[0-9]{1,3}$')
           - route_port is integer
           - route_port > 0
           - route_port <= 65535
           - route_hosts is sequence
           - route_hosts is not string
           - route_hosts | length == 1
-          - route_hosts[0] == canary_host
+          - canary_host is string
+          - canary_host is match('^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$')
+          - canary_router is string
+          - canary_router | length > 0
+          - canary_router | length <= 123
+          - canary_router is match('^[a-zA-Z0-9_-]+$')
           - traefik_backends is sequence
           - traefik_backends is not string
           - traefik_backends | length == 1
@@ -47,9 +45,7 @@
           - canary_backend_url is string
           - canary_backend_url is match('^http://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$')
           - canary_backend_url is not search('[?#]')
-          - gateway_wireguard_ip is string
-          - gateway_wireguard_ip is match('^(?:10\.)[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
-          - (action == 'observe' and (expected_observation is not defined or expected_observation is none)) or (action != 'observe' and expected_observation is mapping)
+          - (action == 'observe' and expected_canary is not defined) or (action != 'observe' and expected_canary is mapping)
         fail_msg: "Stable-ingress canary identity is invalid"
 
     - name: Read exact canary file before mutation
@@ -118,30 +114,32 @@
 
     - name: Normalize pre-convergence canary observation
       ansible.builtin.set_fact:
-        promotion_canary_observation:
+        canary_snapshot:
           presence: "{{ 'present' if prior_canary_exists else 'absent' }}"
-          identity_digest: "{{ canary_identity_digest }}"
-          backend_count: "{{ 1 if prior_canary_exists else 0 }}"
-          backend_digest: "{{ (('[' ~ (canary_backend_url | to_json) ~ ']') | hash('sha256')) if prior_canary_exists else ('[]' | hash('sha256')) }}"
-      no_log: true
-
-    - name: Add pre-convergence observation digest
-      ansible.builtin.set_fact:
-        promotion_canary_observation: "{{ promotion_canary_observation | combine({'digest': (promotion_canary_observation | dict2items | sort(attribute='key') | items2dict | to_json(separators=(',', ':')) | hash('sha256'))}) }}"
+          host: "{{ canary_host if prior_canary_exists else none }}"
+          router_name: "{{ (existing_canary_config.http.routers.keys() | list | first) ~ '@file' if prior_canary_exists else none }}"
+          backends: "{{ [existing_canary_config.http.services[canary_service].loadBalancer.servers[0].url] if prior_canary_exists else [] }}"
       no_log: true
 
     - name: Validate expected canary observation before mutation
       ansible.builtin.assert:
         that:
-          - promotion_canary_observation == expected_observation
+          - expected_canary.keys() | sort == ['backends', 'host', 'presence', 'router_name']
+          - canary_snapshot == expected_canary
         fail_msg: "Stable-ingress canary compare-and-set failed"
       when: action != 'observe'
       no_log: true
 
+    - name: Timestamp configured canary observation
+      ansible.builtin.command:
+        argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+      register: canary_observed_time
+      changed_when: false
+
     - name: Emit observation-only canary result
       ansible.builtin.debug:
         msg: >-
-          TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': promotion_canary_observation} | to_json }}
+          TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': canary_snapshot | combine({'outcome': 'succeeded', 'observed_at': canary_observed_time.stdout})} | to_json }}
       when: action == 'observe'
 
     - name: Stop after observation
@@ -265,20 +263,21 @@
           ansible.builtin.set_fact:
             final_canary_observation:
               presence: "{{ 'present' if final_canary_file.stat.exists else 'absent' }}"
-              identity_digest: "{{ canary_identity_digest }}"
-              backend_count: "{{ 1 if final_canary_file.stat.exists else 0 }}"
-              backend_digest: "{{ (('[' ~ (canary_backend_url | to_json) ~ ']') | hash('sha256')) if final_canary_file.stat.exists else ('[]' | hash('sha256')) }}"
+              host: "{{ canary_host if final_canary_file.stat.exists else none }}"
+              router_name: "{{ (final_canary_config.http.routers.keys() | list | first) ~ '@file' if final_canary_file.stat.exists else none }}"
+              backends: "{{ [final_canary_config.http.services[canary_service].loadBalancer.servers[0].url] if final_canary_file.stat.exists else [] }}"
           no_log: true
 
-        - name: Add final canary observation digest
-          ansible.builtin.set_fact:
-            final_canary_observation: "{{ final_canary_observation | combine({'digest': (final_canary_observation | dict2items | sort(attribute='key') | items2dict | to_json(separators=(',', ':')) | hash('sha256'))}) }}"
-          no_log: true
+        - name: Timestamp final configured canary observation
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+          register: final_canary_time
+          changed_when: false
 
         - name: Emit canary observation
           ansible.builtin.debug:
             msg: >-
-              TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': final_canary_observation} | to_json }}
+              TEMPLATE_OUTPUT_JSON={{ {'promotion_canary_observation': final_canary_observation | combine({'outcome': 'succeeded', 'observed_at': final_canary_time.stdout})} | to_json }}
 
         - name: Emit canary completion marker
           ansible.builtin.debug:

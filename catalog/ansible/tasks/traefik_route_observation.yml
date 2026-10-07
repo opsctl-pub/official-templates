@@ -25,25 +25,9 @@
       - existing_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
       - existing_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
       - traefik_dynamic_dir in (existing_traefik.Mounts | default([]) | map(attribute='Destination') | list)
-      - "'--providers.file.directory=/etc/traefik/dynamic/opsctl' in (existing_traefik.Config.Cmd | default([]))"
+      - "('--providers.file.directory=' ~ traefik_dynamic_dir) in (existing_traefik.Config.Cmd | default([]))"
       - "'--providers.file.watch=true' in (existing_traefik.Config.Cmd | default([]))"
     fail_msg: "Managed Traefik gateway is unavailable"
-  no_log: true
-
-- name: Set expected route backend URLs
-  set_fact:
-    expected_backend_urls: "{{ (traefik_backends | default([], true)) | map(attribute='url') | list }}"
-  no_log: true
-
-- name: Set current route backend identity
-  set_fact:
-    route_cas_present: "{{ expected_route_observation is defined and expected_route_observation.presence == 'present' }}"
-    current_backend_identity_class: >-
-      {{
-        expected_route_observation.backend_identity_class
-        if (expected_route_observation is defined and expected_route_observation.presence == 'present')
-        else ('private' if (expected_backend_urls | length) > 0 else 'loopback')
-      }}
   no_log: true
 
 - name: Inspect exact deployment route file
@@ -61,7 +45,8 @@
       https: null
       redirect_http_to_https: null
       middlewares: []
-      backend_identity_class: null
+      backends: []
+      router_name: null
   when: not route_file.stat.exists
   no_log: true
 
@@ -153,18 +138,6 @@
             else []
           }}
 
-    - name: Classify observed backends when no desired backend set was supplied
-      set_fact:
-        current_backend_identity_class: >-
-          {{
-            'loopback'
-            if (observed_backend_urls | length == 1 and observed_backend_urls[0] is match('^http://127\.0\.0\.1:[0-9]+$'))
-            else 'private'
-          }}
-      when:
-        - not route_cas_present
-        - expected_backend_urls | length == 0
-
     - name: Set accepted Traefik v3 route matcher pattern
       set_fact:
         route_v3_rule_pattern: '^Host\(`[^`]+`\)(?: \|\| Host\(`[^`]+`\))*$'
@@ -205,25 +178,23 @@
           - route_service.loadBalancer.servers | length > 0
           - route_service.loadBalancer.servers[0] is mapping
           - route_service.loadBalancer.servers[0].keys() | list == ['url']
-          - route_cas_present or (expected_backend_urls | length == 0) or (observed_backend_urls == expected_backend_urls)
-          - (not route_cas_present) or ((current_backend_identity_class == 'private' and (observed_backend_urls | length) == (expected_route_observation.backend_count | int) and (observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')) == expected_route_observation.backend_digest) or (current_backend_identity_class == 'loopback' and observed_backend_urls == ['http://127.0.0.1:' ~ (route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int | string)]))
           - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
-          - (observed_backend_urls | select('match', '^http://[^:/?#]+:[0-9]+$') | list | length) == (observed_backend_urls | length)
+          - (observed_backend_urls | select('match', '^http://(?:[0-9.]+|\[[0-9a-f:]+\]):[1-9][0-9]{0,4}$') | list | length) == (observed_backend_urls | length)
           - (route_router.middlewares | default([])) is sequence
           - (route_router.middlewares | default([])) is not string
         fail_msg: "Managed Traefik route is malformed"
-      register: route_structure_assertion
-      ignore_errors: true
       no_log: true
 
-    - name: Emit safe first failing route predicate
-      fail:
-        msg: >-
-          route_observation_assertion_failed={{
-            route_structure_assertion.assertion
-            | default('route structure predicate evaluation failed')
-          }}
-      when: route_structure_assertion.failed | default(false)
+    - name: Validate explicit parsed backend ports
+      assert:
+        that:
+          - item | urlsplit('port') is integer
+          - item | urlsplit('port') >= 1
+          - item | urlsplit('port') <= 65535
+          - item | urlsplit('port') == (observed_backend_urls[0] | urlsplit('port'))
+        fail_msg: "Managed Traefik backend port is malformed"
+      loop: "{{ observed_backend_urls }}"
+      no_log: true
 
     - name: Validate route without managed HTTP redirect
       assert:
@@ -257,15 +228,12 @@
         route_observation_base:
           presence: present
           hosts: "{{ observed_route_hosts }}"
-          route_port: "{{ route_service.loadBalancer.servers[0].url | regex_replace('^http://[^:/?#]+:', '') | int }}"
+          route_port: "{{ observed_backend_urls[0] | urlsplit('port') }}"
           https: "{{ 'tls' in route_router }}"
           redirect_http_to_https: "{{ route_redirect_present }}"
           middlewares: "{{ route_router.middlewares | default([]) }}"
-          backend_identity_class: "{{ current_backend_identity_class }}"
-    - name: Add normalized private backend identity
-      set_fact:
-        route_observation_base: "{{ route_observation_base | combine({'backend_count': observed_backend_urls | length, 'backend_digest': observed_backend_urls | sort | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')}) }}"
-      when: current_backend_identity_class == 'private'
+          backends: "{{ observed_backend_urls }}"
+          router_name: "{{ route_key }}@file"
   rescue:
     - name: Set unknown route observation
       set_fact:
@@ -276,19 +244,16 @@
           https: null
           redirect_http_to_https: null
           middlewares: []
-          backend_identity_class: null
+          backends: []
+          router_name: null
 
-- name: Add deterministic route observation digest
+- name: Timestamp native route facts
+  command:
+    argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+  register: route_observed_time
+  changed_when: false
+
+- name: Build plain route observation
   set_fact:
-    route_observation: >-
-      {{
-        route_observation_base
-        | combine({
-            'digest': (
-              route_observation_base
-              | to_json(sort_keys=True, separators=[',', ':'])
-              | hash('sha256')
-            )
-          })
-      }}
+    route_observation: "{{ route_observation_base | combine({'outcome': 'incomplete' if route_observation_base.presence == 'unknown' else 'succeeded', 'observed_at': route_observed_time.stdout}) }}"
   no_log: true

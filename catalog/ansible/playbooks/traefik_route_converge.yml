@@ -8,10 +8,10 @@
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
     route_key: "deployment-{{ deployment_id }}"
-    resolved_route_state: "{{ route_state | default('present', true) }}"
-    resolved_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+    resolved_route_state: "{{ route_state }}"
+    resolved_route_hosts: "{{ route_hosts }}"
     resolved_route_middlewares: "{{ route_middlewares | default([], true) }}"
-    resolved_traefik_backends: "{{ traefik_backends | default([{'url': 'http://127.0.0.1:' ~ (route_port | string)}]) }}"
+    resolved_traefik_backends: "{{ traefik_backends }}"
   pre_tasks:
     - name: Skip Traefik route converge in simulate mode
       meta: end_play
@@ -26,16 +26,6 @@
           - deployment_id is defined
           - deployment_id is string
           - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - app_slug is defined
-          - app_slug is string
-          - app_slug == (app_slug | trim)
-          - (app_slug | trim | length) > 0
-          - (app_slug | length) <= 255
-          - app_container_name is defined
-          - app_container_name is string
-          - app_container_name == (app_container_name | trim)
-          - (app_container_name | trim | length) > 0
-          - (app_container_name | length) <= 255
           - route_port is defined
           - route_port is integer
           - route_port > 0
@@ -58,20 +48,20 @@
           - (resolved_route_middlewares | unique | list | length) == (resolved_route_middlewares | length)
           - resolved_traefik_backends is sequence
           - resolved_traefik_backends is not string
-          - (resolved_traefik_backends | length) > 0
+          - (resolved_traefik_backends | length) <= 64
+          - (resolved_route_state == 'absent') or ((resolved_traefik_backends | length) > 0)
+          - (resolved_route_state == 'present') or ((resolved_traefik_backends | length) == 0)
           - (resolved_traefik_backends | map(attribute='url') | list | unique | list | length) == (resolved_traefik_backends | length)
         fail_msg: "Traefik route identity is missing or malformed"
 
-    - name: Validate optional route comparison evidence
+    - name: Require plain route comparison snapshot
       assert:
         that:
-          - expected_route_observation is mapping
-          - expected_route_observation.keys() | difference(['backend_count', 'backend_digest']) | sort == ['backend_identity_class', 'digest', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port']
-          - ('backend_count' in expected_route_observation) == ('backend_digest' in expected_route_observation)
-          - expected_route_observation.presence in ['present', 'absent']
-          - expected_route_observation.digest is match('^[0-9a-f]{64}$')
+          - expected_route is mapping
+          - expected_route.keys() | sort == ['backends', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port', 'router_name']
+          - expected_route.presence in ['present', 'absent']
         fail_msg: "Traefik route comparison evidence is invalid"
-      when: expected_route_observation is defined
+      no_log: true
 
     - name: Validate normalized route hostnames before mutation
       assert:
@@ -106,8 +96,9 @@
           - item is mapping
           - item.keys() | list == ['url']
           - item.url is string
-          - item.url is match('^http://[^:/?#]+:[0-9]+/?$')
-          - item.url | regex_search(':[0-9]+/?$') | regex_replace('[^0-9]', '') | int == route_port
+          - item.url is match('^http://(?:[0-9.]+|\[[0-9a-f:]+\]):[1-9][0-9]{0,4}$')
+          - item.url | urlsplit('port') is integer
+          - item.url | urlsplit('port') == route_port
         fail_msg: "Traefik backend identity is invalid"
       loop: "{{ resolved_traefik_backends }}"
       loop_control:
@@ -121,10 +112,9 @@
     - name: Reject changed deployment route before mutation
       assert:
         that:
-          - route_observation == expected_route_observation
+          - route_observation_base == expected_route or (resolved_route_state == 'absent' and route_observation.presence == 'absent')
         fail_msg: "Managed Traefik route changed before configuration"
       no_log: true
-      when: expected_route_observation is defined
 
     - name: OPERATION_STEP traefik-route:start
       shell: |
@@ -138,6 +128,12 @@
 
     - name: Converge managed Traefik route
       block:
+        - name: Retain exact prior route bytes for restoration
+          set_fact:
+            prior_route_content: "{{ route_content.content if route_file.stat.exists else none }}"
+            route_activation_attempted: false
+          no_log: true
+
         - name: Verify watched dynamic directory exists
           stat:
             path: "{{ traefik_dynamic_dir }}"
@@ -150,6 +146,11 @@
               - traefik_dynamic_dir_stat.stat.exists
               - traefik_dynamic_dir_stat.stat.isdir
             fail_msg: "Managed Traefik route directory is unavailable"
+          no_log: true
+
+        - name: Record subject activation boundary
+          set_fact:
+            route_activation_attempted: true
           no_log: true
 
         - name: Remove exact deployment route
@@ -233,6 +234,27 @@
           when: resolved_route_state == 'present'
           no_log: true
 
+        - name: Observe activated subject route
+          include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
+
+        - name: Require actual desired native route
+          assert:
+            that:
+              - route_observation.outcome == 'succeeded'
+              - route_observation.presence == resolved_route_state
+              - route_observation.hosts == (resolved_route_hosts | sort)
+              - route_observation.backends == (resolved_traefik_backends | map(attribute='url') | list)
+              - resolved_route_state == 'absent' or route_observation.route_port == route_port
+              - resolved_route_state == 'absent' or route_observation.https == route_https
+              - resolved_route_state == 'absent' or route_observation.redirect_http_to_https == redirect_http_to_https
+              - resolved_route_state == 'absent' or route_observation.middlewares == resolved_route_middlewares
+            fail_msg: "Activated route could not be verified"
+          no_log: true
+
+        - name: Emit actual activated route facts
+          debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ {'deployment_route_observation': route_observation} | to_json }}"
+
         - name: OPERATION_STEP traefik-route:complete
           shell: |
             printf 'OPERATION_STEP={"name":"traefik-route:complete","status":"completed","metadata":{"display_name":"Traefik route ready","deployment_id":"%s","host_count":%s,"route_port":%s,"https":%s}}\n' \
@@ -243,6 +265,44 @@
           args:
             executable: /bin/sh
       rescue:
+        - name: Restore exact previous route selection
+          block:
+            - name: Restore prior route atomically
+              copy:
+                content: "{{ prior_route_content | b64decode }}"
+                dest: "{{ route_file_path }}"
+                owner: root
+                group: root
+                mode: "0644"
+              when: prior_route_content is not none
+              no_log: true
+
+            - name: Restore prior route absence
+              file:
+                path: "{{ route_file_path }}"
+                state: absent
+              when: prior_route_content is none
+              no_log: true
+
+            - name: Observe restored route
+              include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
+
+            - name: Require exact restored snapshot
+              assert:
+                that:
+                  - route_observation_base == expected_route
+                fail_msg: "Previous route could not be restored"
+              no_log: true
+
+            - name: Emit restored facts with safe failure
+              debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'deployment_route_observation': route_observation, 'procedure_error': {'phase': 'apply', 'code': 'route_apply_failed'}} | to_json }}"
+          rescue:
+            - name: Emit incomplete restoration
+              debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'procedure_error': {'phase': 'restore', 'code': 'restoration_failed'}} | to_json }}"
+          when: route_activation_attempted | default(false)
+
         - name: Remove incomplete staged route
           file:
             path: "{{ staged_route_file.path }}"
