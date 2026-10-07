@@ -1,0 +1,104 @@
+---
+- name: Inspect one exact native project instance
+  community.docker.docker_container_info:
+    name: "{{ compose_instance_id }}"
+  register: compose_instance_info
+  no_log: true
+
+- name: Validate present native project membership
+  ansible.builtin.assert:
+    that:
+      - compose_instance_info.container.Id == compose_instance_id
+      - compose_instance_info.container.Config.Labels['com.docker.compose.project'] == compose_project_name
+      - compose_instance_info.container.State.Status in ['created', 'running', 'restarting', 'paused', 'exited', 'dead', 'removing']
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Observe the actual instance image without pulling
+  community.docker.docker_image_info:
+    name: "{{ compose_instance_info.container.Image }}"
+  register: compose_instance_image
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Require the observed image identity
+  ansible.builtin.assert:
+    that:
+      - compose_instance_image.images | length == 1
+      - compose_instance_image.images[0].Id == compose_instance_info.container.Image
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Project only public instance fields
+  ansible.builtin.set_fact:
+    compose_instance: >-
+      {% set container = compose_instance_info.container %}
+      {% set ports = namespace(values=[]) %}
+      {% for key, bindings in (container.NetworkSettings.Ports | default({}, true)).items() %}
+      {% for binding in bindings | default([], true) %}
+      {% set ports.values = ports.values + [{'host_ip': binding.HostIp, 'host_port': binding.HostPort | int,
+        'container_port': key.split('/')[0] | int, 'protocol': key.split('/')[1]}] %}
+      {% endfor %}
+      {% endfor %}
+      {% set mounts = namespace(values=[]) %}
+      {% for mount in container.Mounts | default([]) %}
+      {% set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in ['volume', 'bind', 'tmpfs'] else 'other',
+        'source': mount.Name | default(none) if mount.Type == 'volume' else
+          (mount.Source | default(none) if mount.Type == 'bind' else none),
+        'target': mount.Destination, 'read_only': not mount.RW}] %}
+      {% endfor %}
+      {% set digests = compose_instance_image.images[0].RepoDigests | default([], true) |
+        map('regex_replace', '^.*@', '') | unique | list %}
+      {{ {'id': container.Id, 'name': container.Name | regex_replace('^/', ''),
+        'replica': container.Config.Labels.get('com.docker.compose.container-number') | int
+          if container.Config.Labels.get('com.docker.compose.container-number', '') is match('^[1-9][0-9]*$') else none,
+        'image_ref': container.Config.Image, 'image_id': container.Image,
+        'image_digest': digests[0] if digests | length == 1 else none,
+        'state': container.State.Status, 'health': container.State.Health.Status | default('none'),
+        'exit_code': container.State.ExitCode | default(none), 'ports': ports.values, 'mounts': mounts.values} }}
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Select bounded-instance refusal
+  ansible.builtin.set_fact:
+    compose_observation_failure: compose_observation_limit
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Bound instance projections
+  ansible.builtin.assert:
+    that:
+      - compose_instance.ports | length <= 256
+      - compose_instance.mounts | length <= 128
+      - compose_instance.replica is none or compose_instance.replica <= 128
+      - compose_instance.health in ['healthy', 'unhealthy', 'starting', 'none', 'unknown']
+      - compose_instance.ports | map(attribute='protocol') | difference(['tcp', 'udp']) | length == 0
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Restore native observation failure after bounded instance validation
+  ansible.builtin.set_fact:
+    compose_observation_failure: compose_observation_failed
+  no_log: true
+
+- name: Retain bounded instance classification for readiness
+  ansible.builtin.set_fact:
+    compose_instance_network_names: >-
+      {{ (compose_instance_network_names +
+        (compose_instance_info.container.NetworkSettings.Networks | default({}, true)).keys() | list) | unique | list }}
+    compose_observed_instances: >-
+      {{ compose_observed_instances + [{'instance': compose_instance,
+        'service': compose_instance_info.container.Config.Labels.get('com.docker.compose.service', ''),
+        'restart': compose_instance_info.container.HostConfig.RestartPolicy.Name | default('no'),
+        'unexpected': (compose_instance_id not in (compose_known_containers | default([])) and
+          not (compose_allow_new_instances | default(false))) or
+          compose_instance_info.container.Config.Labels.get('com.docker.compose.service', '') not in
+          (compose_services | map(attribute='name') | list)}] }}
+  when: compose_instance_info.exists
+  no_log: true
+
+- name: Retain actual absence of a recorded instance
+  ansible.builtin.set_fact:
+    compose_absent_containers: "{{ compose_absent_containers + [compose_instance_id] }}"
+  when: not compose_instance_info.exists
+  no_log: true

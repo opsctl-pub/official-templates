@@ -1,0 +1,462 @@
+---
+- name: Deploy original supplied files through native Docker Compose
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    compose_project_src: "{{ compose_workspace }}/{{ compose_project_directory | default('.') }}"
+  tasks:
+    - name: Initialize the bounded native deployment procedure
+      ansible.builtin.set_fact:
+        compose_action: deploy
+        compose_phase: compose:prepare
+        compose_outcome: unknown
+        compose_reason: compose_prerequisite_unavailable
+        compose_changed: false
+        compose_files_written: []
+        compose_observation_complete: false
+        compose_allow_new_instances: false
+      no_log: true
+
+    - name: Publish preparation progress
+      ansible.builtin.debug:
+        msg: 'OPERATION_STEP={"name":"compose:prepare","status":"running","metadata":{"display_name":"Prepare native Compose deployment"}}'
+
+    - name: Deliver originals apply native Compose and observe all instances
+      block:
+        - name: Validate bounded native inputs
+          ansible.builtin.assert:
+            that:
+              - compose_project_name is match('^[a-z0-9][a-z0-9_-]*$')
+              - compose_workspace.startswith('/')
+              - "'..' not in compose_workspace.split('/')"
+              - compose_source_directory.startswith('/')
+              - compose_files | length > 0 and compose_files | length <= 16
+              - compose_env_files | default([]) | length <= 16
+              - compose_profiles | default([]) | length <= 32
+              - compose_supplied_files | length > 0 and compose_supplied_files | length <= 32
+              - compose_supplied_files | map(attribute='path') | unique | length == compose_supplied_files | length
+              - compose_supplied_files | map(attribute='source') | unique | length == compose_supplied_files | length
+              - compose_directories | default([]) | length <= 32
+              - compose_wait_timeout | default(300) is integer
+              - compose_wait_timeout | default(300) >= 1 and compose_wait_timeout | default(300) <= 1800
+
+        - name: Observe existing project membership before any file or workload effect
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Select conflict refusal before checking existing membership
+          ansible.builtin.set_fact:
+            compose_reason: compose_project_conflict
+
+        - name: Refuse pre-existing instances outside recorded membership
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
+              - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
+
+        - name: Select file-delivery failure
+          ansible.builtin.set_fact:
+            compose_phase: compose:files
+            compose_reason: compose_file_delivery_failed
+
+        - name: Publish completed native preparation
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:prepare","status":"completed","metadata":{"display_name":"Prepare native Compose deployment"}}'
+          no_log: false
+
+        - name: Publish original-file delivery progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:files","status":"running","metadata":{"display_name":"Deliver supplied Compose files"}}'
+          no_log: false
+
+        - name: Require confined original file destinations and flat Secret keys
+          ansible.builtin.assert:
+            that:
+              - supplied_file.source is match('^source-[0-9]{2}$')
+              - supplied_file.path is string and supplied_file.path | length > 0
+              - not supplied_file.path.startswith('/')
+              - supplied_file.path != '.'
+              - "'..' not in supplied_file.path.split('/')"
+              - "'\\' not in supplied_file.path"
+              - supplied_file.mode is match('^0[0-7]{3}$')
+          loop: "{{ compose_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: supplied file
+
+        - name: Require confined project and empty-directory paths
+          ansible.builtin.assert:
+            that:
+              - not relative_directory.startswith('/')
+              - "'..' not in relative_directory.split('/')"
+              - "'\\' not in relative_directory"
+          loop: "{{ [compose_project_directory | default('.')] + (compose_directories | default([])) }}"
+          loop_control:
+            loop_var: relative_directory
+            label: supplied directory
+
+        - name: Require native file selections to resolve to supplied workspace files
+          ansible.builtin.assert:
+            that:
+              - not native_selection.startswith('/')
+              - "'\\' not in native_selection"
+              - compose_selection_path in (compose_supplied_files | map(attribute='path') | list)
+          vars:
+            compose_selection_path: >-
+              {% set path = namespace(parts=(compose_project_directory | default('.')).split('/') | reject('equalto', '.') | list,
+                escaped=false) %}
+              {% for part in native_selection.split('/') %}
+              {% if part == '..' %}
+              {% if path.parts | length == 0 %}{% set path.escaped = true %}
+              {% else %}{% set path.parts = path.parts[:-1] %}{% endif %}
+              {% elif part not in ['', '.'] %}{% set path.parts = path.parts + [part] %}{% endif %}
+              {% endfor %}
+              {{ none if path.escaped else path.parts | join('/') }}
+          loop: "{{ compose_files + (compose_env_files | default([])) }}"
+          loop_control:
+            loop_var: native_selection
+            label: native file selection
+
+        - name: Collect every workspace ancestor and required original-file parent
+          ansible.builtin.set_fact:
+            compose_delivery_directories: >-
+              {% set paths = namespace(values=[], path='') %}
+              {% for component in compose_workspace.split('/') | reject('equalto', '') %}
+              {% set paths.path = paths.path + '/' + component %}
+              {% set paths.values = paths.values + [paths.path] %}
+              {% endfor %}
+              {% set relatives = (compose_directories | default([])) + [compose_project_directory | default('.')] +
+                (compose_supplied_files | map(attribute='path') | map('dirname') | list) %}
+              {% for relative in relatives %}
+              {% set paths.path = compose_workspace %}
+              {% for component in relative.split('/') | reject('in', ['', '.']) %}
+              {% set paths.path = paths.path + '/' + component %}
+              {% set paths.values = paths.values + [paths.path] %}
+              {% endfor %}
+              {% endfor %}
+              {{ paths.values | unique | sort }}
+
+        - name: Inspect every destination ancestor without following links
+          ansible.builtin.stat:
+            path: "{{ directory_path }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          loop: "{{ compose_delivery_directories }}"
+          loop_control:
+            loop_var: directory_path
+            label: destination directory
+          register: compose_directory_stats
+
+        - name: Refuse symlink or incompatible existing ancestors
+          ansible.builtin.assert:
+            that: not directory_stat.stat.exists or (directory_stat.stat.isdir and not directory_stat.stat.islnk)
+          loop: "{{ compose_directory_stats.results }}"
+          loop_control:
+            loop_var: directory_stat
+            label: destination directory
+
+        - name: Create only missing destination directories without recursive permission changes
+          ansible.builtin.file:
+            path: "{{ directory_stat.directory_path }}"
+            state: directory
+            mode: '0755'
+          loop: "{{ compose_directory_stats.results }}"
+          loop_control:
+            loop_var: directory_stat
+            label: missing directory
+          when: not directory_stat.stat.exists
+          register: compose_created_directories
+
+        - name: Inspect every supplied destination file without following links
+          ansible.builtin.stat:
+            path: "{{ compose_workspace }}/{{ supplied_file.path }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          loop: "{{ compose_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: destination file
+          register: compose_file_stats
+
+        - name: Refuse incompatible destination file types
+          ansible.builtin.assert:
+            that: not file_stat.stat.exists or (file_stat.stat.isreg and not file_stat.stat.islnk)
+          loop: "{{ compose_file_stats.results }}"
+          loop_control:
+            loop_var: file_stat
+            label: destination file
+
+        - name: Overwrite every supplied original file and preserve unsupplied data
+          ansible.builtin.copy:
+            src: "{{ compose_source_directory }}/{{ supplied_file.source }}"
+            dest: "{{ compose_workspace }}/{{ supplied_file.path }}"
+            mode: "{{ supplied_file.mode }}"
+            force: true
+            backup: false
+            follow: false
+          diff: false
+          loop: "{{ compose_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: supplied file
+          register: compose_file_copies
+
+        - name: Preserve successful delivery facts
+          ansible.builtin.set_fact:
+            compose_files_written: >-
+              {% set paths = namespace(values=[]) %}
+              {% for result in compose_file_copies.results %}
+              {% if not result.failed | default(false) and not result.skipped | default(false) %}
+              {% set paths.values = paths.values + [result.supplied_file.path] %}{% endif %}
+              {% endfor %}
+              {{ paths.values }}
+            compose_changed: "{{ compose_file_copies.changed or compose_created_directories.changed }}"
+
+        - name: Publish completed original-file delivery
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:files","status":"completed","metadata":{"display_name":"Deliver supplied Compose files"}}'
+          no_log: false
+
+        - name: Select registry-authentication failure
+          ansible.builtin.set_fact:
+            compose_reason: compose_registry_auth_failed
+
+        - name: Allocate operation-local Docker config even for anonymous access
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: opsctl-compose-auth-
+          register: compose_auth_directory
+
+        - name: Restrict operation-local authentication directory
+          ansible.builtin.file:
+            path: "{{ compose_auth_directory.path }}"
+            state: directory
+            mode: '0700'
+
+        - name: Load only the delivered plain registry selection
+          ansible.builtin.set_fact:
+            compose_registry_auth: >-
+              {{ lookup('ansible.builtin.file', compose_registry_auth_file) | from_json
+                if compose_registry_auth_file | default(none) is not none else {'registries': []} }}
+
+        - name: Require the closed plain registry array
+          ansible.builtin.assert:
+            that:
+              - compose_registry_auth is mapping
+              - compose_registry_auth.keys() | list == ['registries']
+              - compose_registry_auth.registries is sequence
+
+        - name: Authenticate selected registries in the private native Docker config
+          community.docker.docker_login:
+            registry_url: "{{ registry.host }}"
+            username: "{{ registry.username }}"
+            password: "{{ registry.password }}"
+            config_path: "{{ compose_auth_directory.path }}/config.json"
+          environment:
+            DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+          loop: "{{ compose_registry_auth.registries }}"
+          loop_control:
+            loop_var: registry
+            label: selected registry
+
+        - name: Select native-configuration failure
+          ansible.builtin.set_fact:
+            compose_reason: compose_configuration_changed
+            compose_config_argv: >-
+              {% set args = namespace(values=['docker', 'compose', '--project-name', compose_project_name,
+                '--project-directory', compose_project_src]) %}
+              {% for file in compose_files %}{% set args.values = args.values + ['--file', file] %}{% endfor %}
+              {% for file in compose_env_files | default([]) %}{% set args.values = args.values + ['--env-file', file] %}{% endfor %}
+              {% for profile in compose_profiles | default([]) %}{% set args.values = args.values + ['--profile', profile] %}{% endfor %}
+              {{ args.values + ['config', '--format', 'json'] }}
+
+        - name: Read native resolved configuration privately after original-file delivery
+          ansible.builtin.command:
+            argv: "{{ compose_config_argv }}"
+            chdir: "{{ compose_project_src }}"
+          environment:
+            DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+          register: compose_native_config_output
+          changed_when: false
+
+        - name: Retain the native resolved configuration without model hashes or rewrites
+          ansible.builtin.set_fact:
+            compose_native_config: "{{ compose_native_config_output.stdout | from_json }}"
+
+        - name: Project only selected native service readiness intent
+          ansible.builtin.set_fact:
+            compose_native_intent: >-
+              {% set services = namespace(values=[]) %}
+              {% for name, service in compose_native_config.services.items() %}
+              {% set dependencies = namespace(conditions=[]) %}
+              {% for parent in compose_native_config.services.values() %}
+              {% if name in parent.depends_on | default({}) %}
+              {% set dependencies.conditions = dependencies.conditions + [parent.depends_on[name].condition | default('service_started')] %}
+              {% endif %}
+              {% endfor %}
+              {% set replicas = service.scale | default(service.deploy.replicas | default(1)) | int %}
+              {% set condition = 'scaled_down' if replicas == 0 else ('completed' if
+                'service_completed_successfully' in dependencies.conditions else ('healthy' if
+                'service_healthy' in dependencies.conditions or
+                (service.healthcheck | default({}) | length > 0 and not service.healthcheck.disable | default(false) and
+                 service.healthcheck.test | default([]) != ['NONE']) else 'running')) %}
+              {% set services.values = services.values + [{'name': name, 'replicas': replicas,
+                'condition': condition, 'allow_completion': service.restart | default('no') in ['', 'no'] and
+                  dependencies.conditions | length == 0}] %}
+              {% endfor %}
+              {{ services.values | sort(attribute='name') }}
+
+        - name: Apply only documented defaults to captured service intent
+          ansible.builtin.set_fact:
+            compose_expected_intent: >-
+              {% set services = namespace(values=[]) %}
+              {% for service in compose_services %}
+              {% set services.values = services.values + [service | combine({
+                'allow_completion': service.allow_completion | default(false)})] %}
+              {% endfor %}
+              {{ services.values | sort(attribute='name') }}
+
+        - name: Refuse changed native selected service count readiness or completion intent
+          ansible.builtin.assert:
+            that: compose_native_intent == compose_expected_intent
+
+        - name: Select unavailable build refusal before native apply
+          ansible.builtin.set_fact:
+            compose_reason: compose_build_unavailable
+
+        - name: Refuse build-only or explicitly required-build services
+          ansible.builtin.assert:
+            that:
+              - native_service.value.image | default('') | length > 0
+              - native_service.value.pull_policy | default('') != 'build'
+          loop: "{{ compose_native_config.services | dict2items }}"
+          loop_control:
+            loop_var: native_service
+            label: native service
+          when: native_service.key in (compose_services | map(attribute='name') | list)
+
+        - name: Reobserve current resources and membership immediately before native apply
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Select project conflict refusal for final membership check
+          ansible.builtin.set_fact:
+            compose_reason: compose_project_conflict
+
+        - name: Require complete unchanged membership before permitting native orphan removal
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
+              - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
+
+        - name: Retain complete native pre-apply resource observations
+          ansible.builtin.set_fact:
+            compose_prior_networks: >-
+              {% set prior = namespace(values=[]) %}
+              {% for result in compose_network_inventory %}
+              {% set prior.values = prior.values + [{'name': result.compose_network_name,
+                'id': result.network.Id if result.exists else none, 'presence': 'present' if result.exists else 'absent'}] %}
+              {% endfor %}
+              {{ prior.values }}
+            compose_prior_volumes: "{{ compose_observed_volumes }}"
+            compose_phase: compose:apply
+            compose_reason: compose_apply_failed
+
+        - name: Publish native apply progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:apply","status":"running","metadata":{"display_name":"Apply native Compose project"}}'
+          no_log: false
+
+        - name: Apply the original native Compose project without building or overriding images
+          community.docker.docker_compose_v2:
+            project_src: "{{ compose_project_src }}"
+            project_name: "{{ compose_project_name }}"
+            files: "{{ compose_files }}"
+            env_files: "{{ compose_env_files | default([]) }}"
+            profiles: "{{ compose_profiles | default([]) }}"
+            state: present
+            pull: policy
+            build: never
+            recreate: auto
+            renew_anon_volumes: false
+            assume_yes: false
+            wait: false
+            remove_orphans: true
+          environment:
+            DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+          register: compose_native_apply
+
+        - name: Preserve native apply effects and begin finite readiness observations
+          ansible.builtin.set_fact:
+            compose_changed: "{{ compose_changed or compose_native_apply.changed }}"
+            compose_allow_new_instances: true
+            compose_phase: compose:observe
+            compose_reason: compose_readiness_timeout
+            compose_ready: false
+            compose_wait_deadline: "{{ now(utc=true).timestamp() | int + compose_wait_timeout | default(300) }}"
+
+        - name: Publish completed native apply progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:apply","status":"completed","metadata":{"display_name":"Apply native Compose project"}}'
+          no_log: false
+
+        - name: Publish native observation progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:observe","status":"running","metadata":{"display_name":"Observe Compose readiness"}}'
+          no_log: false
+
+        - name: Poll all selected instances within the finite readiness budget
+          ansible.builtin.include_tasks: ../tasks/compose_wait.yml
+          loop: "{{ range(0, (compose_wait_timeout | default(300) // 5) + 1) | list }}"
+          loop_control:
+            label: readiness observation
+          when: not compose_ready and now(utc=true).timestamp() | int < compose_wait_deadline
+
+        - name: Require complete observed readiness
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_ready
+
+        - name: Record complete native deployment
+          ansible.builtin.set_fact:
+            compose_outcome: succeeded
+            compose_reason: null
+            compose_phase: compose:complete
+            compose_removed_containers: "{{ compose_absent_containers }}"
+      rescue:
+        - name: Preserve successful file delivery and native partial effects
+          ansible.builtin.set_fact:
+            compose_files_written: >-
+              {% set paths = namespace(values=[]) %}
+              {% for result in compose_file_copies.results | default([]) %}
+              {% if not result.failed | default(false) and not result.skipped | default(false) %}
+              {% set paths.values = paths.values + [result.supplied_file.path] %}{% endif %}
+              {% endfor %}
+              {{ paths.values }}
+            compose_changed: >-
+              {{ compose_changed or compose_file_copies.changed | default(false) or
+                compose_created_directories.changed | default(false) or compose_native_apply.changed | default(false) }}
+            compose_allow_new_instances: "{{ compose_native_apply is defined }}"
+            compose_failure_reason: "{{ compose_reason }}"
+
+        - name: Observe safe partial native facts without rollback or data deletion
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Retain failed versus unavailable procedure truth
+          ansible.builtin.set_fact:
+            compose_outcome: "{{ 'failed' if compose_observation_complete else 'unknown' }}"
+            compose_reason: "{{ compose_failure_reason if compose_observation_complete else compose_reason }}"
+      always:
+        - name: Remove only this operation-local authentication directory
+          ansible.builtin.file:
+            path: "{{ compose_auth_directory.path }}"
+            state: absent
+          when: compose_auth_directory.path is defined
+      no_log: true
+
+    - name: Publish exactly one final native deployment result
+      ansible.builtin.include_tasks: ../tasks/compose_publish.yml

@@ -20,7 +20,7 @@
 
     - name: Inspect named image container
       community.docker.docker_container_info:
-        name: "{{ app_container_name }}"
+        name: "{{ app_container_name | default('app') }}"
       register: image_container_info
 
     - name: Validate present container facts
@@ -30,6 +30,19 @@
           - image_container_info.container.State.Status in ['created', 'running', 'restarting', 'paused', 'exited', 'dead', 'removing']
           - image_container_info.container.Config.Image is string
           - image_container_info.container.Image is string
+      when: image_container_info.exists
+
+    - name: Observe the current image without pulling
+      community.docker.docker_image_info:
+        name: "{{ image_container_info.container.Image }}"
+      register: image_image_info
+      when: image_container_info.exists
+
+    - name: Require the observed image identity
+      ansible.builtin.assert:
+        that:
+          - image_image_info.images | length == 1
+          - image_image_info.images[0].Id == image_container_info.container.Image
       when: image_container_info.exists
 
     - name: Project safe instance fields
@@ -50,14 +63,25 @@
             if mount.Type == 'volume' else (mount.Source | default(none) if mount.Type == 'bind' else none),
             'target': mount.Destination, 'read_only': not mount.RW}] %}
           {% endfor %}
+          {% set digests = image_image_info.images[0].RepoDigests | default([], true) |
+            map('regex_replace', '^.*@', '') | unique | list %}
           {{ {'id': image_container_info.container.Id,
             'name': image_container_info.container.Name | regex_replace('^/', ''), 'replica': none,
             'image_ref': image_container_info.container.Config.Image,
-            'image_id': image_container_info.container.Image, 'image_digest': none,
+            'image_id': image_container_info.container.Image,
+            'image_digest': digests[0] if digests | length == 1 else none,
             'state': image_container_info.container.State.Status,
             'health': image_container_info.container.State.Health.Status | default('none'),
             'exit_code': image_container_info.container.State.ExitCode | default(none),
             'ports': ports.values, 'mounts': mounts.values} }}
+      when: image_container_info.exists
+
+    - name: Bound safe instance detail
+      ansible.builtin.assert:
+        that:
+          - image_observed_container.ports | length <= 256
+          - image_observed_container.mounts | length <= 128
+          - image_observed_container.ports | map(attribute='protocol') | difference(['tcp', 'udp']) | length == 0
       when: image_container_info.exists
 
     - name: Inspect recorded predecessor by full identity
@@ -138,8 +162,16 @@
         'volumes': image_observed_volumes, 'networks': image_observed_networks} }}
   no_log: true
 
-- name: Refuse oversized image-runtime observations without publishing partial success
-  ansible.builtin.assert:
-    that: image_runtime | to_json | length <= 262144
-    fail_msg: Native image observation exceeds the supported output limit.
+- name: Clear unavailable readiness without inventing a workload result
+  ansible.builtin.set_fact:
+    image_runtime: "{{ image_runtime | combine({'ready': none}) }}"
+  when: not image_runtime.observation_complete
+  no_log: true
+
+- name: Retain explicit unavailable image facts when the full envelope exceeds its bound
+  ansible.builtin.set_fact:
+    image_runtime: >-
+      {{ image_runtime | combine({'observation_complete': false, 'ready': none,
+        'container': none, 'volumes': [], 'networks': []}) }}
+  when: "{'image_runtime': image_runtime} | to_json | length > 262144"
   no_log: true

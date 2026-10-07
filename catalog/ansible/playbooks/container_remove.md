@@ -45,14 +45,15 @@ when observation is unavailable, not in supplied incarnation references.
 
 ## Plain Results
 
-One final `TEMPLATE_OUTPUT_JSON` contains `image_runtime`, plus any independently
+Every ordinary-image removal emits one final `TEMPLATE_OUTPUT_JSON` containing
+`image_runtime` (empty resource lists when unmanaged), plus any independently
 qualified route/drain results. `image_runtime` has exactly these fields:
 
 | Field | Value |
 |---|---|
 | `action` | `remove` |
 | `observation_complete` | Boolean; false on unknown, changed or unavailable observations. |
-| `ready` | null for removal. |
+| `ready` | null for removal and for every incomplete image observation, including deploy. |
 | `container` | null after confirmed named-target absence; otherwise the safe instance below. |
 | `previous_container_absent` | Boolean after an actual predecessor lookup; null if no predecessor was supplied or lookup was unavailable. |
 | `volumes` | `{name,created_at,presence,users:[{id,state,read_only}]}`; presence is `present`, `absent` or `unknown`. |

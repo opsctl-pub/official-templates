@@ -1,0 +1,44 @@
+---
+- name: Assemble the complete plain Compose result
+  ansible.builtin.set_fact:
+    compose_result: >-
+      {{ {'action': compose_action, 'project_name': compose_project_name,
+        'project_directory': compose_project_directory | default('.'),
+        'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') if compose_observation_complete | default(false) else none,
+        'outcome': compose_outcome, 'observation_complete': compose_observation_complete | default(false),
+        'changed': compose_changed | default(false),
+        'ready': compose_ready if compose_action != 'remove' and compose_observation_complete | default(false) else none,
+        'phase': compose_phase, 'reason': compose_reason | default(none),
+        'files_written': compose_files_written | default([]),
+        'services': compose_observed_services | default([]),
+        'unexpected_containers': compose_unexpected_containers | default([]),
+        'networks': compose_observed_networks | default([]),
+        'volumes': compose_observed_volumes | default([]),
+        'removed_containers': compose_removed_containers | default([])} }}
+  no_log: true
+
+- name: Publish explicit unavailable facts when the complete envelope exceeds its bound
+  ansible.builtin.set_fact:
+    compose_outcome: unknown
+    compose_reason: compose_observation_limit
+    compose_result: >-
+      {{ compose_result | combine({'outcome': 'unknown', 'observation_complete': false, 'ready': none, 'observed_at': none,
+        'reason': 'compose_observation_limit', 'services': [], 'unexpected_containers': [],
+        'networks': [], 'volumes': []}) }}
+  when: "{'compose': compose_result} | to_json | length > 262144"
+  no_log: true
+
+- name: Publish exactly one final Compose result
+  ansible.builtin.debug:
+    msg: "TEMPLATE_OUTPUT_JSON={{ {'compose': compose_result} | to_json }}"
+
+- name: Publish actual final procedure progress
+  ansible.builtin.debug:
+    msg: >-
+      OPERATION_STEP={{ {'name': compose_phase, 'status': 'completed' if compose_outcome == 'succeeded' else 'failed',
+        'metadata': {'display_name': 'Compose procedure', 'reason_code': compose_reason | default(none)}} | to_json }}
+
+- name: Fail after available Compose facts are published
+  ansible.builtin.fail:
+    msg: Compose procedure could not establish the requested result. Review the reported native state before retrying.
+  when: compose_outcome != 'succeeded'
