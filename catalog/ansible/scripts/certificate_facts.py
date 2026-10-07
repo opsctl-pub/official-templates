@@ -366,11 +366,12 @@ def observe(args, hosts, trust=None):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
             facts["renewal"] = dict.fromkeys(("enabled", "active", "next_due_at"))
             facts["outcome"] = "incomplete"
-    deadline = time.monotonic() + 25
-    facts["hosts"] = [probe(host, facts["leaf_fingerprint_sha256"], trust,
-                            args.address, args.port, deadline) for host in hosts]
-    if any(host["served"] != "matched" or host["trusted"] is not True for host in facts["hosts"]):
-        facts["outcome"] = "failed"
+    if facts["presence"] != "absent":
+        deadline = time.monotonic() + 25
+        facts["hosts"] = [probe(host, facts["leaf_fingerprint_sha256"], trust,
+                                args.address, args.port, deadline) for host in hosts]
+        if any(host["served"] != "matched" or host["trusted"] is not True for host in facts["hosts"]):
+            facts["outcome"] = "failed"
     after, after_raw = selection(args.selection, args.root, args.subject)
     if after_raw != raw or snapshot(after) != snapshot(facts):
         raise ValueError("selection changed during observation")

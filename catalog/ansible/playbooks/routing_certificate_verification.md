@@ -125,7 +125,7 @@ Unknown never authorizes mutation. Material/trust keeps the existing256KiB bound
 | Item | Additional inputs and behavior |
 |---|---|
 | traefik_certificate_selection_observe | No expected snapshot/material. Selection only, hosts=[] in output, no serving claim. |
-| traefik_https_observe; traefik_custom_certificate_observe | Probe every requested host. Optional private trust_bundle_pem=null selects system trust; otherwise supplied trust. |
+| traefik_https_observe; traefik_custom_certificate_observe | Probe every requested host when a selection is present. Genuine absence skips SNI and returns full succeeded ABSENT facts with hosts=[]. Optional private trust_bundle_pem=null selects system trust; otherwise supplied trust. |
 | traefik_automatic_certificate | certificate_action=issue/retry/renew, expected snapshot, acme_email3..320, admitted HTTPS acme_directory_url, challenge=http-01/dns-01, renewal_enabled=true. HTTP requires null broker_url/broker_token_source_file. DNS requires approved broker_url, runner broker_token_source_file and existing dns_challenge_token_revision_id/dns_challenge_token_content_digest custody binding. |
 | traefik_automatic_certificate_retire | Expected snapshot. Disable only subject enrollment and remove matching automatic selection. Preserve custom/native selection and material; no account purge/revocation/sweep. |
 | traefik_custom_certificate_install | Deployment subject, material_id/revision_id/leaf_fingerprint_sha256, expected snapshot. certificate_source_dir defaults /var/run/opsctl/file-secret with protected tls.crt/tls.key; existing content_digest checked before delivery. |
@@ -134,6 +134,10 @@ Unknown never authorizes mutation. Material/trust keeps the existing256KiB bound
 
 Observe never creates directories, installs tools or mutates configuration.
 Missing tooling or unreadable/changed native references is unknown, not absence.
+Full observation rereads and compares the exact native selection before returning,
+including absence. Absent facts claim no serving, trust, material, validity or
+renewal. Backend absence acceptance defaults off; only ordinary HTTPS
+certificate_stage=before may consume it as not_configured, never HTTPS completion.
 
 ### Native Procedure And Overrides
 
