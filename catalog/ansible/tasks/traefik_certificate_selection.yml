@@ -196,7 +196,6 @@
   always:
     - name: Keep failed or unknown publication restoration as explicit liability
       ansible.builtin.set_fact:
-        certificate_selection_original_error: "{{ certificate_selection_error }}"
         certificate_selection_error: {phase: restore, code: restoration_failed}
       when:
         - not certificate_selection_succeeded

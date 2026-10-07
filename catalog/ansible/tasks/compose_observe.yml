@@ -195,7 +195,6 @@
           {%- endfor -%}
           {{ networks.values }}
         compose_network_inventory: "{{ compose_network_info.results }}"
-        compose_volume_inventory: "{{ compose_volume_info.results }}"
 
     - name: Project native volume incarnation origin and presence
       ansible.builtin.set_fact:

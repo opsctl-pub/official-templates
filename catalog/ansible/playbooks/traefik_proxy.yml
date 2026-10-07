@@ -94,8 +94,6 @@
                 and (traefik_dashboard_auth | default('') | length > 0))
                 or (challenge | default('http-01')) == 'dns-01'
               }}
-            traefik_dns01_broker_url: "{{ broker_url | default('') }}"
-            traefik_dns01_token_file: "{{ dns_challenge_token_file }}"
 
         - name: Enter qualified dashboard retirement after disabled runtime verification
           ansible.builtin.set_fact:

@@ -318,7 +318,6 @@
         state: absent
         keep_volumes: true
         stop_timeout: 10
-      register: container_remove
       when: container_inspect.rc == 0
       no_log: true
 

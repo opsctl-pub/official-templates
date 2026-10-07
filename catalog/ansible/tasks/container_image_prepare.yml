@@ -9,13 +9,6 @@
         pull_result: {}
       no_log: true
 
-    - name: Allocate private per-service Docker authentication
-      ansible.builtin.tempfile:
-        state: directory
-        prefix: opsctl-image-auth-
-      register: compose_image_auth_directory
-      when: compose_image_service is defined
-
     - name: OPERATION_STEP creds:check
       shell: |
         printf 'OPERATION_STEP={"name":"creds:check","status":"running","metadata":{"display_name":"Check registry credentials"}}\n'
@@ -50,28 +43,6 @@
         auth_is_mapping: false
       when: auth_content_raw | length == 0
 
-    - name: Require exact grouped registry Secret selection
-      ansible.builtin.assert:
-        that:
-          - auth is mapping
-          - auth.contract_version | default('') == 'compose-registry-v1'
-          - auth.services is mapping
-          - compose_image_service in auth.services
-          - auth.services[compose_image_service].image == app_image
-          - auth.services[compose_image_service].mode == app_compose_registry_access[compose_image_service].mode
-          - auth.services[compose_image_service].credential_id == app_compose_registry_access[compose_image_service].credential_id
-          - (auth.services[compose_image_service].mode == 'anonymous' and auth.services[compose_image_service].auth is none) or (auth.services[compose_image_service].mode == 'credential' and auth.services[compose_image_service].auth is mapping)
-        fail_msg: "Reviewed registry access is unavailable"
-      no_log: true
-      when: compose_image_service is defined
-
-    - name: Select only this reviewed service authentication
-      ansible.builtin.set_fact:
-        auth: "{{ auth.services[compose_image_service].auth | default({}, true) }}"
-        auth_is_mapping: "{{ app_compose_registry_access[compose_image_service].mode == 'credential' }}"
-      no_log: true
-      when: compose_image_service is defined
-
     - name: OPERATION_STEP creds:check complete
       shell: |
         printf 'OPERATION_STEP={"name":"creds:check","status":"completed","metadata":{"display_name":"Check registry credentials"}}\n'
@@ -90,7 +61,6 @@
         echo "{{ auth.token }}" | docker login "{{ auth.host }}" -u "{{ auth.username | default('oauth2') }}" --password-stdin >/dev/null 2>&1
       args:
         executable: /bin/sh
-      environment: "{{ {'DOCKER_CONFIG': compose_image_auth_directory.path} if compose_image_service is defined else {} }}"
       register: login_token_result
       failed_when: false
       changed_when: false
@@ -104,7 +74,6 @@
         echo "{{ auth.password }}" | docker login "{{ auth.host }}" -u "{{ auth.username }}" --password-stdin >/dev/null 2>&1
       args:
         executable: /bin/sh
-      environment: "{{ {'DOCKER_CONFIG': compose_image_auth_directory.path} if compose_image_service is defined else {} }}"
       register: login_user_result
       failed_when: false
       changed_when: false
@@ -208,7 +177,6 @@
         - name: Pull image "{{ app_image }}" from registry
           ansible.builtin.command:
             argv: [docker, pull, "{{ app_image }}"]
-          environment: "{{ {'DOCKER_CONFIG': compose_image_auth_directory.path} if compose_image_service is defined else {} }}"
           register: pull_result
           changed_when: true
           failed_when: pull_result.rc != 0
@@ -345,19 +313,9 @@
         - name: Docker logout after image preparation
           ansible.builtin.command:
             argv: [docker, logout, "{{ auth.host }}"]
-          environment: "{{ {'DOCKER_CONFIG': compose_image_auth_directory.path} if compose_image_service is defined else {} }}"
           no_log: true
           failed_when: false
           when:
             - auth_is_mapping | default(false)
             - auth.host is defined
             - auth_logout_required | default(false)
-  always:
-    - name: Remove private per-service authentication custody
-      ansible.builtin.file:
-        path: "{{ compose_image_auth_directory.path }}"
-        state: absent
-      no_log: true
-      when:
-        - compose_image_service is defined
-        - compose_image_auth_directory.path is defined
