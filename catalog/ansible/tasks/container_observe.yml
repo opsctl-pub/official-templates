@@ -1,0 +1,177 @@
+---
+- name: Initialize bounded image-runtime observation
+  ansible.builtin.set_fact:
+    image_observation_complete: true
+    image_observed_container: null
+    image_previous_absent: null
+    image_observed_volumes: []
+    image_observed_networks: []
+    image_runtime_ready: null
+  no_log: true
+
+- name: Observe image container and retained native resources
+  block:
+    - name: Bound native resource references
+      ansible.builtin.assert:
+        that:
+          - app_observe_volumes | default([]) | length <= 64
+          - app_observe_networks | default([]) | length <= 64
+          - image_runtime_action in ['deploy', 'inspect', 'remove']
+
+    - name: Inspect named image container
+      community.docker.docker_container_info:
+        name: "{{ app_container_name | default('app') }}"
+      register: image_container_info
+
+    - name: Validate present container facts
+      ansible.builtin.assert:
+        that:
+          - image_container_info.container.Id is match('^[0-9a-f]{64}$')
+          - image_container_info.container.State.Status in ['created', 'running', 'restarting', 'paused', 'exited', 'dead', 'removing']
+          - image_container_info.container.Config.Image is string
+          - image_container_info.container.Image is string
+      when: image_container_info.exists
+
+    - name: Observe the current image without pulling
+      community.docker.docker_image_info:
+        name: "{{ image_container_info.container.Image }}"
+      register: image_image_info
+      when: image_container_info.exists
+
+    - name: Require the observed image identity
+      ansible.builtin.assert:
+        that:
+          - image_image_info.images | length == 1
+          - image_image_info.images[0].Id == image_container_info.container.Image
+      when: image_container_info.exists
+
+    - name: Project safe instance fields
+      ansible.builtin.set_fact:
+        image_observed_container: >-
+          {% set ports = namespace(values=[]) %}
+          {% for key, bindings in (image_container_info.container.NetworkSettings.Ports | default({}, true)).items() %}
+          {% for binding in bindings | default([], true) %}
+          {% set ports.values = ports.values + [{'host_ip': binding.HostIp,
+            'host_port': binding.HostPort | int, 'container_port': key.split('/')[0] | int,
+            'protocol': key.split('/')[1]}] %}
+          {% endfor %}
+          {% endfor %}
+          {% set mounts = namespace(values=[]) %}
+          {% for mount in image_container_info.container.Mounts | default([]) %}
+          {% set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in
+            ['volume', 'bind', 'tmpfs'] else 'other', 'source': mount.Name | default(none)
+            if mount.Type == 'volume' else (mount.Source | default(none) if mount.Type == 'bind' else none),
+            'target': mount.Destination, 'read_only': not mount.RW}] %}
+          {% endfor %}
+          {% set digests = image_image_info.images[0].RepoDigests | default([], true) |
+            map('regex_replace', '^.*@', '') | unique | list %}
+          {{ {'id': image_container_info.container.Id,
+            'name': image_container_info.container.Name | regex_replace('^/', ''), 'replica': none,
+            'image_ref': image_container_info.container.Config.Image,
+            'image_id': image_container_info.container.Image,
+            'image_digest': digests[0] if digests | length == 1 else none,
+            'state': image_container_info.container.State.Status,
+            'health': image_container_info.container.State.Health.Status | default('none'),
+            'exit_code': image_container_info.container.State.ExitCode | default(none),
+            'ports': ports.values, 'mounts': mounts.values} }}
+      when: image_container_info.exists
+
+    - name: Bound safe instance detail
+      ansible.builtin.assert:
+        that:
+          - image_observed_container.ports | length <= 256
+          - image_observed_container.mounts | length <= 128
+          - image_observed_container.ports | map(attribute='protocol') | difference(['tcp', 'udp']) | length == 0
+      when: image_container_info.exists
+
+    - name: Inspect recorded predecessor by full identity
+      community.docker.docker_container_info:
+        name: "{{ app_previous_container_id }}"
+      register: image_previous_info
+      when: app_previous_container_id | default(none) is not none
+
+    - name: Record predecessor absence only after native observation
+      ansible.builtin.set_fact:
+        image_previous_absent: "{{ not image_previous_info.exists }}"
+      when: app_previous_container_id | default(none) is not none
+
+    - name: Observe all referenced volume incarnations and users
+      ansible.builtin.include_tasks:
+        file: container_observe_volume.yml
+        apply:
+          no_log: true
+      loop: "{{ app_observe_volumes | default([]) }}"
+      loop_control:
+        loop_var: observed_volume
+        label: retained volume
+
+    - name: Inspect referenced networks by full native identity
+      community.docker.docker_network_info:
+        name: "{{ observed_network.id }}"
+      loop: "{{ app_observe_networks | default([]) }}"
+      loop_control:
+        loop_var: observed_network
+        label: retained network
+      register: image_network_details
+
+    - name: Record network presence and actual attachments
+      ansible.builtin.set_fact:
+        image_observed_networks: >-
+          {{ image_observed_networks + [{'id': network_detail.observed_network.id,
+            'name': network_detail.observed_network.name,
+            'presence': 'absent' if not network_detail.exists else
+              ('present' if network_detail.network.Id == network_detail.observed_network.id and
+               network_detail.network.Name == network_detail.observed_network.name else 'unknown'),
+            'containers': (network_detail.network.Containers | default({}, true)).keys() | list | sort
+              if network_detail.exists else []}] }}
+      loop: "{{ image_network_details.results }}"
+      loop_control:
+        loop_var: network_detail
+        label: retained network
+
+    - name: Bound observed network attachments
+      ansible.builtin.assert:
+        that: image_network.containers | length <= 128
+      loop: "{{ image_observed_networks }}"
+      loop_control:
+        loop_var: image_network
+        label: retained network
+
+    - name: Record current image readiness
+      ansible.builtin.set_fact:
+        image_runtime_ready: >-
+          {{ image_container_info.exists and image_observed_container.state == 'running' and
+             image_observed_container.health in ['none', 'healthy'] }}
+      when: image_runtime_action != 'remove'
+  rescue:
+    - name: Mark native observation incomplete
+      ansible.builtin.set_fact:
+        image_observation_complete: false
+        image_runtime_ready: null
+  no_log: true
+
+- name: Assemble plain bounded image-runtime facts
+  ansible.builtin.set_fact:
+    image_runtime: >-
+      {{ {'action': image_runtime_action,
+        'observation_complete': image_observation_complete and
+          image_observed_volumes | selectattr('presence', 'equalto', 'unknown') | list | length == 0 and
+          image_observed_networks | selectattr('presence', 'equalto', 'unknown') | list | length == 0,
+        'ready': image_runtime_ready, 'container': image_observed_container,
+        'previous_container_absent': image_previous_absent,
+        'volumes': image_observed_volumes, 'networks': image_observed_networks} }}
+  no_log: true
+
+- name: Clear unavailable readiness without inventing a workload result
+  ansible.builtin.set_fact:
+    image_runtime: "{{ image_runtime | combine({'ready': none}) }}"
+  when: not image_runtime.observation_complete
+  no_log: true
+
+- name: Retain explicit unavailable image facts when the full envelope exceeds its bound
+  ansible.builtin.set_fact:
+    image_runtime: >-
+      {{ image_runtime | combine({'observation_complete': false, 'ready': none,
+        'container': none, 'volumes': [], 'networks': []}) }}
+  when: "{'image_runtime': image_runtime} | to_json | length > 262144"
+  no_log: true

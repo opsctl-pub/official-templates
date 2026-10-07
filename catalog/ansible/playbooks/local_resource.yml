@@ -1,29 +1,359 @@
 ---
-- name: Converge one exact managed local resource
+- name: Observe or converge one native local resource
   hosts: all
   gather_facts: false
   become: true
+  vars:
+    resource_driver: "{{ local_resource_driver | default('local' if local_resource_kind == 'volume' else 'bridge') }}"
   pre_tasks:
-    - name: Skip local resource effects in simulate mode
+    - name: End simulation before any native effect
       ansible.builtin.meta: end_play
       when: simulate | default(false)
-    - name: Require the closed local resource contract
-      ansible.builtin.assert:
-        that:
-          - local_resource is mapping
-          - local_resource.protocol == 'opsctl-local-resource/1'
-          - local_resource.server_id == server_id
-          - local_resource.organization_id == org_id
-        fail_msg: "Local resource identity is invalid"
   tasks:
-    - name: Observe or converge exact owned local allocation
-      ansible.builtin.script:
-        cmd: >-
-          {{ playbook_dir }}/../scripts/local_resource.py
-          --request {{ (local_resource | to_json | b64encode) | quote }}
-        executable: python3
-      register: local_resource_result
-      changed_when: (local_resource_result.stdout | from_json).changed
-    - name: Emit typed local resource observation
+    - name: Initialize unavailable resource facts
+      ansible.builtin.set_fact:
+        resource_presence: unknown
+        resource_incarnation: null
+        resource_native_driver: null
+        resource_attachment_count: null
+        resource_changed: false
+        resource_outcome: incomplete
+        resource_reason: local_resource_observation_incomplete
+        resource_accounting:
+          observed_used_bytes: null
+          observed_free_bytes: null
+      no_log: true
+
+    - name: Perform the bounded native resource procedure
+      block:
+        - name: Validate public native resource intent
+          ansible.builtin.assert:
+            that:
+              - local_resource_kind in ['volume', 'network']
+              - local_resource_action in ['create', 'inspect', 'remove']
+              - local_resource_name is string
+              - local_resource_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$')
+              - resource_driver is string
+              - resource_driver == ('local' if local_resource_kind == 'volume' else 'bridge')
+              - local_resource_labels is mapping
+              - local_resource_action != 'remove' or local_resource_expected_incarnation | default(none) is not none
+
+        - name: Observe native volume
+          community.docker.docker_volume_info:
+            name: "{{ local_resource_name }}"
+          register: resource_volume
+          when: local_resource_kind == 'volume'
+
+        - name: Observe native network
+          community.docker.docker_network_info:
+            name: "{{ local_resource_name }}"
+          register: resource_network
+          when: local_resource_kind == 'network'
+
+        - name: Retain actual native resource observation
+          ansible.builtin.set_fact:
+            resource_exists: "{{ resource_volume.exists if local_resource_kind == 'volume' else resource_network.exists }}"
+            resource_native: "{{ resource_volume.volume if local_resource_kind == 'volume' else resource_network.network }}"
+
+        - name: Record native presence before qualification
+          ansible.builtin.set_fact:
+            resource_presence: "{{ 'present' if resource_exists else 'absent' }}"
+            resource_incarnation: >-
+              {{ (resource_native.CreatedAt | default(none) if local_resource_kind == 'volume' else resource_native.Id)
+                if resource_exists else none }}
+            resource_native_driver: "{{ resource_native.Driver if resource_exists and resource_native.Driver in ['local', 'bridge'] else none }}"
+            resource_reason: local_resource_identity_changed
+
+        - name: Require supplied labels driver and recorded incarnation
+          ansible.builtin.assert:
+            that:
+              - resource_native.Name == local_resource_name
+              - resource_native.Driver == resource_driver
+              - resource_native.Labels | default({}, true) == local_resource_labels
+              - local_resource_expected_incarnation | default(none) is none or resource_incarnation == local_resource_expected_incarnation
+          when: resource_exists
+
+        - name: Refuse recreating a missing recorded incarnation
+          ansible.builtin.assert:
+            that: local_resource_expected_incarnation | default(none) is none
+          when: not resource_exists and local_resource_action == 'create'
+
+        - name: Select execution failure before creation
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_execution_failed
+
+        - name: Mark qualified absence unavailable until creation is reobserved
+          ansible.builtin.set_fact:
+            resource_presence: unknown
+          when: not resource_exists and local_resource_action == 'create'
+
+        - name: Create only a missing native volume
+          community.docker.docker_volume:
+            name: "{{ local_resource_name }}"
+            driver: "{{ resource_driver }}"
+            labels: "{{ local_resource_labels }}"
+            state: present
+            recreate: never
+          register: resource_volume_create
+          when: not resource_exists and local_resource_kind == 'volume' and local_resource_action == 'create'
+
+        - name: Create only a missing native network without detaching containers
+          ansible.builtin.command:
+            argv: >-
+              {%- set command = ['docker', 'network', 'create', '--driver', resource_driver] -%}
+              {%- for label in local_resource_labels | dictsort -%}
+              {%- set _ = command.extend(['--label', label.0 ~ '=' ~ label.1]) -%}
+              {%- endfor -%}
+              {{ command + ['--', local_resource_name] }}
+          register: resource_network_create
+          changed_when: resource_network_create.rc == 0
+          when: not resource_exists and local_resource_kind == 'network' and local_resource_action == 'create'
+
+        - name: Record actual creation effects
+          ansible.builtin.set_fact:
+            resource_changed: "{{ resource_volume_create.changed | default(false) or resource_network_create.changed | default(false) }}"
+            resource_reason: local_resource_observation_incomplete
+
+        - name: Require the native network creation identity
+          ansible.builtin.assert:
+            that:
+              - resource_network_create.stdout | trim is match('^[a-f0-9]{64}$')
+          when: resource_network_create is not skipped
+
+        - name: Observe volume after possible creation
+          community.docker.docker_volume_info:
+            name: "{{ local_resource_name }}"
+          register: resource_volume
+          when: local_resource_kind == 'volume'
+
+        - name: Observe network after possible creation
+          community.docker.docker_network_info:
+            name: "{{ local_resource_name }}"
+          register: resource_network
+          when: local_resource_kind == 'network'
+
+        - name: Retain fresh native object
+          ansible.builtin.set_fact:
+            resource_exists: "{{ resource_volume.exists if local_resource_kind == 'volume' else resource_network.exists }}"
+            resource_native: "{{ resource_volume.volume if local_resource_kind == 'volume' else resource_network.network }}"
+
+        - name: Record fresh presence and incarnation
+          ansible.builtin.set_fact:
+            resource_presence: "{{ 'present' if resource_exists else 'absent' }}"
+            resource_incarnation: >-
+              {{ (resource_native.CreatedAt | default(none) if local_resource_kind == 'volume' else resource_native.Id)
+                if resource_exists else none }}
+            resource_native_driver: "{{ resource_native.Driver if resource_exists and resource_native.Driver in ['local', 'bridge'] else none }}"
+            resource_reason: local_resource_identity_changed
+
+        - name: Recheck identity after possible creation
+          ansible.builtin.assert:
+            that:
+              - resource_native.Name == local_resource_name
+              - resource_native.Driver == resource_driver
+              - resource_native.Labels | default({}, true) == local_resource_labels
+              - local_resource_expected_incarnation | default(none) is none or resource_incarnation == local_resource_expected_incarnation
+          when: resource_exists
+
+        - name: Require create to yield an observed native object
+          ansible.builtin.assert:
+            that: resource_exists
+          when: local_resource_action == 'create'
+
+        - name: Require the exact newly created network after native observation
+          ansible.builtin.assert:
+            that:
+              - resource_exists
+              - resource_native.Id == resource_network_create.stdout | trim
+              - resource_native.Name == local_resource_name
+              - resource_native.Driver == resource_driver
+              - resource_native.Labels | default({}, true) == local_resource_labels
+          when: resource_network_create is not skipped
+
+        - name: Select incomplete observation before counting users
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_observation_incomplete
+
+        - name: Observe stopped and running volume users
+          community.docker.docker_host_info:
+            containers: true
+            containers_all: true
+            containers_filters:
+              volume: "{{ local_resource_name }}"
+          register: resource_users
+          when: local_resource_kind == 'volume'
+
+        - name: Bound observed resource users
+          ansible.builtin.assert:
+            that: resource_users.containers | length <= 128
+          when: local_resource_kind == 'volume'
+
+        - name: Retain actual attachment count
+          ansible.builtin.set_fact:
+            resource_attachment_count: >-
+              {{ resource_users.containers | length if local_resource_kind == 'volume' else
+                ((resource_native.Containers | default({}, true)) | length if resource_exists else 0) }}
+            resource_reason: local_resource_in_use
+
+        - name: Require no users before deleting a present resource
+          ansible.builtin.assert:
+            that: resource_attachment_count == 0
+          when: resource_exists and local_resource_action == 'remove'
+
+        - name: Select execution failure before deletion
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_execution_failed
+
+        - name: Recheck volume incarnation immediately before deletion
+          community.docker.docker_volume_info:
+            name: "{{ local_resource_name }}"
+          register: resource_volume_final
+          when: resource_exists and local_resource_action == 'remove' and local_resource_kind == 'volume'
+
+        - name: Recheck network incarnation immediately before deletion
+          community.docker.docker_network_info:
+            name: "{{ resource_incarnation }}"
+          register: resource_network_final
+          when: resource_exists and local_resource_action == 'remove' and local_resource_kind == 'network'
+
+        - name: Select changed-identity refusal before the final comparison
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_identity_changed
+          when: resource_exists and local_resource_action == 'remove'
+
+        - name: Require the previously qualified object at deletion
+          ansible.builtin.assert:
+            that:
+              - resource_volume_final.exists if local_resource_kind == 'volume' else resource_network_final.exists
+              - >-
+                (resource_volume_final.volume.CreatedAt == resource_incarnation and
+                 resource_volume_final.volume.Driver == resource_driver and
+                 resource_volume_final.volume.Labels | default({}, true) == local_resource_labels)
+                if local_resource_kind == 'volume' else
+                (resource_network_final.network.Id == resource_incarnation and
+                 resource_network_final.network.Name == local_resource_name and
+                 resource_network_final.network.Driver == resource_driver and
+                 resource_network_final.network.Labels | default({}, true) == local_resource_labels and
+                 resource_network_final.network.Containers | default({}, true) | length == 0)
+          when: resource_exists and local_resource_action == 'remove'
+
+        - name: Select execution failure for the qualified removal
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_execution_failed
+
+        - name: Remove the qualified unused volume retaining Docker in-use refusal
+          community.docker.docker_volume:
+            name: "{{ local_resource_name }}"
+            state: absent
+          register: resource_volume_remove
+          when: resource_exists and local_resource_kind == 'volume' and local_resource_action == 'remove'
+
+        - name: Remove the qualified network without forced detachment
+          ansible.builtin.command:
+            argv: [docker, network, rm, --, "{{ resource_incarnation }}"]
+          register: resource_network_remove
+          changed_when: resource_network_remove.rc == 0
+          when: resource_exists and local_resource_kind == 'network' and local_resource_action == 'remove'
+
+        - name: Preserve observed removal effects
+          ansible.builtin.set_fact:
+            resource_changed: >-
+              {{ resource_changed or resource_volume_remove.changed | default(false) or
+                resource_network_remove.changed | default(false) }}
+            resource_reason: local_resource_observation_incomplete
+
+        - name: Reobserve removed volume by its exact name
+          community.docker.docker_volume_info:
+            name: "{{ local_resource_name }}"
+          register: resource_volume_removed
+          when: local_resource_action == 'remove' and local_resource_kind == 'volume'
+
+        - name: Reobserve removed network by its exact name
+          community.docker.docker_network_info:
+            name: "{{ local_resource_name }}"
+          register: resource_network_removed
+          when: local_resource_action == 'remove' and local_resource_kind == 'network'
+
+        - name: Require actual resource absence
+          ansible.builtin.assert:
+            that: not (resource_volume_removed.exists if local_resource_kind == 'volume' else resource_network_removed.exists)
+          when: local_resource_action == 'remove'
+
+        - name: Record confirmed absence without fabricated incarnation or driver
+          ansible.builtin.set_fact:
+            resource_presence: absent
+            resource_incarnation: null
+            resource_native_driver: null
+            resource_attachment_count: 0
+          when: local_resource_action == 'remove'
+
+        - name: Account only the module-observed local volume mountpoint
+          ansible.builtin.script:
+            cmd: >-
+              {{ playbook_dir }}/../scripts/local_volume_usage.py
+              {{ resource_native.Mountpoint | quote }}
+            executable: python3
+          register: resource_usage
+          changed_when: false
+          when:
+            - local_resource_kind == 'volume'
+            - local_resource_action != 'remove'
+            - resource_exists
+            - resource_native.Driver == 'local'
+
+        - name: Retain nullable capacity observations
+          ansible.builtin.set_fact:
+            resource_accounting: "{{ resource_usage.stdout | from_json }}"
+          when: resource_usage is not skipped
+
+        - name: Reobserve accounted volume incarnation
+          community.docker.docker_volume_info:
+            name: "{{ local_resource_name }}"
+          register: resource_volume_accounted
+          when: resource_usage is not skipped
+
+        - name: Select changed-identity refusal for accounting revalidation
+          ansible.builtin.set_fact:
+            resource_reason: local_resource_identity_changed
+          when: resource_usage is not skipped
+
+        - name: Refuse changed resource identity after accounting
+          ansible.builtin.assert:
+            that:
+              - resource_volume_accounted.exists
+              - resource_volume_accounted.volume.CreatedAt == resource_incarnation
+              - resource_volume_accounted.volume.Driver == resource_driver
+              - resource_volume_accounted.volume.Labels | default({}, true) == local_resource_labels
+          when: resource_usage is not skipped
+
+        - name: Record successful native procedure
+          ansible.builtin.set_fact:
+            resource_outcome: succeeded
+            resource_reason: null
+      rescue:
+        - name: Preserve safe partial failure without native error text
+          ansible.builtin.set_fact:
+            resource_outcome: "{{ 'incomplete' if resource_reason == 'local_resource_observation_incomplete' else 'failed' }}"
+            resource_changed: >-
+              {{ resource_changed or resource_volume_create.changed | default(false) or
+                resource_network_create.changed | default(false) or resource_volume_remove.changed | default(false) or
+                resource_network_remove.changed | default(false) }}
+      no_log: true
+
+    - name: Emit plain resource facts associated with this executing operation
       ansible.builtin.debug:
-        msg: "TEMPLATE_OUTPUT_JSON={{ {'local_resource': (local_resource_result.stdout | from_json)} | to_json }}"
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'local_resource': {
+            'kind': local_resource_kind, 'action': local_resource_action, 'name': local_resource_name,
+            'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'), 'outcome': resource_outcome,
+            'presence': resource_presence, 'incarnation': resource_incarnation,
+            'driver': resource_native_driver, 'changed': resource_changed,
+            'attachment_count': resource_attachment_count,
+            'observed_used_bytes': resource_accounting.observed_used_bytes,
+            'observed_free_bytes': resource_accounting.observed_free_bytes,
+            'quota_enforced': false, 'reason_code': resource_reason}} | to_json }}
+
+    - name: Fail after available resource facts have been emitted
+      ansible.builtin.fail:
+        msg: Local resource procedure could not establish the requested result. Review the reported native state.
+      when: resource_outcome != 'succeeded'

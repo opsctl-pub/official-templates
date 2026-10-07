@@ -1,0 +1,35 @@
+---
+- name: Inspect one native Compose project without source or registry access
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Initialize read-only procedure outcome
+      ansible.builtin.set_fact:
+        compose_action: inspect
+        compose_phase: compose:observe
+        compose_outcome: unknown
+        compose_reason: null
+        compose_changed: false
+      no_log: true
+
+    - name: Publish completed preparation progress
+      ansible.builtin.debug:
+        msg: 'OPERATION_STEP={"name":"compose:prepare","status":"completed","metadata":{"display_name":"Prepare native inspection"}}'
+
+    - name: Publish observation progress
+      ansible.builtin.debug:
+        msg: 'OPERATION_STEP={"name":"compose:observe","status":"running","metadata":{"display_name":"Inspect Compose project"}}'
+
+    - name: Observe all native project and recorded resource facts
+      ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+    - name: Record successful complete read independently of readiness
+      ansible.builtin.set_fact:
+        compose_outcome: "{{ 'succeeded' if compose_observation_complete else 'unknown' }}"
+        compose_phase: "{{ 'compose:complete' if compose_observation_complete else 'compose:observe' }}"
+        compose_reason: "{{ none if compose_observation_complete else compose_reason }}"
+      no_log: true
+
+    - name: Publish final plain inspection facts
+      ansible.builtin.include_tasks: ../tasks/compose_publish.yml

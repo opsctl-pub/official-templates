@@ -300,3 +300,15 @@
         printf 'OPERATION_STEP={"name":"inspect:result","status":"completed","metadata":%s}\n' '{{ inspect_result | combine({"display_name": "Inspection complete"}) | to_json }}'
       args:
         executable: /bin/sh
+
+    - name: Observe every ordinary image runtime without adopting label candidates
+      ansible.builtin.include_tasks:
+        file: ../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: inspect
+
+    - name: Publish managed native facts separately from inspection display metadata
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"

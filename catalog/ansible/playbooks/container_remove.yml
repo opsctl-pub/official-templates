@@ -25,19 +25,6 @@
           - expected_image_ref is none or (expected_image_ref is string and expected_image_ref | length > 0)
         fail_msg: "Managed container removal identity is invalid"
 
-    - name: Validate opt-in local removal identity
-      assert:
-        that:
-          - app_local_runtime is mapping
-          - app_local_runtime.protocol == 'opsctl-local-runtime/1'
-          - app_local_runtime.action == 'remove'
-          - app_local_runtime.organization_id == expected_org_id
-          - app_local_runtime.deployment_id == expected_deployment_id
-          - app_local_runtime.server_id == server_id
-          - app_local_runtime.container_name == container_name
-        fail_msg: "Local removal requires exact managed identity"
-      when: app_local_runtime is defined
-
     - name: OPERATION_STEP remove:start
       shell: |
         printf 'OPERATION_STEP={"name":"remove:start","status":"running","metadata":{"display_name":"Remove container","container_name":{{ container_name | to_json }}}}\n'
@@ -113,6 +100,15 @@
           - expected_image_ref is none or container_payload.Config.Image == expected_image_ref
         fail_msg: "Refusing to remove a container without exact OpsCtl ownership"
       when: container_inspect.rc == 0
+      no_log: true
+
+    - name: Require the recorded managed predecessor or qualified absence
+      ansible.builtin.assert:
+        that:
+          - app_previous_container_id is none or app_previous_container_id is match('^[0-9a-f]{64}$')
+          - container_absent or (app_previous_container_id is not none and container_payload.Id == app_previous_container_id)
+        fail_msg: Managed container identity changed. Refresh its observation before removal.
+      when: app_previous_container_id is defined
       no_log: true
 
     - name: Observe explicitly qualified whole-deployment route
@@ -497,32 +493,15 @@
         fail_msg: "Connection drain inspected container identity changed"
       when: app_connection_drain is defined and not container_absent
 
-    - name: Bind Compose removal to the same canonical drain incarnation
-      assert:
-        that:
-          - app_local_runtime.previous.container_id == app_connection_drain.receipt.runtime.container_id
-          - app_local_runtime.previous.revision_id == app_connection_drain.contract.revision_id
-          - container_absent or app_local_runtime.previous.container_id == container_payload.Id
-        fail_msg: "Compose removal and drain receipt must name the same incarnation"
-      when: app_local_runtime is defined and app_connection_drain is defined
-
-    - name: Remove the shared reviewed Compose deployment
-      ansible.builtin.include_tasks:
-        file: "{{ playbook_dir }}/../tasks/container_compose.yml"
-        apply:
-          no_log: true
-      when: app_local_runtime is defined
-
     - name: Remove inspected immutable container identity
-      command:
-        argv:
-          - docker
-          - rm
-          - -f
-          - "{{ container_payload.Id }}"
+      community.docker.docker_container:
+        name: "{{ container_payload.Id }}"
+        state: absent
+        keep_volumes: true
+        stop_timeout: 10
       register: container_remove
-      changed_when: container_remove.rc == 0
-      when: container_inspect.rc == 0 and app_local_runtime is not defined
+      when: container_inspect.rc == 0
+      no_log: true
 
     - name: Record exact whole-final route retirement evidence
       set_fact:
@@ -592,72 +571,40 @@
       no_log: true
 
     - name: Assemble complete verified removal output
-      command:
-        argv:
-          - python3
-          - -c
-          - |
-            import json, sys
+      ansible.builtin.set_fact:
+        verified_removal_output: >-
+          {{ ({'route_retirement': removal_route_receipt} if app_route_retirement is defined else {}) |
+            combine((drain_removal_output.stdout | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json)
+              if app_connection_drain is defined else {}) }}
+      no_log: true
 
-            def registered(text, key):
-                lines = text.strip().splitlines()
-                prefix = 'TEMPLATE_OUTPUT_JSON='
-                if len(lines) != 1 or not lines[0].startswith(prefix):
-                    raise ValueError()
-                envelope = json.loads(lines[0][len(prefix):])
-                if not isinstance(envelope, dict) or set(envelope) != {key}:
-                    raise ValueError()
-                value = envelope[key]
-                if not isinstance(value, dict):
-                    raise ValueError()
-                return value
+    - name: Observe retained native resources and exact predecessor absence
+      ansible.builtin.include_tasks:
+        file: ../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: remove
 
-            try:
-                request = json.loads(sys.argv[2])
-                route = json.loads(sys.argv[3])
-                drain_required = json.loads(sys.argv[5])
-                output = {}
-                if request:
-                    proof = registered(sys.argv[1], 'local_runtime')
-                    if (proof.get('protocol') != 'opsctl-local-runtime/1'
-                            or proof.get('presence') != 'absent' or proof.get('ready') is not False
-                            or any(proof.get(key) != request[key] for key in (
-                                'organization_id', 'deployment_id', 'server_id', 'operation_id', 'revision_id'))
-                            or proof.get('container_id') != request['previous']['container_id']
-                            or not isinstance(proof.get('attachments'), list)
-                            or not isinstance(proof.get('detached_attachments', []), list)):
-                        raise ValueError()
-                    output['local_runtime'] = proof
-                elif sys.argv[1]:
-                    raise ValueError()
-                if route:
-                    if (not isinstance(route, dict) or set(route) != {'version', 'identity', 'observation'}
-                            or type(route['version']) is not int or route['version'] != 1
-                            or not isinstance(route['identity'], dict) or not isinstance(route['observation'], dict)):
-                        raise ValueError()
-                    output['route_retirement'] = route
-                if drain_required:
-                    receipt = registered(sys.argv[4], 'connection_drain_removal')
-                    if set(receipt) != {'contract_digest', 'container_id', 'absent'} or receipt['absent'] is not True:
-                        raise ValueError()
-                    output['connection_drain_removal'] = receipt
-                elif sys.argv[4]:
-                    raise ValueError()
-                if output:
-                    print('TEMPLATE_OUTPUT_JSON=' + json.dumps(output, separators=(',', ':')))
-            except Exception:
-                print('Canonical removal output is invalid.', file=sys.stderr)
-                raise SystemExit(1)
-          - "{{ compose_transition.stdout | default('') if app_local_runtime is defined else '' }}"
-          - "{{ (app_local_runtime if app_local_runtime is defined else {}) | to_json }}"
-          - "{{ removal_route_receipt | default({}) | to_json }}"
-          - "{{ drain_removal_output.stdout | default('') if app_connection_drain is defined else '' }}"
-          - "{{ (app_connection_drain is defined) | to_json }}"
-      register: verified_removal_output
-      changed_when: false
+    - name: Add plain image facts without replacing separate routing and drain outputs
+      ansible.builtin.set_fact:
+        verified_removal_output: "{{ verified_removal_output | combine({'image_runtime': image_runtime}) }}"
+      no_log: true
+
+    - name: Bound complete removal output
+      ansible.builtin.assert:
+        that: verified_removal_output | to_json | length <= 262144
+        fail_msg: Native removal observation exceeds the supported output limit.
       no_log: true
 
     - name: Return complete verified removal output
-      debug:
-        msg: "{{ verified_removal_output.stdout }}"
-      when: verified_removal_output.stdout | length > 0
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ verified_removal_output | to_json }}"
+
+    - name: Refuse unqualified removal observation after publishing available facts
+      ansible.builtin.assert:
+        that:
+          - image_runtime.observation_complete
+          - image_runtime.container is none
+          - image_runtime.previous_container_absent is none or image_runtime.previous_container_absent
+        fail_msg: Native removal observation is incomplete. Retained resources remain referenced.
