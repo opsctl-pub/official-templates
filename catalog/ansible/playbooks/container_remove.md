@@ -10,7 +10,10 @@ item, never this procedure.
 The existing inventory/SSH target and privilege escalation apply. Required
 variables are `app_managed=true`, `app_container_name`, `app_org_id`,
 `app_deployment_id`, and `app_slug`. The organization and deployment are canonical
-UUIDs. The container must have the matching existing `com.opsctl.*` labels.
+UUIDs. The container must have exactly matching ownership values:
+`com.opsctl.managed=true`, `com.opsctl.org_id=app_org_id`,
+`com.opsctl.deployment_id=app_deployment_id`, and `com.opsctl.app=app_slug`.
+Additional labels are not removal authority and need not be absent.
 `app_expected_image_ref` defaults to null; a value must equal the observed
 container's configured image reference.
 

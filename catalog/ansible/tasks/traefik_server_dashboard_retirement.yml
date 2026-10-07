@@ -23,9 +23,10 @@
             certificate_observation | dict2items |
             selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
             items2dict == expected_certificate
+      when: not (certificate_dashboard_retirement | default(false))
 
     - name: Require the actual Server dashboard route absent before dashboard retirement
-      when: certificate_dashboard_retirement | default(true)
+      when: certificate_dashboard_retirement | default(false)
       block:
         - name: Require exact Server subject and local dashboard route reference
           ansible.builtin.assert:
@@ -33,6 +34,8 @@
               - certificate_subject.type == 'server'
               - certificate_subject.id == server_id
               - traefik_dashboard_route_file == traefik_dynamic_dir ~ '/server-dashboard-' ~ server_id ~ '.yml'
+              - certificate_observation.outcome == 'succeeded'
+              - certificate_observation.presence in ['present', 'absent']
 
         - name: Observe dashboard route without following a link
           ansible.builtin.stat:
@@ -82,6 +85,27 @@
       retries: 126
       delay: 10
       when: certificate_retire_service_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Reobserve the Server selection after renewal has quiesced
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
+      when: certificate_dashboard_retirement | default(false)
+
+    - name: Require known current Server selection before freezing retirement CAS
+      ansible.builtin.assert:
+        that:
+          - certificate_observation.outcome == 'succeeded'
+          - certificate_observation.presence in ['present', 'absent']
+      when: certificate_dashboard_retirement | default(false)
+
+    - name: Freeze the quiescent Server selection for existing strict removal CAS
+      ansible.builtin.set_fact:
+        expected_certificate: >-
+          {{ certificate_observation | dict2items |
+            selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+            items2dict }}
+      when: certificate_dashboard_retirement | default(false)
 
     - name: Remove only the still-matching automatic selection
       ansible.builtin.include_tasks: traefik_certificate_selection.yml
@@ -140,6 +164,28 @@
       ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
       vars:
         certificate_probe_hosts: false
+
+    - name: Keep final unavailable or changed selection from inheriting retirement success
+      ansible.builtin.set_fact:
+        certificate_retirement_succeeded: false
+        certificate_automatic_retired: null
+        certificate_retirement_error: {phase: observe, code: certificate_state_changed}
+      when: >-
+        certificate_retirement_succeeded and
+        (certificate_observation.outcome != 'succeeded' or
+         certificate_observation.presence not in ['present', 'absent'] or
+         certificate_observation.source == 'automatic' or
+         (expected_certificate.source != 'automatic' and
+          (certificate_observation | dict2items |
+           selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+           items2dict != expected_certificate)))
+
+    - name: Retain corroborated disabled enrollment for actual final absence
+      ansible.builtin.set_fact:
+        certificate_observation: >-
+          {{ certificate_observation | combine({'renewal':
+            {'enabled': false, 'active': false, 'next_due_at': none}}) }}
+      when: certificate_retirement_succeeded and certificate_observation.presence == 'absent'
 
     - name: Add independently observed retirement and original failure
       ansible.builtin.set_fact:

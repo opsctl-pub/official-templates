@@ -56,6 +56,13 @@ refuse; image-backed build metadata is retained without executing a build.
 File delivery alone does not promise a reload/restart. Platform/native failures can
 leave partial effects; there is no automatic rollback or application-data deletion.
 
+Readiness intent collects incoming dependency conditions across selected resolved
+services: zero replicas takes precedence as scaled_down, then a completion
+dependency selects completed, then a healthy dependency or enabled own healthcheck
+selects healthy, otherwise running. `disable:true` or `test: ["NONE"]` disables
+only the own check. `allow_completion` requires restart absent/empty/`no` and no
+incoming conditions; it is not inferred from a service's outgoing dependencies.
+
 Observe every replica. Running requires actual healthy status when Docker exposes
 inherited health; explicit native disablement follows Docker. Completed dependencies
 require exited/zero. `allow_completion=true` permits restart-disabled standalone
