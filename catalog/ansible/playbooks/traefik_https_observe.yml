@@ -1,109 +1,19 @@
 ---
-- name: Observe automatic HTTPS for one managed Traefik deployment route
+- name: Observe one subject's selected and actually served certificate
   hosts: all
   gather_facts: false
   become: true
-  vars:
-    traefik_container_name: traefik
-    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
-    traefik_certificate_dir: /etc/traefik/certificates/opsctl
-    traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
-    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
-    route_key: "deployment-{{ deployment_id }}"
-  pre_tasks:
-    - name: Validate HTTPS observation identity
-      ansible.builtin.assert:
-        that:
-          - adapter_key in ['traefik_acme_http01', 'traefik_acme_dns01']
-          - certificate_mode == 'automatic'
-          - challenge_type == ('dns-01' if adapter_key == 'traefik_acme_dns01' else 'http-01')
-          - renewal_due_days == 30
-          - org_id is string
-          - org_id == (org_id | trim)
-          - (org_id | length) > 0
-          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - route_hosts is sequence
-          - route_hosts is not string
-          - (route_hosts | length) > 0
-          - (route_hosts | length) <= 100
-          - route_hosts == (route_hosts | unique | sort | list)
-          - (route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (route_hosts | length)
-          - not (simulate | default(false) | bool)
-        fail_msg: HTTPS observation identity is invalid
   tasks:
-    - name: Initialize bounded unknown observation
-      ansible.builtin.set_fact:
-        certificate_observation_base:
-          adapter_key: "{{ adapter_key }}"
-          mode: automatic
-          route_hosts: "{{ route_hosts }}"
-          challenge_type: "{{ challenge_type }}"
-          issuer_configured: false
-          certificate_bound: false
-          status: unknown
-          hosts: []
-          observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
-      no_log: true
+    - name: Read native certificate facts without mutation
+      ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
 
-    - name: Initialize unknown per-host evidence
-      ansible.builtin.set_fact:
-        certificate_observation_base: >-
-          {{ certificate_observation_base | combine({'hosts': certificate_observation_base.hosts +
-             [{'hostname': item, 'status': 'unknown', 'trusted': none, 'fingerprint_sha256': none,
-               'not_before': none, 'not_after': none, 'renewal_due': none}]}) }}
-      loop: "{{ route_hosts }}"
-      no_log: true
-
-    - name: Initialize deterministic unknown digest
-      ansible.builtin.set_fact:
-        certificate_observation: >-
-          {{ certificate_observation_base | combine({'digest': certificate_observation_base
-             | to_json(sort_keys=True, separators=[',', ':']) | hash('sha256')}) }}
-      no_log: true
-
-    - name: Read file-selection enrollment and actual SNI evidence
-      no_log: true
-      block:
-        - name: Read exact managed deployment route
-          ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/traefik_route_observation.yml"
-
-        - name: Execute transient read-only certificate observer
-          ansible.builtin.script:
-            cmd: >-
-              ../scripts/traefik_automatic_certificate_observation.py
-              {{ {'identity': {'organization_id': org_id, 'subject': {'type': 'deployment', 'id': deployment_id},
-                               'gateway_id': gateway_id, 'server_id': server_id, 'route_hosts': route_hosts},
-                   'adapter_key': adapter_key, 'challenge_type': challenge_type, 'renewal_due_days': renewal_due_days,
-                   'container_name': traefik_container_name, 'route_router': route_router | default(none),
-                   'route_observation': route_observation} | to_json | quote }}
-            executable: python3
-          environment:
-            PYTHONPATH: "{{ traefik_acme_state_dir }}/runtime"
-            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-          register: file_observation
-          changed_when: false
-
-        - name: Validate bounded normalized observer output
-          ansible.builtin.assert:
-            that:
-              - file_observation.stdout is string
-              - file_observation.stdout | length <= 65536
-              - file_observation.stdout | trim is match('^TEMPLATE_OUTPUT_JSON=')
-            fail_msg: Automatic certificate observation is invalid
-
-        - name: Use normalized selected-file observation
-          ansible.builtin.set_fact:
-            certificate_observation: "{{ (file_observation.stdout | trim | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).certificate_observation }}"
-      rescue:
-        - name: Retain bounded unknown certificate evidence
-          ansible.builtin.debug:
-            msg: File certificate observation unavailable
-          no_log: true
-
-    - name: Emit normalized HTTPS observation
+    - name: Emit plain certificate facts
       ansible.builtin.debug:
-        msg: "TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} | to_json }}"
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+
+    - name: Refuse unavailable or unverified native facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: certificate_observation.outcome != 'succeeded'

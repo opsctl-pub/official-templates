@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew the {{ certificate_subject_key }} certificate
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/bin/bash "{{ certificate_subject_state }}/renew.sh" {{ certificate_unit_action | default('due') }}{{ (' "' ~ automatic_attempt.path ~ '"') if certificate_unit_action | default('due') != 'due' else '' }}
+TimeoutStartSec=1260s
+TimeoutStopSec=30s
+StandardOutput=null
+StandardError=null

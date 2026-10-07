@@ -1,5 +1,5 @@
 ---
-- name: Execute managed gateway-local automatic certificate action
+- name: Issue retry or renew one subject through its native renewal unit
   hosts: all
   gather_facts: false
   become: true
@@ -8,13 +8,10 @@
     traefik_certificate_dir: /etc/traefik/certificates/opsctl
     traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
     traefik_acme_dir: /var/lib/traefik
-    dns_challenge_broker_url: "{{ automatic_certificate_profile.broker_url | default('') }}"
-    dns_challenge_token_source_file: /var/run/opsctl/file-secret/dns-challenge-token
-    dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('') }}"
   pre_tasks:
-    - name: Skip automatic certificate mutation in simulation
+    - name: End simulation without a consumed result
       ansible.builtin.meta: end_play
       when: simulate | default(false)
   tasks:
-    - name: Execute shared automatic certificate tasks
+    - name: Execute the readable subject procedure
       ansible.builtin.include_tasks: ../tasks/traefik_automatic_certificate.yml

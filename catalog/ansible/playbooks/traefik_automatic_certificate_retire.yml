@@ -1,83 +1,17 @@
 ---
-- name: Retire exact automatic selection and renewal enrollment
+- name: Retire only the subject's automatic selection and enrollment
   hosts: all
   gather_facts: false
   become: true
   vars:
     traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
     traefik_certificate_dir: /etc/traefik/certificates/opsctl
-    traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
   pre_tasks:
-    - name: Validate retirement envelope
-      ansible.builtin.assert:
-        that:
-          - automatic_certificate_retirement_request is mapping
-          - not (simulate | default(false) | bool)
-        fail_msg: Automatic certificate retirement input is invalid
-      no_log: true
-
-    - name: Check existing certificate tooling
-      ansible.builtin.command:
-        argv: [python3, -c, 'import cryptography, yaml']
-      register: retirement_tooling
-      changed_when: false
-      failed_when: false
-
-    - name: Require existing certificate tooling
-      ansible.builtin.assert:
-        that: retirement_tooling.rc == 0
-        fail_msg: Automatic certificate retirement tooling is unavailable
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
   tasks:
-    - name: Run qualified retirement
-      block:
-        - name: Create transient retirement directory
-          ansible.builtin.tempfile:
-            state: directory
-            prefix: opsctl-certificate-retirement-
-          register: retirement_scratch
-
-        - name: Deliver existing physical certificate helpers
-          ansible.builtin.copy:
-            src: "../scripts/{{ item }}"
-            dest: "{{ retirement_scratch.path }}/{{ item }}"
-            owner: root
-            group: root
-            mode: '0700'
-          loop: [traefik_automatic_certificate.py, traefik_certificate_selection.py]
-
-        - name: Retire selected automatic binding and enrollment
-          ansible.builtin.command:
-            argv: [python3, "{{ retirement_scratch.path }}/traefik_automatic_certificate.py", retire]
-            stdin: "{{ automatic_certificate_retirement_request | to_json }}"
-          environment:
-            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-            PYTHONDONTWRITEBYTECODE: '1'
-          register: retirement_action
-          failed_when: false
-          no_log: true
-
-        - name: Require bounded retirement success
-          ansible.builtin.assert:
-            that:
-              - retirement_action.rc == 0
-              - retirement_action.stdout is string
-              - retirement_action.stdout | length <= 65536
-              - retirement_action.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-            fail_msg: Automatic certificate retirement failed
-          no_log: true
-
-        - name: Emit closed retirement receipt
-          ansible.builtin.debug:
-            msg: "{{ retirement_action.stdout }}"
-      rescue:
-        - name: Refuse unavailable automatic retirement
-          ansible.builtin.fail:
-            msg: Automatic certificate retirement failed
-      always:
-        - name: Remove transient retirement directory
-          ansible.builtin.file:
-            path: "{{ retirement_scratch.path }}"
-            state: absent
-          when: retirement_scratch is defined and retirement_scratch.path is defined
+    - name: Retire the authorized automatic subject without touching other sources
+      ansible.builtin.include_tasks: ../tasks/traefik_server_dashboard_retirement.yml
+      vars:
+        certificate_dashboard_retirement: false

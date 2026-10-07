@@ -1,51 +1,245 @@
 ---
-- name: Check gateway certificate selection tooling
-  ansible.builtin.command:
-    argv: [python3, -c, 'import cryptography, yaml']
-  register: certificate_selection_tooling
-  changed_when: false
-  failed_when: false
+- name: Initialize failed selection outcome
+  ansible.builtin.set_fact:
+    certificate_selection_succeeded: false
+    certificate_selection_error: {phase: validate, code: routing_input_invalid}
+    certificate_selection_restoration_failed: false
+    certificate_previous_observation: null
+    certificate_stage: {}
+    certificate_timer_pause_attempted: false
+    certificate_subject_quiescent: false
+    certificate_publication_attempted: false
+  no_log: true
 
-- name: Install missing certificate selection tooling
-  ansible.builtin.package:
-    name: [python3-cryptography, python3-yaml]
-    state: present
-  when: certificate_selection_tooling.rc != 0
-
-- name: Execute the shared certificate selection owner
+- name: Stage and change only the authorized subject selection
   block:
-    - name: Create selection execution directory
-      ansible.builtin.tempfile:
-        state: directory
-        prefix: opsctl-certificate-selection-
-      register: certificate_selection_dir
+    - name: Read the actual selection without serving inference
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
 
-    - name: Deliver canonical selection helper
-      ansible.builtin.copy:
-        src: ../scripts/traefik_certificate_selection.py
-        dest: "{{ certificate_selection_dir.path }}/selection.py"
+    - name: Require complete known expected material before staging
+      ansible.builtin.assert:
+        that:
+          - certificate_observation.outcome == 'succeeded'
+          - certificate_subject.type in ['deployment', 'server']
+          - expected_certificate is mapping
+          - expected_certificate.keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+          - expected_certificate.presence in ['present', 'absent']
+          - certificate_selection_action in ['publish', 'remove']
+          - >-
+            certificate_observation | dict2items |
+            selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+            items2dict == expected_certificate
+          - >-
+            certificate_selection_action != 'remove' or
+            expected_certificate.presence == 'absent' or
+            (expected_certificate.source == certificate_selected_source and
+             (certificate_selected_source != 'custom' or
+              (expected_certificate.material_id == material_id and expected_certificate.revision_id == revision_id)))
+      vars:
+        certificate_selected_source: "{{ certificate_source | default('custom') }}"
+
+    - name: Save actual prior enrollment for restoration
+      ansible.builtin.set_fact:
+        certificate_previous_observation: "{{ certificate_observation }}"
+        certificate_selection_error: {phase: stage, code: certificate_material_invalid}
+
+    - name: Inspect this subject's native timer
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_timer_name }}", --no-pager, --property=LoadState]
+      changed_when: false
+      failed_when: false
+      register: certificate_timer_load
+
+    - name: Require explicit loaded or absent timer
+      ansible.builtin.assert:
+        that:
+          - certificate_timer_load.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
+
+    - name: Track the timer mutation boundary even if systemd partly fails
+      ansible.builtin.set_fact:
+        certificate_timer_pause_attempted: true
+      when: certificate_timer_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Pause only this subject's renewal timer
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
+        state: stopped
+        enabled: false
+      when: certificate_timer_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Inspect the subject service independently of timer existence
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=LoadState]
+      register: certificate_service_load
+      changed_when: false
+      failed_when: false
+
+    - name: Require known active-service availability
+      ansible.builtin.assert:
+        that: certificate_service_load.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
+
+    - name: Wait for this subject's active renewal service before manual mutation
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=ActiveState, --value]
+      changed_when: false
+      register: certificate_service_wait
+      until: certificate_service_wait.stdout | trim in ['inactive', 'failed']
+      retries: 126
+      delay: 10
+      when: certificate_service_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Retain quiescent subject state
+      ansible.builtin.set_fact:
+        certificate_subject_quiescent: true
+
+    - name: Ensure private template-local primitive directory
+      ansible.builtin.file:
+        path: "{{ traefik_certificate_dir | default('/etc/traefik/certificates/opsctl') }}/runtime"
+        state: directory
         owner: root
         group: root
         mode: '0700'
 
-    - name: Compare and update the selected certificate pool
-      ansible.builtin.command:
-        argv: [python3, "{{ certificate_selection_dir.path }}/selection.py", "{{ certificate_selection_action }}"]
-        stdin: "{{ certificate_selection_request | to_json }}"
-      environment:
-        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-      register: certificate_selection_result
-      failed_when: false
-      no_log: true
+    - name: Install only native facts and publication primitives
+      ansible.builtin.copy:
+        src: "../scripts/{{ item }}"
+        dest: "{{ traefik_certificate_dir | default('/etc/traefik/certificates/opsctl') }}/runtime/{{ item }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop: [certificate_facts.py, traefik_certificate_publish.py]
 
-    - name: Require successful certificate selection
+    - name: Create private material staging
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ traefik_certificate_dir | default('/etc/traefik/certificates/opsctl') }}"
+        prefix: .selection-
+      register: certificate_stage
+
+    - name: Freeze the complete expected snapshot for final native comparison
+      ansible.builtin.copy:
+        content: "{{ expected_certificate | to_json }}"
+        dest: "{{ certificate_stage.path }}/expected.json"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Stage the selected chain and private key
+      ansible.builtin.copy:
+        src: "{{ item.source }}"
+        dest: "{{ certificate_stage.path }}/{{ item.name }}"
+        remote_src: "{{ certificate_source_remote | default(false) }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - {source: "{{ certificate_chain_source | default('') }}", name: tls.crt}
+        - {source: "{{ certificate_key_source | default('') }}", name: tls.key}
+      when: certificate_selection_action == 'publish'
+
+    - name: Stage only explicitly selected trust
+      ansible.builtin.copy:
+        content: "{{ trust_bundle_pem }}"
+        dest: "{{ certificate_stage.path }}/trust.pem"
+        owner: root
+        group: root
+        mode: '0600'
+      when: trust_bundle_pem | default(none) is not none
+
+    - name: Mark final compare and activation phase
+      ansible.builtin.set_fact:
+        certificate_selection_error: {phase: apply, code: certificate_state_changed}
+        certificate_publication_attempted: true
+        certificate_selection_restoration_failed: true
+
+    - name: Compare actual material then atomically publish and probe or remove
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '--kill-after=1s', '30s', 'python3', (traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) ~ '/runtime/traefik_certificate_publish.py',
+              '--selection', certificate_selection_path, '--root', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl'),
+              '--subject', certificate_subject | to_json, '--source', certificate_source | default('custom'),
+              '--hosts', route_hosts | to_json, '--expected-file', certificate_stage.path ~ '/expected.json',
+              '--address', certificate_probe_address | default('127.0.0.1'), '--port', certificate_probe_port | default(443) | string]
+            + (['--material', material_id] if material_id | default(none) is not none else [])
+            + (['--revision', revision_id] if revision_id | default(none) is not none else [])
+            + (['--trust-file', certificate_stage.path ~ '/trust.pem'] if trust_bundle_pem | default(none) is not none else [])
+            + (['--remove'] if certificate_selection_action == 'remove' else
+               ['--chain', (certificate_chain_source if certificate_source | default('custom') == 'native' else certificate_stage.path ~ '/tls.crt'),
+                '--key', (certificate_key_source if certificate_source | default('custom') == 'native' else certificate_stage.path ~ '/tls.key'),
+                '--fingerprint', leaf_fingerprint_sha256]) }}
+      register: certificate_publication
+      failed_when: false
+
+    - name: Require bounded native publication facts
       ansible.builtin.assert:
-        that: certificate_selection_result.rc == 0
-        fail_msg: "{{ certificate_selection_result.stderr | truncate(512, true, '') }}"
+        that:
+          - certificate_publication.stdout is string
+          - certificate_publication.stdout | length <= 131072
+
+    - name: Retain native outcome and any restoration liability
+      ansible.builtin.set_fact:
+        certificate_selection_succeeded: "{{ certificate_publication.rc == 0 }}"
+        certificate_selection_error: "{{ (certificate_publication.stdout | from_json).procedure_error | default(none) }}"
+        certificate_observation: "{{ (certificate_publication.stdout | from_json).certificate_observation }}"
+        certificate_selection_restoration_failed: >-
+          {{ certificate_publication.rc != 0 and
+             (((certificate_publication.stdout | from_json).procedure_error | default({})).get('code') == 'restoration_failed' or
+             ((certificate_publication.stdout | from_json).certificate_observation | dict2items |
+              selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+              items2dict != expected_certificate)) }}
+  rescue:
+    - name: Keep failed selection distinct from activation success
+      ansible.builtin.set_fact:
+        certificate_selection_succeeded: false
   always:
-    - name: Remove selection execution directory
+    - name: Keep failed or unknown publication restoration as explicit liability
+      ansible.builtin.set_fact:
+        certificate_selection_original_error: "{{ certificate_selection_error }}"
+        certificate_selection_error: {phase: restore, code: restoration_failed}
+      when:
+        - not certificate_selection_succeeded
+        - certificate_publication_attempted
+        - certificate_selection_restoration_failed
+
+    - name: Restore prior automatic enrollment only after a restored failed switch
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
+        enabled: "{{ certificate_previous_observation.renewal.enabled }}"
+        state: "{{ 'started' if certificate_previous_observation.renewal.active else 'stopped' }}"
+      when:
+        - not certificate_selection_succeeded
+        - not certificate_publication_attempted or (certificate_subject_quiescent and not certificate_selection_restoration_failed)
+        - certificate_timer_pause_attempted
+        - certificate_previous_observation is not none
+        - certificate_previous_observation.source == 'automatic'
+        - certificate_previous_observation.renewal.enabled is boolean
+        - certificate_previous_observation.renewal.active is boolean
+      register: certificate_enrollment_restoration
+      ignore_errors: true
+
+    - name: Preserve failed enrollment restoration as liability
+      ansible.builtin.set_fact:
+        certificate_selection_error: {phase: restore, code: restoration_failed}
+      when: certificate_enrollment_restoration.failed | default(false)
+
+    - name: Remove only this invocation's private staging
       ansible.builtin.file:
-        path: "{{ certificate_selection_dir.path }}"
+        path: "{{ certificate_stage.path }}"
         state: absent
-      when: certificate_selection_dir is defined and certificate_selection_dir.path is defined
+      when: certificate_stage is defined and certificate_stage.path is defined
+
+    - name: Observe final selected state and requested serving without modifying it
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: "{{ certificate_selection_action != 'remove' }}"
+
+    - name: Keep original procedure failure while reporting final observed facts
+      ansible.builtin.set_fact:
+        certificate_procedure_error: "{{ certificate_selection_error if not certificate_selection_succeeded else certificate_procedure_error }}"
+        certificate_observation: >-
+          {{ certificate_observation | combine({'outcome': 'failed'})
+            if not certificate_selection_succeeded and certificate_observation.outcome == 'succeeded'
+            else certificate_observation }}
+  no_log: true

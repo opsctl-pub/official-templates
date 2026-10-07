@@ -1,34 +1,121 @@
 ---
-- name: Inspect runtime before removing newly staged broker credential
-  community.docker.docker_container_info:
-    name: "{{ traefik_container_name }}"
-  register: failed_gateway_info
-  failed_when: false
-  no_log: true
+- name: Remove only a newly delivered token proven unused by native runtime and procedures
   when:
     - dns_challenge_token_installed is defined
     - not dns_challenge_token_installed.stat.exists
+  block:
+    - name: Observe containers without changing their state
+      community.docker.docker_host_info:
+        containers: true
+      register: token_native_containers
+      no_log: true
 
-- name: Read failed gateway runtime identity
-  ansible.builtin.set_fact:
-    failed_gateway_details: >-
-      {{
-        (failed_gateway_info.get('containers', []) | first)
-        if (failed_gateway_info.get('containers', []) | length) > 0
-        else failed_gateway_info.get('container', None)
-      }}
-  no_log: true
-  when:
-    - failed_gateway_info is defined
-    - not (failed_gateway_info.failed | default(true))
+    - name: Require bounded complete native reference inventory
+      ansible.builtin.assert:
+        that:
+          - token_native_containers.containers is sequence
+          - token_native_containers.containers | length <= 128
+      no_log: true
 
-- name: Remove unreferenced newly staged broker credential
-  ansible.builtin.file:
-    path: "{{ dns_challenge_token_file }}"
-    state: absent
-  no_log: true
-  when:
-    - failed_gateway_details is defined
-    - dns_challenge_token_installed is defined
-    - not dns_challenge_token_installed.stat.exists
-    - failed_gateway_details is none or ('HTTPREQ_PASSWORD_FILE=' ~ dns_challenge_token_file) not in (failed_gateway_details.Config.Env | default([]))
+    - name: Read exact container token references including stopped clients
+      community.docker.docker_container_info:
+        name: "{{ item.Id }}"
+      loop: "{{ token_native_containers.containers }}"
+      register: token_container_references
+      no_log: true
+
+    - name: Require actual container reference observations
+      ansible.builtin.assert:
+        that:
+          - item.exists
+          - ('HTTPREQ_PASSWORD_FILE=' ~ dns_challenge_token_file) not in (item.container.Config.Env | default([]))
+          - item.container.Mounts | selectattr('Source', 'equalto', dns_challenge_token_file) | list | length == 0
+      loop: "{{ token_container_references.results }}"
+      no_log: true
+
+    - name: Inspect native renewal state without creating it
+      ansible.builtin.stat:
+        path: "{{ traefik_acme_state_dir | default('/var/lib/opsctl/automatic-certificates') }}"
+        follow: false
+      register: token_renewal_root
+      no_log: true
+
+    - name: Require an ordinary renewal root or explicit absence
+      ansible.builtin.assert:
+        that:
+          - not token_renewal_root.stat.exists or (token_renewal_root.stat.isdir and not token_renewal_root.stat.islnk)
+      no_log: true
+
+    - name: Inspect renewal ancestors without following linked subjects
+      ansible.builtin.find:
+        paths: "{{ traefik_acme_state_dir | default('/var/lib/opsctl/automatic-certificates') }}"
+        recurse: false
+        file_type: any
+        hidden: true
+        follow: false
+      register: token_subjects
+      when: token_renewal_root.stat.exists
+      no_log: true
+
+    - name: Refuse incomplete or linked renewal ancestors
+      ansible.builtin.assert:
+        that:
+          - token_subjects.skipped_paths | default({}) | length == 0
+          - token_subjects.matched <= 128
+          - token_subjects.files | selectattr('islnk', 'equalto', true) | list | length == 0
+      when: token_renewal_root.stat.exists
+      no_log: true
+
+    - name: Read only the finite installed subject procedure inventory
+      ansible.builtin.find:
+        paths: "{{ traefik_acme_state_dir | default('/var/lib/opsctl/automatic-certificates') }}"
+        patterns: renew.sh
+        recurse: true
+        depth: 2
+        file_type: any
+        follow: false
+      register: token_renewal_scripts
+      when: token_renewal_root.stat.exists
+      no_log: true
+
+    - name: Require complete procedure enumeration
+      ansible.builtin.assert:
+        that:
+          - token_renewal_scripts.skipped_paths | default({}) | length == 0
+          - token_renewal_scripts.matched <= 128
+      when: token_renewal_root.stat.exists
+      no_log: true
+
+    - name: Require bounded complete regular procedure references
+      ansible.builtin.assert:
+        that:
+          - token_renewal_scripts.skipped_paths | default({}) | length == 0
+          - token_renewal_scripts.matched <= 128
+          - item.isreg and not item.islnk
+          - item.size <= 65536
+      loop: "{{ token_renewal_scripts.files | default([]) }}"
+      when: token_renewal_root.stat.exists
+      no_log: true
+
+    - name: Read installed subject procedure references privately
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ token_renewal_scripts.files | default([]) }}"
+      register: token_renewal_references
+      no_log: true
+
+    - name: Require no installed subject procedure references this token
+      ansible.builtin.assert:
+        that: dns_challenge_token_file not in (item.content | b64decode)
+      loop: "{{ token_renewal_references.results }}"
+      no_log: true
+
+    - name: Remove only the exact proven-unused newly delivered credential
+      ansible.builtin.file:
+        path: "{{ dns_challenge_token_file }}"
+        state: absent
+      no_log: true
+  rescue:
+    - name: Retain token on unknown or existing native reference
+      ansible.builtin.debug:
+        msg: Newly delivered credential retained because native references could not be excluded.

@@ -1,0 +1,115 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+state={{ certificate_subject_state | quote }}
+store={{ traefik_certificate_dir | quote }}
+selection={{ certificate_selection_path | quote }}
+route={{ (traefik_dynamic_dir ~ '/acme-' ~ certificate_subject_key ~ '.yml') | quote }}
+subject={{ certificate_subject | to_json | quote }}
+hosts={{ route_hosts | to_json | quote }}
+action="${1:-due}"
+case "$action" in issue|retry|renew|due) ;; *) exit 1 ;; esac
+if [ "$action" = due ]; then
+    work=$(mktemp -d "$state/.attempt-XXXXXXXX")
+else
+    work="${2:?}"
+    case "$work" in "$state"/.attempt-*) ;; *) exit 1 ;; esac
+    [ -d "$work" ] && [ ! -L "$work" ]
+fi
+route_installed=false
+route_stage="$route.${work##*/}"
+cleanup_failed=false
+
+cleanup() {
+    status=$?
+    trap - EXIT
+    if [ -f "$work/client.id" ]; then
+        read -r client < "$work/client.id" || true
+        if [[ "${client:-}" =~ ^[a-f0-9]{64}$ ]]; then
+            timeout 15s docker rm -f -- "$client" >/dev/null 2>&1 || cleanup_failed=true
+        else
+            cleanup_failed=true
+        fi
+    fi
+    if "$route_installed"; then
+        if cmp -s -- "$state/challenge.yml" "$route" && [ ! -L "$route" ]; then
+            rm -- "$route" || cleanup_failed=true
+        else
+            cleanup_failed=true
+        fi
+    fi
+    if [ -e "$route_stage" ]; then
+        if cmp -s -- "$state/challenge.yml" "$route_stage" && [ ! -L "$route_stage" ]; then
+            rm -- "$route_stage" || cleanup_failed=true
+        else
+            cleanup_failed=true
+        fi
+    fi
+    if "$cleanup_failed"; then exit 1; fi
+    if [ "$status" -ne 0 ]; then exit "$status"; fi
+    rm -f -- "$work/expected.json" "$work/client.id" "$work/publication.json" "$work/client.log"
+    rmdir -- "$work" || cleanup_failed=true
+    if "$cleanup_failed"; then exit 1; fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if [ "$action" = due ]; then
+    timeout 5s python3 "$store/runtime/certificate_facts.py" \
+        --selection "$selection" --root "$store" --subject "$subject" \
+        --timer {{ certificate_timer_name | quote }} --snapshot --require-source automatic \
+        > "$work/expected.json"
+else
+    printf '%s' {{ expected_certificate | to_json | quote }} > "$work/expected.json"
+fi
+
+{% if challenge == 'http-01' %}
+exec 9>{{ (traefik_acme_state_dir ~ '/http-challenge.lock') | quote }}
+flock -w 600 9
+if [ -e "$route" ] || [ -L "$route" ]; then exit 1; fi
+install -m 0644 -- "$state/challenge.yml" "$route_stage"
+ln -- "$route_stage" "$route"
+route_installed=true
+rm -- "$route_stage"
+{% endif %}
+
+client_name="opsctl-acme-{{ certificate_subject_key }}-${work##*/}"
+docker_args=(run --cidfile "$work/client.id" --name "$client_name" --network host
+    --label {{ ('com.opsctl.component=automatic_certificate') | quote }}
+    --label {{ ('com.opsctl.subject_type=' ~ certificate_subject.type) | quote }}
+    --label {{ ('com.opsctl.subject_id=' ~ certificate_subject.id) | quote }}
+    --volume "$state/lego:$state/lego"
+    --volume {{ ((certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt')) ~ ':' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt')) ~ ':ro') | quote }}
+    --env {{ ('SSL_CERT_FILE=' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt'))) | quote }}
+    --env {{ ('LEGO_CA_CERTIFICATES=' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt'))) | quote }})
+{% if challenge == 'dns-01' %}
+docker_args+=(--volume {{ (dns_challenge_token_file ~ ':' ~ dns_challenge_token_file ~ ':ro') | quote }}
+    --env {{ ('HTTPREQ_ENDPOINT=' ~ broker_url) | quote }} --env HTTPREQ_USERNAME=opsctl
+    --env {{ ('HTTPREQ_PASSWORD_FILE=' ~ dns_challenge_token_file) | quote }} --env HTTPREQ_HTTP_TIMEOUT=120)
+{% endif %}
+lego_args=(run --server {{ acme_directory_url | quote }} --email {{ acme_email | quote }}
+    --accept-tos --path "$state/lego")
+{% for host in route_hosts %}
+lego_args+=(--domains {{ host | quote }})
+{% endfor %}
+{% if challenge == 'http-01' %}
+lego_args+=(--http --http.address {{ ('127.0.0.1:' ~ (certificate_http_port | default(38473) | string)) | quote }} --http.delay 3s)
+{% else %}
+lego_args+=(--dns httpreq)
+{% endif %}
+if [ "$action" != issue ]; then lego_args+=(--reuse-key --no-random-sleep); fi
+if [ "$action" = renew ]; then lego_args+=(--renew-force); fi
+if [ "$action" = due ]; then lego_args+=(--renew-days 30); fi
+timeout --signal=TERM --kill-after=5s 600s docker "${docker_args[@]}" \
+    goacme/lego@sha256:1944e8c36055beec47c7de6f15202b41128be75eea0ffa257f0c14d93c5155fd \
+    "${lego_args[@]}" > "$work/client.log" 2>&1
+
+timeout --signal=TERM --kill-after=1s 30s python3 "$store/runtime/traefik_certificate_publish.py" \
+    --selection "$selection" --root "$store" --subject "$subject" --source automatic \
+    --hosts "$hosts" --expected-file "$work/expected.json" \
+    --chain {{ (certificate_subject_state ~ '/lego/certificates/' ~ route_hosts[0] ~ '.crt') | quote }} \
+    --key {{ (certificate_subject_state ~ '/lego/certificates/' ~ route_hosts[0] ~ '.key') | quote }} \
+    --address {{ certificate_probe_address | default('127.0.0.1') | quote }} \
+    --port {{ certificate_probe_port | default(443) }} > "$work/publication.json"

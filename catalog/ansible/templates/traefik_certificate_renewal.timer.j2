@@ -1,0 +1,11 @@
+[Unit]
+Description=Automatic renewal for {{ certificate_subject_key }}
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit={{ certificate_service_name }}
+
+[Install]
+WantedBy=timers.target
