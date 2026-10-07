@@ -78,6 +78,23 @@ target and organization fields remain. No private receipt, binding program,
 API-selected remote layout or compatibility controller is accepted.
 simulate=true ends without changes or consumed success.
 
+### Server Dashboard Setup
+
+Dashboard setup admits automatic issue for an exact Server subject without a
+backend-invented preimage. Before dashboard, runtime, broker or renewal mutation,
+it reads the native five-field snapshot in explicit selection-only mode, with
+host probes disabled and no running-gateway or enrollment prerequisite. Absolute
+template-owned selection paths and ancestors must be root-owned, unlinked and
+of the expected type. Actual missing selection/ancestors may establish absence;
+unreadable, foreign, malformed or changed state remains unknown. Only a successful
+absent or automatic selection is admitted; custom/native/unknown refuses setup.
+The captured snapshot becomes local expected_certificate. After runtime converge,
+unchanged generic issuance reobserves/compares it before mutation, preserving final
+serving, enrollment and restoration. Existing automatic material may change to
+the admitted hostname for that same Server. The helper's explicit --selection-only
+returns exactly the five snapshot fields and skips probes/enrollment; its default
+observation and --snapshot behavior remain unchanged.
+
 ### Public Inputs
 
 All items take certificate_subject={type:deployment|server,id:UUID} and route_hosts

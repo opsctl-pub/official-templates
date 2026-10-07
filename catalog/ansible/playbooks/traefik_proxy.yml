@@ -31,6 +31,38 @@
           ansible.builtin.set_fact:
             traefik_dashboard_retirement_started: false
 
+        - name: Observe the Server dashboard selection before setup mutation
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          vars:
+            certificate_selection_only: true
+            certificate_probe_hosts: false
+          when: traefik_dashboard_enabled | default(false)
+
+        - name: Require known absent or automatic Server selection
+          ansible.builtin.assert:
+            that:
+              - certificate_subject.type == 'server'
+              - certificate_action == 'issue'
+              - certificate_selection_observed
+              - >-
+                certificate_selection_snapshot.presence == 'absent' or
+                (certificate_selection_snapshot.presence == 'present' and
+                 certificate_selection_snapshot.source == 'automatic')
+            fail_msg: Dashboard certificate selection is unavailable or not automatic
+          when: traefik_dashboard_enabled | default(false)
+          no_log: true
+
+        - name: Capture the actual dashboard selection for generic issuance comparison
+          ansible.builtin.set_fact:
+            expected_certificate:
+              presence: "{{ certificate_selection_snapshot.presence }}"
+              source: "{{ certificate_selection_snapshot.source }}"
+              material_id: "{{ certificate_selection_snapshot.material_id }}"
+              revision_id: "{{ certificate_selection_snapshot.revision_id }}"
+              leaf_fingerprint_sha256: "{{ certificate_selection_snapshot.leaf_fingerprint_sha256 }}"
+          when: traefik_dashboard_enabled | default(false)
+          no_log: true
+
         - name: Install broker credential for explicit DNS-01 profile
           ansible.builtin.include_tasks: ../tasks/traefik_gateway_dns_challenge_secret.yml
           when:
