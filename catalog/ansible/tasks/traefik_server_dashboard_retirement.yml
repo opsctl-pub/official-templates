@@ -1,115 +1,162 @@
 ---
-- name: Require qualified dashboard retirement inputs
-  ansible.builtin.assert:
-    that:
-      - certificate_selection_request is mapping
-      - automatic_certificate_retirement_request is mapping
-      - certificate_selection_request.identity.subject.type == 'server'
-      - certificate_selection_request.identity.gateway_id == None
-      - certificate_selection_request.identity == automatic_certificate_retirement_request.identity
-      - certificate_selection_request.operation_id == automatic_certificate_retirement_request.operation_id
-      - traefik_dashboard_route_file is defined
-      - traefik_dashboard_route_file is string
-      - traefik_dashboard_route_file == traefik_dynamic_dir ~ '/server-dashboard-' ~ certificate_selection_request.identity.subject.id ~ '.yml'
-      - not (simulate | default(false) | bool)
-    fail_msg: Dashboard retirement identity is invalid
+- name: Initialize unknown automatic retirement
+  ansible.builtin.set_fact:
+    certificate_retirement_succeeded: false
+    certificate_retirement_error: {phase: remove, code: certificate_state_changed}
+    certificate_automatic_retired: null
   no_log: true
 
-- name: Inspect owning dashboard route after successful runtime removal
-  ansible.builtin.stat:
-    path: "{{ traefik_dashboard_route_file }}"
-    follow: false
-  register: dashboard_retirement_route
-
-- name: Require physical dashboard route absence
-  ansible.builtin.assert:
-    that: not dashboard_retirement_route.stat.exists
-    fail_msg: Dashboard route remains installed
-
-- name: Retire qualified dashboard selection and enrollment
+- name: Retire only authorized subject enrollment and its automatic selection
   block:
-    - name: Create transient dashboard retirement directory
-      ansible.builtin.tempfile:
-        state: directory
-        prefix: opsctl-dashboard-retirement-
-      register: dashboard_retirement_scratch
+    - name: Observe the actual selected source without claiming serving
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
 
-    - name: Deliver existing selection and retirement helpers
-      ansible.builtin.copy:
-        src: "../scripts/{{ item }}"
-        dest: "{{ dashboard_retirement_scratch.path }}/{{ item }}"
-        mode: '0700'
-      loop: [traefik_certificate_selection.py, traefik_automatic_certificate.py]
+    - name: Require the complete expected selection before disabling enrollment
+      ansible.builtin.assert:
+        that:
+          - certificate_observation.outcome == 'succeeded'
+          - expected_certificate.keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+          - expected_certificate.presence in ['present', 'absent']
+          - >-
+            certificate_observation | dict2items |
+            selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+            items2dict == expected_certificate
 
-    - name: Observe exact selected bytes
+    - name: Require the actual Server dashboard route absent before dashboard retirement
+      when: certificate_dashboard_retirement | default(true)
+      block:
+        - name: Require exact Server subject and local dashboard route reference
+          ansible.builtin.assert:
+            that:
+              - certificate_subject.type == 'server'
+              - certificate_subject.id == server_id
+              - traefik_dashboard_route_file == traefik_dynamic_dir ~ '/server-dashboard-' ~ server_id ~ '.yml'
+
+        - name: Observe dashboard route without following a link
+          ansible.builtin.stat:
+            path: "{{ traefik_dashboard_route_file }}"
+            follow: false
+          register: dashboard_retirement_route
+
+        - name: Refuse retirement while dashboard route remains
+          ansible.builtin.assert:
+            that: not dashboard_retirement_route.stat.exists
+
+    - name: Inspect only this subject's timer
       ansible.builtin.command:
-        argv: [python3, "{{ dashboard_retirement_scratch.path }}/traefik_certificate_selection.py", observe]
-        stdin: "{{ certificate_selection_request | to_json }}"
-      environment:
-        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-        PYTHONDONTWRITEBYTECODE: '1'
-      register: dashboard_retirement_selection
+        argv: [systemctl, show, "{{ certificate_timer_name }}", --no-pager, --property=LoadState]
+      register: certificate_retire_timer
       changed_when: false
       failed_when: false
-      no_log: true
 
-    - name: Require successful bounded selection observation
+    - name: Require explicit timer presence or absence
       ansible.builtin.assert:
-        that:
-          - dashboard_retirement_selection.rc == 0
-          - dashboard_retirement_selection.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-          - dashboard_retirement_selection.stdout | length <= 524288
-        fail_msg: Dashboard selection is unavailable
-      no_log: true
+        that: certificate_retire_timer.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
 
-    - name: Capture opaque selection CAS
-      ansible.builtin.set_fact:
-        dashboard_retirement_observation: "{{ (dashboard_retirement_selection.stdout | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).automatic_certificate_selection }}"
-      no_log: true
+    - name: Stop and disable this subject's enrollment
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
+        enabled: false
+        state: stopped
+      when: certificate_retire_timer.stdout | trim == 'LoadState=loaded'
 
-    - name: Require exact observed owner and root
-      ansible.builtin.assert:
-        that:
-          - dashboard_retirement_observation.identity == certificate_selection_request.identity
-          - dashboard_retirement_observation.operation_id == certificate_selection_request.operation_id
-        fail_msg: Dashboard selection identity changed
-      no_log: true
-
-    - name: Retire with exact observed bytes
+    - name: Inspect the subject service independently of timer existence
       ansible.builtin.command:
-        argv: [python3, "{{ dashboard_retirement_scratch.path }}/traefik_automatic_certificate.py", retire]
-        stdin: "{{ automatic_certificate_retirement_request | combine({'expected_binding': dashboard_retirement_observation.expected_binding}) | to_json }}"
-      environment:
-        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-        OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-        PYTHONDONTWRITEBYTECODE: '1'
-      register: dashboard_retirement_action
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=LoadState]
+      register: certificate_retire_service_load
+      changed_when: false
       failed_when: false
-      no_log: true
 
-    - name: Require bounded retirement success
+    - name: Require known active-service availability
+      ansible.builtin.assert:
+        that: certificate_retire_service_load.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
+
+    - name: Wait for this subject's client before a manual selection mutation
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=ActiveState, --value]
+      register: certificate_retire_wait
+      changed_when: false
+      until: certificate_retire_wait.stdout | trim in ['inactive', 'failed']
+      retries: 126
+      delay: 10
+      when: certificate_retire_service_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Remove only the still-matching automatic selection
+      ansible.builtin.include_tasks: traefik_certificate_selection.yml
+      vars:
+        certificate_source: automatic
+        certificate_selection_action: remove
+      when: expected_certificate.source == 'automatic'
+
+    - name: Refuse failed automatic selection removal
+      ansible.builtin.assert:
+        that: certificate_selection_succeeded
+      when: expected_certificate.source == 'automatic'
+
+    - name: Reobserve the retained custom native or absent selection
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
+
+    - name: Require no automatic selection and preserve a nonautomatic expected source
       ansible.builtin.assert:
         that:
-          - dashboard_retirement_action.rc == 0
-          - dashboard_retirement_action.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-          - dashboard_retirement_action.stdout | length <= 65536
-        fail_msg: Dashboard automatic retirement failed
-      no_log: true
+          - certificate_observation.outcome == 'succeeded'
+          - certificate_observation.source != 'automatic'
+          - >-
+            expected_certificate.source == 'automatic' or
+            (certificate_observation | dict2items |
+             selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+             items2dict == expected_certificate)
 
-    - name: Emit complete dashboard retirement evidence
-      ansible.builtin.debug:
-        msg: >-
-          TEMPLATE_OUTPUT_JSON={{ {
-            'automatic_certificate_selection': dashboard_retirement_observation,
-            'automatic_certificate_retirement': (dashboard_retirement_action.stdout
-              | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
-              | from_json).automatic_certificate_retirement
-          } | to_json }}
+    - name: Observe actual subject timer state after retirement
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_timer_name }}", --no-pager, --property=LoadState,UnitFileState,ActiveState]
+      register: certificate_retired_timer
+      changed_when: false
+      failed_when: false
+
+    - name: Require enrollment absent or disabled and inactive
+      ansible.builtin.assert:
+        that: >-
+          'LoadState=not-found' in certificate_retired_timer.stdout.splitlines() or
+          ('LoadState=loaded' in certificate_retired_timer.stdout.splitlines() and
+           'UnitFileState=disabled' in certificate_retired_timer.stdout.splitlines() and
+           'ActiveState=inactive' in certificate_retired_timer.stdout.splitlines())
+
+    - name: Retain actual retirement facts
+      ansible.builtin.set_fact:
+        certificate_retirement_succeeded: true
+        certificate_retirement_error: null
+        certificate_automatic_retired: true
+  rescue:
+    - name: Retain failed retirement liability without fabricating absence
+      ansible.builtin.set_fact:
+        certificate_retirement_succeeded: false
   always:
-    - name: Remove transient dashboard retirement directory
-      ansible.builtin.file:
-        path: "{{ dashboard_retirement_scratch.path }}"
-        state: absent
-      when: dashboard_retirement_scratch is defined and dashboard_retirement_scratch.path is defined
+    - name: Observe final actual subject selection
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
+
+    - name: Add independently observed retirement and original failure
+      ansible.builtin.set_fact:
+        certificate_observation: >-
+          {{ certificate_observation | combine({'automatic_retired': certificate_automatic_retired}) |
+            combine({'outcome': 'failed'} if not certificate_retirement_succeeded and certificate_observation.outcome == 'succeeded' else {}) }}
+        certificate_procedure_error: "{{ certificate_retirement_error if not certificate_retirement_succeeded else certificate_procedure_error }}"
+  no_log: true
+
+- name: Emit actual selection and enrollment retirement
+  ansible.builtin.debug:
+    msg: >-
+      TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+        combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+  when: certificate_emit_result | default(true)
+
+- name: Fail after available retirement facts
+  ansible.builtin.fail:
+    msg: Server configuration changed. Refresh its observation before retrying.
+  when: not certificate_retirement_succeeded

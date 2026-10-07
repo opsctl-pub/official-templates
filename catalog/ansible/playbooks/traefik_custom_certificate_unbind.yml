@@ -1,108 +1,59 @@
 ---
-- name: Unbind one Deployment custom certificate from managed Traefik
+- name: Unbind the authorized subject's custom certificate
   hosts: all
   gather_facts: false
   become: true
   vars:
-    traefik_container_name: "traefik"
-    traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
-    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
-    binding_file: "{{ traefik_dynamic_dir }}/certificate-deployment-{{ deployment_id }}.yml"
+    certificate_source_dir: /var/run/opsctl/file-secret
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
   pre_tasks:
-    - name: Validate custom certificate unbind identity
-      ansible.builtin.assert:
-        that:
-          - adapter_key == 'traefik_custom_file'
-          - certificate_mode == 'custom'
-          - not (simulate | default(false) | bool)
-          - org_id is string
-          - org_id == (org_id | trim)
-          - (org_id | length) > 0
-          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - material_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - revision_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - metadata_digest is match('^[0-9a-f]{64}$')
-          - content_digest is match('^[0-9a-f]{64}$')
-          - leaf_fingerprint_sha256 is match('^[0-9a-f]{64}$')
-          - route_hosts is sequence
-          - route_hosts is not string
-          - (route_hosts | length) > 0
-          - (route_hosts | length) <= 100
-          - route_hosts == (route_hosts | unique | sort | list)
-          - (route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (route_hosts | length)
-          - target_server is string
-          - target_server == (target_server | trim)
-          - (target_server | length) > 0
-          - expected_custom_certificate_observation is mapping
-        fail_msg: "Custom certificate unbind identity is invalid"
-
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
   tasks:
-    - name: Read current custom certificate observation
-      ansible.builtin.include_tasks:
-        file: ../tasks/traefik_custom_certificate_observation.yml
+    - name: Initialize safe custom action failure
+      ansible.builtin.set_fact:
+        certificate_selection_succeeded: false
+        custom_certificate_error: {phase: validate, code: routing_input_invalid}
 
-    - name: Require unchanged removable custom certificate observation
-      ansible.builtin.assert:
-        that:
-          - >-
-            custom_certificate_observation.classification == 'absent' or
-            custom_certificate_observation.digest == expected_custom_certificate_observation.digest
-          - custom_certificate_observation.classification in ['exact', 'other', 'absent']
-          - >-
-            custom_certificate_observation.classification == 'absent' or
-            (
-              custom_certificate_observation.deployment_id == deployment_id and
-              custom_certificate_observation.material_id == material_id and
-              custom_certificate_observation.revision_id == revision_id and
-              custom_certificate_observation.route_hosts == route_hosts and
-              custom_certificate_observation.binding_count == 1 and
-              custom_certificate_observation.content_digest == content_digest and
-              custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
-            )
-        fail_msg: "Custom certificate state changed before unbind"
+    - name: Validate and perform the admitted custom action
+      block:
+        - name: Validate admitted custom material identity
+          ansible.builtin.assert:
+            that:
+              - certificate_subject.type == 'deployment'
+              - material_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - revision_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - leaf_fingerprint_sha256 is match('^[0-9a-f]{64}$')
+            fail_msg: Routing procedure inputs are invalid. Refresh the review.
+          no_log: true
 
-    - name: Remove through the shared selected-pool owner
-      ansible.builtin.include_tasks:
-        file: ../tasks/traefik_certificate_selection.yml
-      vars:
-        certificate_selection_action: remove
-        certificate_selection_request:
-          owner:
-            organization_id: "{{ org_id }}"
-            subject: {type: deployment, id: "{{ deployment_id }}"}
-            gateway_id: "{{ gateway_id }}"
-            server_id: "{{ server_id }}"
-            revision_id: "{{ revision_id }}"
-            source: custom
-            route_hosts: "{{ route_hosts }}"
-            fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
-          expected_binding: "{{ custom_selected_binding_bytes }}"
-      when: custom_certificate_observation.classification in ['exact', 'other']
+        - name: Remove only the matching custom selection while retaining unused material
+          ansible.builtin.include_tasks: ../tasks/traefik_certificate_selection.yml
+          vars:
+            certificate_source: custom
+            certificate_selection_action: remove
+      rescue:
+        - name: Observe retained selection after failed custom preparation
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          vars:
+            certificate_probe_hosts: false
 
-    - name: Read custom certificate observation after unbind
-      ansible.builtin.include_tasks:
-        file: ../tasks/traefik_custom_certificate_observation.yml
+        - name: Preserve original custom refusal with available facts
+          ansible.builtin.set_fact:
+            certificate_selection_succeeded: false
+            certificate_procedure_error: "{{ custom_certificate_error }}"
+            certificate_observation: "{{ certificate_observation | combine({'outcome': 'failed'}) }}"
+      no_log: true
 
-    - name: Require absent custom certificate binding
-      ansible.builtin.assert:
-        that:
-          - custom_certificate_observation.classification == 'absent'
-          - custom_certificate_observation.binding_count == 0
-          - custom_certificate_observation.material_id is none
-          - custom_certificate_observation.revision_id is none
-          - custom_certificate_observation.route_hosts == []
-          - custom_certificate_observation.host_count == 0
-          - custom_certificate_observation.hosts == []
-          - custom_certificate_observation.content_digest is none
-          - custom_certificate_observation.leaf_fingerprint_sha256 is none
-        fail_msg: "Custom certificate binding remains after unbind"
-
-    - name: Emit normalized custom certificate observation
+    - name: Emit actual certificate facts and any closed procedure failure
       ansible.builtin.debug:
         msg: >-
-          TEMPLATE_OUTPUT_JSON={{
-            {'custom_certificate_observation': custom_certificate_observation}
-            | to_json
-          }}
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+
+    - name: Fail after preserving actual selection and restoration facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: not certificate_selection_succeeded or certificate_observation.outcome != 'succeeded'

@@ -1,0 +1,7 @@
+{{ {'http': {
+    'routers': {certificate_subject_key ~ '-acme': {
+      'rule': '(Host(`' ~ (route_hosts | join('`) || Host(`')) ~ '`)) && PathPrefix(`/.well-known/acme-challenge/`)',
+      'entryPoints': ['web'], 'priority': 2147482000, 'service': certificate_subject_key ~ '-acme'}},
+    'services': {certificate_subject_key ~ '-acme': {'loadBalancer': {'servers': [
+      {'url': 'http://127.0.0.1:' ~ (certificate_http_port | default(38473) | string)}]}}}
+  }} | to_nice_yaml(indent=2) }}

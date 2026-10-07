@@ -1,256 +1,97 @@
 ---
-    - name: Inspect custom certificate binding
-      no_log: true
-      block:
-        - name: Inspect managed Traefik container
-          community.docker.docker_container_info:
-            name: "{{ traefik_container_name }}"
-          register: traefik_container_info
+- name: Initialize unavailable certificate facts
+  ansible.builtin.set_fact:
+    certificate_observation:
+      outcome: incomplete
+      observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      presence: unknown
+      source: null
+      material_id: null
+      revision_id: null
+      leaf_fingerprint_sha256: null
+      not_before: null
+      not_after: null
+      selected_hosts: []
+      binding_count: null
+      hosts: []
+      renewal: null
+    certificate_procedure_error: {phase: observe, code: certificate_serving_unverified}
+  no_log: true
 
-        - name: Read managed Traefik container
-          ansible.builtin.set_fact:
-            observed_traefik: >-
-              {{
-                (traefik_container_info.get('containers', []) | first)
-                if ((traefik_container_info.get('containers', []) | length) > 0)
-                else (traefik_container_info.get('container', None))
-              }}
+- name: Observe the subject selection and optional actual SNI
+  block:
+    - name: Validate public observation subject and hosts
+      ansible.builtin.assert:
+        that:
+          - certificate_subject is mapping
+          - certificate_subject.keys() | sort == ['id', 'type']
+          - certificate_subject.type in ['deployment', 'server']
+          - certificate_subject.id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+          - route_hosts is sequence and route_hosts is not string
+          - route_hosts | length <= 100
+          - route_hosts == route_hosts | unique | sort
+          - not (simulate | default(false))
 
-        - name: Require managed certificate mount
-          ansible.builtin.assert:
-            that:
-              - observed_traefik is not none
-              - observed_traefik.Config.Labels.get('com.opsctl.managed') == 'true'
-              - observed_traefik.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
-              - observed_traefik.Config.Labels.get('com.opsctl.org_id') == (org_id | string)
-              - >-
-                (observed_traefik.Mounts
-                | selectattr('Destination', 'equalto', traefik_certificate_dir)
-                | selectattr('Source', 'equalto', traefik_certificate_dir)
-                | selectattr('RW', 'sameas', false)
-                | list | length) == 1
-            fail_msg: "Managed Traefik certificate mount is invalid"
-
-        - name: Read canonical custom selected-pool evidence
-          ansible.builtin.include_tasks:
-            file: traefik_certificate_selection.yml
-          vars:
-            certificate_selection_action: observe_custom
-            certificate_selection_request:
-              identity:
-                organization_id: "{{ org_id }}"
-                subject: {type: deployment, id: "{{ deployment_id }}"}
-                gateway_id: "{{ gateway_id }}"
-                server_id: "{{ server_id }}"
-                route_hosts: "{{ route_hosts }}"
-
-        - name: Parse canonical custom selected-pool evidence
-          ansible.builtin.set_fact:
-            selected_custom_binding: >-
-              {{
-                (certificate_selection_result.stdout
-                | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
-                | from_json).custom_certificate_binding
-              }}
-
-        - name: Read installed custom certificate identity
-          ansible.builtin.set_fact:
-            binding_valid: true
-            binding_present: "{{ selected_custom_binding.present }}"
-            observed_material_id: "{{ selected_custom_binding.material_id | default(none) }}"
-            observed_revision_id: "{{ selected_custom_binding.revision_id | default(none) }}"
-            observed_route_hosts: "{{ selected_custom_binding.route_hosts | default([]) }}"
-            observed_binding_count: "{{ 1 if selected_custom_binding.present else 0 }}"
-            observed_certificate_hosts: []
-            observed_content_digest: "{{ selected_custom_binding.content_digest | default(none) }}"
-            observed_leaf_fingerprint: "{{ selected_custom_binding.leaf_fingerprint_sha256 | default(none) }}"
-            custom_selected_binding_bytes: "{{ selected_custom_binding.expected_binding }}"
-
-        - name: Probe served custom certificates
-          ansible.builtin.command:
-            argv:
-              - python3
-              - -c
-              - |
-                import hashlib
-                import json
-                import socket
-                import ssl
-                import sys
-                from datetime import datetime, timezone
-                hosts = json.loads(sys.argv[1])
-                now = datetime.now(timezone.utc)
-                observed = []
-                for host in hosts:
-                    status = 'unknown'
-                    trusted = None
-                    fingerprint = None
-                    not_before = None
-                    not_after = None
-                    try:
-                        context = ssl.create_default_context()
-                        with socket.create_connection(('127.0.0.1', 443), timeout=5) as sock:
-                            with context.wrap_socket(sock, server_hostname=host) as tls:
-                                metadata = tls.getpeercert()
-                                der = tls.getpeercert(binary_form=True)
-                        trusted = True
-                        fingerprint = hashlib.sha256(der).hexdigest()
-                        before = datetime.fromtimestamp(ssl.cert_time_to_seconds(metadata['notBefore']), timezone.utc)
-                        after = datetime.fromtimestamp(ssl.cert_time_to_seconds(metadata['notAfter']), timezone.utc)
-                        not_before = before.strftime('%Y-%m-%dT%H:%M:%SZ')
-                        not_after = after.strftime('%Y-%m-%dT%H:%M:%SZ')
-                        status = 'active' if before <= now < after else 'expired'
-                    except ssl.SSLCertVerificationError as exc:
-                        trusted = False
-                        status = 'expired' if exc.verify_code == 10 else 'untrusted'
-                    except (OSError, ssl.SSLError, KeyError, ValueError):
-                        pass
-                    if trusted is False:
-                        try:
-                            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                            context.check_hostname = False
-                            context.verify_mode = ssl.CERT_NONE
-                            with socket.create_connection(('127.0.0.1', 443), timeout=5) as sock:
-                                with context.wrap_socket(sock, server_hostname=host) as tls:
-                                    der = tls.getpeercert(binary_form=True)
-                            fingerprint = hashlib.sha256(der).hexdigest()
-                        except (OSError, ssl.SSLError, ValueError):
-                            status = 'unknown'
-                            trusted = None
-                            fingerprint = None
-                            not_before = None
-                            not_after = None
-                    observed.append({'hostname': host, 'status': status, 'trusted': trusted, 'fingerprint_sha256': fingerprint, 'not_before': not_before, 'not_after': not_after})
-                print(json.dumps(observed, sort_keys=True, separators=(',', ':')))
-              - "{{ route_hosts | to_json }}"
-          register: served_certificate_evidence
-          changed_when: false
-          failed_when: false
-          when: binding_present
-
-        - name: Parse served certificate evidence
-          ansible.builtin.assert:
-            that:
-              - served_certificate_evidence.rc == 0
-              - served_certificate_evidence.stdout is string
-              - (served_certificate_evidence.stdout | length) <= 65536
-            fail_msg: "Served custom certificate observation failed"
-          when: binding_present
-
-        - name: Read served certificate evidence
-          ansible.builtin.set_fact:
-            observed_certificate_hosts: "{{ served_certificate_evidence.stdout | from_json }}"
-            observed_route_hosts: "{{ route_hosts }}"
-            observed_binding_count: 1
-            binding_present: true
-            binding_valid: true
-          when:
-            - binding_present
-            - served_certificate_evidence.rc == 0
-
-        - name: Recheck canonical selection after serving probes
-          ansible.builtin.include_tasks:
-            file: traefik_certificate_selection.yml
-          vars:
-            certificate_selection_action: observe_custom
-            certificate_selection_request:
-              identity:
-                organization_id: "{{ org_id }}"
-                subject: {type: deployment, id: "{{ deployment_id }}"}
-                gateway_id: "{{ gateway_id }}"
-                server_id: "{{ server_id }}"
-                route_hosts: "{{ route_hosts }}"
-
-        - name: Require unchanged installed selection during serving probes
-          ansible.builtin.assert:
-            that:
-              - >-
-                (certificate_selection_result.stdout
-                | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
-                | from_json).custom_certificate_binding == selected_custom_binding
-            fail_msg: "Custom certificate selection changed during observation"
-
-      rescue:
-        - name: Mark unrecognized custom certificate evidence
-          ansible.builtin.set_fact:
-            binding_valid: false
-            binding_present: false
-            observed_material_id: null
-            observed_revision_id: null
-            observed_route_hosts: []
-            observed_binding_count: 0
-            observed_certificate_hosts: []
-            observed_content_digest: null
-            observed_leaf_fingerprint: null
-
-    - name: Classify custom certificate observation
+    - name: Resolve template-owned native subject references
       ansible.builtin.set_fact:
-        custom_certificate_classification: >-
-          {%- if not binding_valid -%}unknown
-          {%- elif not binding_present -%}absent
-          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
-              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
-              and (
-                observed_content_digest != ((custom_observation_expected | default({})).content_digest | default(content_digest))
-                or observed_leaf_fingerprint != ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
-              ) -%}unknown
-          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
-              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
-              and observed_content_digest == ((custom_observation_expected | default({})).content_digest | default(content_digest))
-              and observed_leaf_fingerprint == ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
-              and observed_binding_count == 1
-              and observed_route_hosts == route_hosts
-              and (observed_certificate_hosts | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))) | list | length) == (route_hosts | length) -%}exact
-          {%- elif observed_material_id == ((custom_observation_expected | default({})).material_id | default(material_id))
-              and observed_revision_id == ((custom_observation_expected | default({})).revision_id | default(revision_id))
-              and observed_content_digest == ((custom_observation_expected | default({})).content_digest | default(content_digest))
-              and observed_leaf_fingerprint == ((custom_observation_expected | default({})).leaf_fingerprint_sha256 | default(leaf_fingerprint_sha256))
-              and observed_binding_count == 1
-              and observed_route_hosts == route_hosts -%}other
-          {%- elif observed_binding_count == 1
-              and observed_route_hosts == route_hosts
-              and (observed_certificate_hosts | length) == (route_hosts | length)
-              and (observed_certificate_hosts | map(attribute='hostname') | list) == route_hosts
-              and (observed_certificate_hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
-              and (observed_certificate_hosts | selectattr('fingerprint_sha256', 'equalto', observed_leaf_fingerprint) | list | length) == (route_hosts | length) -%}other
-          {%- else -%}mixed
-          {%- endif -%}
-        custom_certificate_observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+        certificate_subject_key: "{{ certificate_subject.type }}-{{ certificate_subject.id }}"
+        certificate_selection_path: "{{ traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl') }}/certificate-{{ certificate_subject.type }}-{{ certificate_subject.id }}.yml"
+        certificate_timer_name: "{{ certificate_unit_prefix | default('opsctl-certificate-') }}{{ certificate_subject.type }}-{{ certificate_subject.id }}.timer"
+        certificate_service_name: "{{ certificate_unit_prefix | default('opsctl-certificate-') }}{{ certificate_subject.type }}-{{ certificate_subject.id }}.service"
 
-    - name: Build normalized custom certificate observation
-      ansible.builtin.set_fact:
-        custom_certificate_observation_base:
-          adapter_key: "{{ adapter_key }}"
-          mode: "{{ certificate_mode }}"
-          classification: "{{ custom_certificate_classification }}"
-          deployment_id: "{{ deployment_id }}"
-          material_id: "{{ observed_material_id }}"
-          revision_id: "{{ observed_revision_id }}"
-          route_hosts: "{{ observed_route_hosts }}"
-          binding_count: "{{ observed_binding_count }}"
-          host_count: "{{ observed_certificate_hosts | length }}"
-          hosts: "{{ observed_certificate_hosts }}"
-          content_digest: "{{ observed_content_digest }}"
-          leaf_fingerprint_sha256: "{{ observed_leaf_fingerprint }}"
-          observed_at: "{{ custom_certificate_observed_at }}"
+    - name: Observe actual gateway native runtime
+      community.docker.docker_container_info:
+        name: "{{ traefik_container_name | default('traefik') }}"
+      register: certificate_gateway
 
-    - name: Add custom certificate observation digest
+    - name: Require the native file-provider gateway and certificate mount
+      ansible.builtin.assert:
+        that:
+          - certificate_gateway.exists
+          - certificate_gateway.container.State.Running
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.managed') == 'true'
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.org_id') == org_id
+          - "'--providers.file.directory=' ~ (traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl')) in certificate_gateway.container.Config.Cmd"
+          - certificate_gateway.container.Config.Cmd | select('match', '(?i)^--(?:certificatesresolvers|configfile|providers\.file\.filename)') | list | length == 0
+          - >-
+            certificate_gateway.container.Mounts |
+            selectattr('Destination', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
+            selectattr('Source', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
+            selectattr('RW', 'equalto', false) | list | length == 1
+
+    - name: Read bounded selection leaf enrollment and requested SNI facts
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../scripts/certificate_facts.py
+          --selection {{ certificate_selection_path | quote }}
+          --root {{ traefik_certificate_dir | default('/etc/traefik/certificates/opsctl') | quote }}
+          --subject {{ certificate_subject | to_json | quote }}
+          --hosts {{ (route_hosts if certificate_probe_hosts | default(true) else []) | to_json | quote }}
+          --timer {{ certificate_timer_name | quote }}
+          --address {{ certificate_probe_address | default('127.0.0.1') | quote }}
+          --port {{ certificate_probe_port | default(443) }}
+          {{ ('--trust-pem ' ~ (trust_bundle_pem | quote)) if trust_bundle_pem | default(none) is not none else '' }}
+        executable: python3
+      register: certificate_native_observation
+      changed_when: false
+      failed_when: false
+
+    - name: Require bounded native facts before decoding
+      ansible.builtin.assert:
+        that:
+          - certificate_native_observation.stdout is string
+          - certificate_native_observation.stdout | length <= 131072
+
+    - name: Retain plain observed facts and closed failure
       ansible.builtin.set_fact:
-        custom_certificate_observation: >-
-          {{
-            custom_certificate_observation_base
-            | combine({
-                'digest': (
-                  custom_certificate_observation_base
-                  | dict2items
-                  | rejectattr('key', 'equalto', 'observed_at')
-                  | items2dict
-                  | to_json(sort_keys=True, separators=[',', ':'])
-                  | hash('sha256')
-                )
-              })
-          }}
+        certificate_observation: "{{ (certificate_native_observation.stdout | from_json).certificate_observation }}"
+        certificate_procedure_error: >-
+          {{ (certificate_native_observation.stdout | from_json).procedure_error |
+            default(none if certificate_native_observation.rc == 0 else
+              {'phase': 'probe', 'code': 'certificate_serving_unverified'}) }}
+  rescue:
+    - name: Keep unavailable native observation distinct from absence
+      ansible.builtin.set_fact:
+        certificate_procedure_error: {phase: observe, code: certificate_serving_unverified}
+  no_log: true

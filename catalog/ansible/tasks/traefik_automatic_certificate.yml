@@ -1,149 +1,529 @@
 ---
-- name: Validate automatic certificate execution input
-  ansible.builtin.assert:
-    that:
-      - automatic_certificate_request is mapping
-      - automatic_certificate_profile is mapping
-      - traefik_certificate_dir is defined
-      - traefik_dynamic_dir is defined
-      - traefik_acme_state_dir is defined
-      - traefik_acme_state_dir is match('^/[A-Za-z0-9_./-]+$')
-    fail_msg: Automatic certificate execution input is invalid
-
-- name: Validate automatic broker delivery identity
-  ansible.builtin.assert:
-    that:
-      - dns_challenge_token_source_file == '/var/run/opsctl/file-secret/dns-challenge-token'
-      - traefik_acme_dir == '/var/lib/traefik'
-      - dns_challenge_token_revision_id is defined
-      - dns_challenge_token_content_digest is defined
-      - dns_challenge_token_file == traefik_acme_dir ~ '/broker-secrets/token-' ~ dns_challenge_token_revision_id
-      - automatic_certificate_profile.token_file == dns_challenge_token_file
-      - automatic_certificate_profile.broker_url == dns_challenge_broker_url
-    fail_msg: Automatic certificate broker delivery identity is invalid
-  when: automatic_certificate_profile.challenge == 'dns-01'
+- name: Initialize automatic action failure
+  ansible.builtin.set_fact:
+    automatic_certificate_succeeded: false
+    automatic_certificate_error: {phase: validate, code: routing_input_invalid}
+    automatic_config_changed: false
+    automatic_prior_files: []
+    automatic_timer_pause_attempted: false
+    automatic_subject_quiescent: false
+    automatic_unit_attempted: false
+    automatic_previous_observation: null
+    automatic_attempt: {}
+    automatic_cleanup_failed: false
+    automatic_selection_restoration_failed: false
   no_log: true
 
-- name: Refuse broker material for HTTP challenge
-  ansible.builtin.assert:
-    that:
-      - automatic_certificate_profile.token_file is none
-      - automatic_certificate_profile.broker_url is none
-      - dns_challenge_token_revision_id is not defined
-      - dns_challenge_token_content_digest is not defined
-    fail_msg: HTTP certificate action cannot carry broker material
-  when: automatic_certificate_profile.challenge == 'http-01'
-
-- name: Deliver automatic broker credential to the gateway
-  ansible.builtin.include_tasks: traefik_gateway_dns_challenge_secret.yml
-  when: automatic_certificate_profile.challenge == 'dns-01'
-
-- name: Check gateway certificate tooling
-  ansible.builtin.command:
-    argv: [python3, -c, 'import cryptography, yaml']
-  register: automatic_tooling
-  changed_when: false
-  failed_when: false
-
-- name: Install missing gateway certificate tooling
-  ansible.builtin.apt:
-    name: [python3-cryptography, python3-yaml]
-    state: present
-    update_cache: false
-  when: automatic_tooling.rc != 0
-
-- name: Ensure private automatic certificate state
-  ansible.builtin.file:
-    path: "{{ traefik_acme_state_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: '0700'
-
-- name: Ensure private persistent automatic certificate runtime
-  ansible.builtin.file:
-    path: "{{ traefik_acme_state_dir }}/runtime"
-    state: directory
-    owner: root
-    group: root
-    mode: '0700'
-
-- name: Run automatic certificate action
+- name: Configure and invoke this subject's normal renewal unit
   block:
-    - name: Deliver exact official automatic certificate helpers
+    - name: Validate public issuer and challenge intent
+      ansible.builtin.assert:
+        that:
+          - certificate_action in ['issue', 'retry', 'renew']
+          - renewal_enabled is sameas true
+          - acme_email is string and acme_email | length >= 3 and acme_email | length <= 320
+          - acme_directory_url is match('^https://[^/?#@]+/[^?#]*$')
+          - challenge in ['http-01', 'dns-01']
+          - route_hosts | length > 0
+          - route_hosts | length <= 100
+          - challenge != 'http-01' or (broker_url | default(none) is none and broker_token_source_file | default(none) is none)
+          - challenge != 'dns-01' or (broker_url is string and broker_token_source_file is string)
+
+    - name: Observe the existing native subject selection and enrollment
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
+
+    - name: Require the complete reviewed material snapshot
+      ansible.builtin.assert:
+        that:
+          - certificate_observation.outcome == 'succeeded'
+          - expected_certificate.keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+          - expected_certificate.presence in ['present', 'absent']
+          - >-
+            certificate_observation | dict2items |
+            selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+            items2dict == expected_certificate
+
+    - name: Retain prior enrollment and resolve subject-owned settings
+      ansible.builtin.set_fact:
+        automatic_previous_observation: "{{ certificate_observation }}"
+        certificate_subject_state: "{{ traefik_acme_state_dir }}/{{ certificate_subject_key }}"
+        automatic_certificate_error: {phase: stage, code: certificate_issue_failed}
+        dns_challenge_broker_url: "{{ broker_url | default(none) }}"
+        dns_challenge_token_source_file: "{{ broker_token_source_file | default(none) }}"
+        dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('unavailable') }}"
+
+    - name: Inspect only this subject's timer
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_timer_name }}", --no-pager, --property=LoadState]
+      register: automatic_timer_load
+      changed_when: false
+      failed_when: false
+
+    - name: Require known timer availability
+      ansible.builtin.assert:
+        that: automatic_timer_load.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
+
+    - name: Track timer mutation before systemd can partly change enrollment
+      ansible.builtin.set_fact:
+        automatic_timer_pause_attempted: true
+      when: automatic_timer_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Pause the subject timer before changing its procedure
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
+        state: stopped
+        enabled: false
+      when: automatic_timer_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Inspect the subject service independently of timer existence
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=LoadState]
+      register: automatic_service_load
+      changed_when: false
+      failed_when: false
+
+    - name: Require known active-service availability
+      ansible.builtin.assert:
+        that: automatic_service_load.stdout | trim in ['LoadState=loaded', 'LoadState=not-found']
+
+    - name: Wait for the current subject unit without interrupting its client
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=ActiveState, --value]
+      register: automatic_service_wait
+      changed_when: false
+      until: automatic_service_wait.stdout | trim in ['inactive', 'failed']
+      retries: 126
+      delay: 10
+      when: automatic_service_load.stdout | trim == 'LoadState=loaded'
+
+    - name: Record that this subject is quiescent
+      ansible.builtin.set_fact:
+        automatic_subject_quiescent: true
+
+    - name: Require existing native certificate and finite shell tooling
+      ansible.builtin.command:
+        argv: [python3, -c, "import cryptography, yaml, shutil; assert all(shutil.which(x) for x in ('openssl', 'systemctl', 'flock', 'timeout', 'docker', 'bash'))"]
+      changed_when: false
+
+    - name: Deliver and verify protected DNS token before enrollment
+      ansible.builtin.include_tasks: traefik_gateway_dns_challenge_secret.yml
+      when: challenge == 'dns-01'
+
+    - name: Ensure private subject state and primitive directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop:
+        - "{{ traefik_acme_state_dir }}"
+        - "{{ certificate_subject_state }}"
+        - "{{ certificate_subject_state }}/lego"
+        - "{{ traefik_certificate_dir }}/runtime"
+
+    - name: Install only the two native certificate primitives
       ansible.builtin.copy:
         src: "../scripts/{{ item }}"
-        dest: "{{ traefik_acme_state_dir }}/runtime/{{ item }}"
+        dest: "{{ traefik_certificate_dir }}/runtime/{{ item }}"
         owner: root
         group: root
         mode: '0600'
-      loop: [traefik_automatic_certificate.py, traefik_certificate_selection.py]
+      loop: [certificate_facts.py, traefik_certificate_publish.py]
 
-    - name: Execute local issuer and selected-file activation
-      ansible.builtin.command:
-        argv: >-
-          {{ [ 'python3', traefik_acme_state_dir ~ '/runtime/traefik_automatic_certificate.py' ]
-             + ([ 'setup' ] if automatic_certificate_setup | default(false) else []) }}
-        stdin: >-
-          {{ {'profile': automatic_certificate_profile,
-              'request': automatic_certificate_request} | to_json }}
-      environment:
-        OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-        OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-        OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-      register: automatic_action
-      failed_when: false
-      no_log: true
+    - name: Ensure the exact admitted native client image
+      community.docker.docker_image:
+        name: goacme/lego@sha256:1944e8c36055beec47c7de6f15202b41128be75eea0ffa257f0c14d93c5155fd
+        source: pull
+        state: present
 
-    - name: Report bounded automatic certificate failure
+    - name: Inspect the exact prior subject procedure files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ certificate_subject_state }}/renew.sh"
+        - "{{ certificate_subject_state }}/challenge.yml"
+        - "/etc/systemd/system/{{ certificate_service_name }}"
+        - "/etc/systemd/system/{{ certificate_timer_name }}"
+      register: automatic_prior_stats
+
+    - name: Require bounded regular prior procedure files
       ansible.builtin.assert:
-        that: automatic_action.rc == 0
-        fail_msg: "{{ automatic_action.stderr | default('Automatic certificate action failed') }}"
+        that:
+          - not item.stat.exists or item.stat.isreg | default(false)
+          - not item.stat.exists or item.stat.uid == 0
+          - not item.stat.exists or item.stat.size <= 65536
+      loop: "{{ automatic_prior_stats.results }}"
 
-    - name: Install gateway-local automatic renewal service
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/opsctl-certificate-renewal.service
+    - name: Read exact prior procedure bytes before any replacement
+      ansible.builtin.slurp:
+        src: "{{ item.item }}"
+      loop: "{{ automatic_prior_stats.results }}"
+      when: item.stat.exists
+      register: automatic_prior_contents
+
+    - name: Retain this invocation's bounded prior file set
+      ansible.builtin.set_fact:
+        automatic_prior_files: "{{ automatic_prior_contents.results }}"
+        automatic_config_changed: true
+
+    - name: Install this subject's finite renewal procedure
+      ansible.builtin.template:
+        src: ../templates/traefik_certificate_renew.sh.j2
+        dest: "{{ certificate_subject_state }}/renew.sh"
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Stage only this subject's HTTP challenge document
+      ansible.builtin.template:
+        src: ../templates/traefik_certificate_challenge.yml.j2
+        dest: "{{ certificate_subject_state }}/challenge.yml"
+        owner: root
+        group: root
+        mode: '0600'
+      when: challenge == 'http-01'
+
+    - name: Install the same oneshot unit for this explicit manual action
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ certificate_subject_state }}"
+        prefix: .attempt-
+      register: automatic_attempt
+
+    - name: Install the subject unit with this invocation's private native state
+      ansible.builtin.template:
+        src: ../templates/traefik_certificate_renewal.service.j2
+        dest: "/etc/systemd/system/{{ certificate_service_name }}"
         owner: root
         group: root
         mode: '0644'
-        content: |
-          [Unit]
-          Description=OpsCtl gateway-local automatic certificate renewal
-          Wants=network-online.target
-          After=network-online.target docker.service
-          Requires=docker.service
+      vars:
+        certificate_unit_action: "{{ certificate_action }}"
 
-          [Service]
-          Type=oneshot
-          UMask=0077
-          Environment="OPSCTL_ACME_STATE_DIR={{ traefik_acme_state_dir }}"
-          ExecStart=/usr/bin/python3 "{{ traefik_acme_state_dir }}/runtime/traefik_automatic_certificate.py" renew-due
-
-    - name: Install mandatory automatic renewal timer
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/opsctl-certificate-renewal.timer
+    - name: Install the subject timer using the existing UTC schedule
+      ansible.builtin.template:
+        src: ../templates/traefik_certificate_renewal.timer.j2
+        dest: "/etc/systemd/system/{{ certificate_timer_name }}"
         owner: root
         group: root
         mode: '0644'
-        content: |
-          [Unit]
-          Description=OpsCtl automatic certificate due checks
 
-          [Timer]
-          OnCalendar=*-*-* 00,06,12,18:00:00
-          RandomizedDelaySec=30m
-          Persistent=true
+    - name: Select actual issuance failure before invoking the native unit
+      ansible.builtin.set_fact:
+        automatic_certificate_error: {phase: renew, code: certificate_issue_failed}
+        automatic_unit_attempted: true
 
-          [Install]
-          WantedBy=timers.target
-
-    - name: Enable gateway-owned automatic renewal
+    - name: Invoke the normal subject unit and wait for its bounded outcome
       ansible.builtin.systemd_service:
-        name: opsctl-certificate-renewal.timer
+        name: "{{ certificate_service_name }}"
+        daemon_reload: true
+        state: started
+
+    - name: Record successful client publication without inventing served facts
+      ansible.builtin.set_fact:
+        automatic_certificate_succeeded: true
+        automatic_certificate_error: null
+  rescue:
+    - name: Retain original issuance failure for final facts
+      ansible.builtin.set_fact:
+        automatic_certificate_succeeded: false
+  always:
+    - name: Observe and dispose only this invocation's native client and state
+      block:
+        - name: Observe changed procedure completion before cleanup or restoration
+          ansible.builtin.command:
+            argv: [systemctl, show, "{{ certificate_service_name }}", --no-pager, --property=ActiveState, --value]
+          changed_when: false
+          register: automatic_changed_service
+          when: automatic_unit_attempted
+
+        - name: Refuse restoration while a changed procedure is unfinished or unknown
+          ansible.builtin.assert:
+            that: automatic_changed_service.stdout | trim in ['inactive', 'failed']
+          when: automatic_unit_attempted
+
+        - name: Inspect this invocation's private publication outcome before cleanup
+          ansible.builtin.stat:
+            path: "{{ automatic_attempt.path }}/publication.json"
+            follow: false
+          when: automatic_attempt.path is defined
+          register: automatic_publication_stat
+
+        - name: Require bounded private publication facts
+          ansible.builtin.assert:
+            that:
+              - automatic_publication_stat.stat.isreg
+              - not automatic_publication_stat.stat.islnk
+              - automatic_publication_stat.stat.uid == 0
+              - automatic_publication_stat.stat.mode == '0600'
+              - automatic_publication_stat.stat.size <= 131072
+          when: automatic_publication_stat.stat.exists | default(false)
+
+        - name: Read available publication outcome without exposing native logs
+          ansible.builtin.slurp:
+            src: "{{ automatic_attempt.path }}/publication.json"
+          when: automatic_publication_stat.stat.size | default(0) > 0
+          register: automatic_publication_bytes
+
+        - name: Preserve an interrupted publication as unknown restoration liability
+          ansible.builtin.set_fact:
+            automatic_certificate_error: {phase: restore, code: restoration_failed}
+            automatic_certificate_succeeded: false
+            automatic_selection_restoration_failed: true
+          when:
+            - automatic_publication_stat.stat.exists | default(false)
+            - automatic_publication_stat.stat.size | default(0) == 0
+
+        - name: Retain native publication failure and restoration disposition
+          ansible.builtin.set_fact:
+            automatic_certificate_error: "{{ automatic_publication_facts.procedure_error }}"
+            automatic_certificate_succeeded: false
+            automatic_selection_restoration_failed: "{{ automatic_publication_facts.procedure_error.code == 'restoration_failed' }}"
+          vars:
+            automatic_publication_facts: "{{ automatic_publication_bytes.content | b64decode | from_json }}"
+          when:
+            - automatic_publication_bytes.content is defined
+            - automatic_publication_facts.procedure_error is defined
+
+        - name: Inspect only this invocation's native client ID file
+          ansible.builtin.stat:
+            path: "{{ automatic_attempt.path }}/client.id"
+            follow: false
+          when: automatic_attempt.path is defined
+          register: automatic_client_stat
+
+        - name: Require a bounded private regular native ID before cleanup
+          ansible.builtin.assert:
+            that:
+              - automatic_client_stat.stat.isreg
+              - not automatic_client_stat.stat.islnk
+              - automatic_client_stat.stat.uid == 0
+              - automatic_client_stat.stat.mode == '0600'
+              - automatic_client_stat.stat.size in [64, 65]
+          when: automatic_client_stat.stat.exists | default(false)
+
+        - name: Read the exact client ID retained by this invocation
+          ansible.builtin.slurp:
+            src: "{{ automatic_attempt.path }}/client.id"
+          when: automatic_client_stat.stat.exists | default(false)
+          register: automatic_client_id
+
+        - name: Validate full native client identity
+          ansible.builtin.assert:
+            that: automatic_client_id.content | b64decode | trim is match('^[a-f0-9]{64}$')
+          when: automatic_client_stat.stat.exists | default(false)
+
+        - name: Observe the exact owned client through its native module
+          community.docker.docker_container_info:
+            name: "{{ automatic_client_id.content | b64decode | trim }}"
+          when: automatic_client_stat.stat.exists | default(false)
+          register: automatic_client_observed
+
+        - name: Require exact matching subject labels before owned client removal
+          ansible.builtin.assert:
+            that:
+              - automatic_client_observed.container.Id == automatic_client_id.content | b64decode | trim
+              - automatic_client_observed.container.Config.Labels.get('com.opsctl.component') == 'automatic_certificate'
+              - automatic_client_observed.container.Config.Labels.get('com.opsctl.subject_type') == certificate_subject.type
+              - automatic_client_observed.container.Config.Labels.get('com.opsctl.subject_id') == certificate_subject.id
+          when: automatic_client_observed.exists | default(false)
+
+        - name: Reap only this positively identified invocation's retained client
+          community.docker.docker_container:
+            name: "{{ automatic_client_observed.container.Id }}"
+            state: absent
+            force_kill: true
+            keep_volumes: true
+          when: automatic_client_observed.exists | default(false)
+
+        - name: Reobserve exact native client absence
+          community.docker.docker_container_info:
+            name: "{{ automatic_client_id.content | b64decode | trim }}"
+          when: automatic_client_stat.stat.exists | default(false)
+          register: automatic_client_after
+
+        - name: Require actual owned client absence before disposing native state
+          ansible.builtin.assert:
+            that: not automatic_client_after.exists
+          when: automatic_client_stat.stat.exists | default(false)
+
+        - name: Observe exact temporary HTTP route names after the unit trap
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+          loop:
+            - "{{ traefik_dynamic_dir }}/acme-{{ certificate_subject_key }}.yml"
+            - "{{ traefik_dynamic_dir }}/acme-{{ certificate_subject_key }}.yml.{{ automatic_attempt.path | basename }}"
+          when: automatic_attempt.path is defined and challenge == 'http-01'
+          register: automatic_route_cleanup
+
+        - name: Refuse leftover routes instead of adopting or deleting unknown content
+          ansible.builtin.assert:
+            that: not item.stat.exists
+          loop: "{{ automatic_route_cleanup.results | default([]) }}"
+          when: not (item.skipped | default(false))
+
+        - name: Remove only the known private attempt files after native cleanup
+          ansible.builtin.file:
+            path: "{{ automatic_attempt.path }}/{{ item }}"
+            state: absent
+          loop: [expected.json, client.id, publication.json, client.log]
+          when: automatic_attempt.path is defined
+
+        - name: Inspect the invocation directory after exact file cleanup
+          ansible.builtin.stat:
+            path: "{{ automatic_attempt.path }}"
+            follow: false
+          when: automatic_attempt.path is defined
+          register: automatic_attempt_after
+
+        - name: Remove only the empty private invocation directory
+          ansible.builtin.command:
+            argv: [rmdir, --, "{{ automatic_attempt.path }}"]
+          when: automatic_attempt_after.stat.exists | default(false)
+      rescue:
+        - name: Retain unknown native cleanup as restoration liability
+          ansible.builtin.set_fact:
+            automatic_cleanup_failed: true
+            automatic_certificate_succeeded: false
+            automatic_certificate_error: {phase: restore, code: restoration_failed}
+
+    - name: Restore due-mode service after the manual action finishes
+      ansible.builtin.template:
+        src: ../templates/traefik_certificate_renewal.service.j2
+        dest: "/etc/systemd/system/{{ certificate_service_name }}"
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        certificate_unit_action: due
+      when: automatic_certificate_succeeded and not automatic_cleanup_failed
+      register: automatic_service_restore
+      ignore_errors: true
+
+    - name: Restore exact prior subject procedure bytes on failure
+      ansible.builtin.copy:
+        content: "{{ item.content | b64decode }}"
+        dest: "{{ item.item.item }}"
+        owner: root
+        group: root
+        mode: "{{ item.item.stat.mode }}"
+      loop: "{{ automatic_prior_files }}"
+      when:
+        - not automatic_certificate_succeeded
+        - automatic_config_changed
+        - automatic_subject_quiescent
+        - not automatic_cleanup_failed
+        - item.item.stat.exists
+      register: automatic_config_restore
+      ignore_errors: true
+
+    - name: Remove only new procedure files absent before this attempt
+      ansible.builtin.file:
+        path: "{{ item.item.item }}"
+        state: absent
+      loop: "{{ automatic_prior_files }}"
+      when:
+        - not automatic_certificate_succeeded
+        - automatic_config_changed
+        - automatic_subject_quiescent
+        - not automatic_cleanup_failed
+        - not item.item.stat.exists
+      register: automatic_config_remove
+      ignore_errors: true
+
+    - name: Enable verified automatic enrollment
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
         daemon_reload: true
         enabled: true
         state: started
+      when: automatic_certificate_succeeded
+      register: automatic_timer_enable
+      ignore_errors: true
 
-    - name: Emit sanitized automatic certificate receipt
-      ansible.builtin.debug:
-        msg: "{{ automatic_action.stdout }}"
+    - name: Reobserve selection before restoring enrollment after a unit attempt
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
+      when:
+        - not automatic_certificate_succeeded
+        - automatic_unit_attempted
+        - not automatic_cleanup_failed
+
+    - name: Preserve changed or unknown selection restoration as liability
+      ansible.builtin.set_fact:
+        automatic_selection_restoration_failed: true
+        automatic_certificate_error: {phase: restore, code: restoration_failed}
+      when:
+        - not automatic_certificate_succeeded
+        - automatic_unit_attempted
+        - >-
+          certificate_observation.outcome != 'succeeded' or
+          (certificate_observation | dict2items |
+           selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+           items2dict != expected_certificate)
+
+    - name: Restore prior automatic enrollment only with unchanged or restored owners
+      ansible.builtin.systemd_service:
+        name: "{{ certificate_timer_name }}"
+        daemon_reload: true
+        enabled: "{{ automatic_previous_observation.renewal.enabled }}"
+        state: "{{ 'started' if automatic_previous_observation.renewal.active else 'stopped' }}"
+      when:
+        - not automatic_certificate_succeeded
+        - automatic_timer_pause_attempted
+        - not automatic_cleanup_failed
+        - not automatic_selection_restoration_failed
+        - >-
+          not automatic_config_changed or
+          (automatic_subject_quiescent and
+           not (automatic_config_restore.failed | default(false)) and
+           not (automatic_config_remove.failed | default(false)))
+        - automatic_previous_observation is not none
+        - automatic_previous_observation.source == 'automatic'
+        - automatic_previous_observation.renewal.enabled is boolean
+        - automatic_previous_observation.renewal.active is boolean
+      register: automatic_timer_restore
+      ignore_errors: true
+
+    - name: Preserve failed native enrollment or restoration truth
+      ansible.builtin.set_fact:
+        automatic_certificate_succeeded: false
+        automatic_certificate_error: {phase: restore, code: restoration_failed}
+      when: >-
+        automatic_service_restore.failed | default(false) or
+        automatic_timer_enable.failed | default(false) or automatic_timer_restore.failed | default(false) or
+        automatic_config_restore.failed | default(false) or automatic_config_remove.failed | default(false)
+
+    - name: Observe final selected leaf every host and actual timer
+      ansible.builtin.include_tasks: traefik_custom_certificate_observation.yml
+
+    - name: Dispose only a newly delivered DNS token with no retained native reference
+      ansible.builtin.include_tasks: traefik_gateway_dns_challenge_cleanup.yml
+      when: not automatic_certificate_succeeded and challenge | default('http-01') == 'dns-01'
+
+    - name: Retain original failure alongside available final facts
+      ansible.builtin.set_fact:
+        certificate_procedure_error: "{{ automatic_certificate_error if not automatic_certificate_succeeded else certificate_procedure_error }}"
+        certificate_observation: >-
+          {{ certificate_observation | combine({'outcome': 'failed'})
+             if not automatic_certificate_succeeded and certificate_observation.outcome == 'succeeded'
+             else certificate_observation }}
+  no_log: true
+
+- name: Emit plain selected served and renewal facts
+  ansible.builtin.debug:
+    msg: >-
+      TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+        combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+  when: certificate_emit_result | default(true)
+
+- name: Fail after reporting the actual automatic result
+  ansible.builtin.fail:
+    msg: Certificate issuance failed. The previous selection is retained unless restoration is reported failed.
+  when: not automatic_certificate_succeeded or certificate_observation.outcome != 'succeeded'

@@ -1,109 +1,21 @@
 ---
-- name: Read exact managed certificate selection without mutation
+- name: Observe one subject's installed selection
   hosts: all
   gather_facts: false
   become: true
-  vars:
-    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
-    traefik_certificate_dir: /etc/traefik/certificates/opsctl
-    traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
-  pre_tasks:
-    - name: Validate selection observation envelope
-      ansible.builtin.assert:
-        that:
-          - certificate_selection_request is mapping
-          - not (simulate | default(false) | bool)
-        fail_msg: Certificate selection observation input is invalid
-      no_log: true
-
-    - name: Check existing certificate selection tooling
-      ansible.builtin.command:
-        argv: [python3, -c, 'import cryptography, yaml']
-      changed_when: false
-      failed_when: false
-      register: selection_tooling
-
-    - name: Require existing certificate selection tooling
-      ansible.builtin.assert:
-        that: selection_tooling.rc == 0
-        fail_msg: Certificate selection observation tooling is unavailable
   tasks:
-    - name: Observe qualified selected bytes
-      block:
-        - name: Create transient selection observation directory
-          ansible.builtin.tempfile:
-            state: directory
-            prefix: opsctl-certificate-observation-
-          register: selection_scratch
+    - name: Read native certificate facts without mutation
+      ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+      vars:
+        certificate_probe_hosts: false
 
-        - name: Deliver existing physical selection helper
-          ansible.builtin.copy:
-            src: ../scripts/traefik_certificate_selection.py
-            dest: "{{ selection_scratch.path }}/selection.py"
-            owner: root
-            group: root
-            mode: '0700'
+    - name: Emit plain certificate facts
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
 
-        - name: Read bounded managed certificate layout metadata
-          ansible.builtin.command:
-            argv: [python3, "{{ selection_scratch.path }}/selection.py", observe_layout]
-            stdin: "{{ certificate_selection_request | to_json }}"
-          environment:
-            OPSCTL_ACME_STATE_DIR: "{{ traefik_acme_state_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-            PYTHONDONTWRITEBYTECODE: '1'
-          register: selection_layout
-          changed_when: false
-          failed_when: false
-          no_log: true
-
-        - name: Require bounded safe layout metadata output
-          ansible.builtin.assert:
-            that:
-              - selection_layout.rc == 0
-              - selection_layout.stdout is string
-              - selection_layout.stdout | length <= 8192
-              - selection_layout.stdout is match('^CERTIFICATE_LAYOUT_METADATA=')
-            fail_msg: Certificate layout metadata is unavailable
-          no_log: true
-
-        - name: Emit separate safe layout metadata
-          ansible.builtin.debug:
-            msg: "{{ selection_layout.stdout }}"
-
-        - name: Read selected binding and material snapshot
-          ansible.builtin.command:
-            argv: [python3, "{{ selection_scratch.path }}/selection.py", observe]
-            stdin: "{{ certificate_selection_request | to_json }}"
-          environment:
-            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-            PYTHONDONTWRITEBYTECODE: '1'
-          register: selection_observation
-          changed_when: false
-          failed_when: false
-          no_log: true
-
-        - name: Require bounded successful selection observation
-          ansible.builtin.assert:
-            that:
-              - selection_observation.rc == 0
-              - selection_observation.stdout is string
-              - selection_observation.stdout | length <= 524288
-              - selection_observation.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-            fail_msg: Certificate selection observation is unavailable
-          no_log: true
-
-        - name: Emit closed selection evidence
-          ansible.builtin.debug:
-            msg: "{{ selection_observation.stdout }}"
-      rescue:
-        - name: Refuse unavailable selection observation
-          ansible.builtin.fail:
-            msg: Certificate selection observation is unavailable
-      always:
-        - name: Remove transient selection observation directory
-          ansible.builtin.file:
-            path: "{{ selection_scratch.path }}"
-            state: absent
-          when: selection_scratch is defined and selection_scratch.path is defined
+    - name: Refuse unavailable or unverified native facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: certificate_observation.outcome != 'succeeded'

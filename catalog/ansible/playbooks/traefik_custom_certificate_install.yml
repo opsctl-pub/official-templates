@@ -1,446 +1,95 @@
 ---
-- name: Install one Deployment custom certificate on managed Traefik
+- name: Install the authorized subject's custom certificate
   hosts: all
   gather_facts: false
   become: true
   vars:
-    traefik_container_name: "traefik"
-    certificate_source_dir: "/var/run/opsctl/file-secret"
-    traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
-    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
-    material_dir: "{{ traefik_certificate_dir }}/material-{{ material_id }}"
-    revision_dir: "{{ material_dir }}/revision-{{ revision_id }}"
-    certificate_file: "{{ revision_dir }}/tls.crt"
-    private_key_file: "{{ revision_dir }}/tls.key"
-    binding_file: "{{ traefik_dynamic_dir }}/certificate-deployment-{{ deployment_id }}.yml"
+    certificate_source_dir: /var/run/opsctl/file-secret
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
   pre_tasks:
-    - name: Validate custom certificate installation identity
-      ansible.builtin.assert:
-        that:
-          - adapter_key == 'traefik_custom_file'
-          - certificate_mode == 'custom'
-          - not (simulate | default(false) | bool)
-          - org_id is string
-          - org_id == (org_id | trim)
-          - (org_id | length) > 0
-          - deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - gateway_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - material_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - revision_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-          - metadata_digest is match('^[0-9a-f]{64}$')
-          - content_digest is match('^[0-9a-f]{64}$')
-          - leaf_fingerprint_sha256 is match('^[0-9a-f]{64}$')
-          - route_hosts is sequence
-          - route_hosts is not string
-          - (route_hosts | length) > 0
-          - (route_hosts | length) <= 100
-          - route_hosts == (route_hosts | unique | sort | list)
-          - (route_hosts | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') | list | length) == (route_hosts | length)
-          - target_server is string
-          - target_server == (target_server | trim)
-          - (target_server | length) > 0
-          - >-
-            ((expected_custom_certificate_observation is defined) | int)
-            + ((expected_automatic_certificate_selection is defined) | int)
-            + ((expected_previous_custom_selection is defined) | int) == 1
-          - >-
-            (expected_custom_certificate_observation is not defined)
-            or (expected_custom_certificate_observation is mapping)
-        fail_msg: "Custom certificate installation identity is invalid"
-
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
   tasks:
-    - name: Qualify the exact automatic predecessor selection
-      when: expected_automatic_certificate_selection is defined
-      no_log: true
+    - name: Initialize safe custom action failure
+      ansible.builtin.set_fact:
+        certificate_selection_succeeded: false
+        custom_certificate_error: {phase: validate, code: routing_input_invalid}
+
+    - name: Validate and perform the admitted custom action
       block:
-        - name: Validate the closed automatic predecessor envelope
+        - name: Validate admitted custom material identity
           ansible.builtin.assert:
             that:
-              - expected_automatic_certificate_selection is mapping
-              - >-
-                (expected_automatic_certificate_selection.keys() | sort | list)
-                == ['digest', 'expected_binding', 'identity', 'operation_id']
-              - >-
-                expected_automatic_certificate_selection.identity == {
-                  'organization_id': org_id,
-                  'subject': {'type': 'deployment', 'id': deployment_id},
-                  'gateway_id': gateway_id,
-                  'server_id': server_id,
-                  'route_hosts': route_hosts
-                }
-              - expected_automatic_certificate_selection.operation_id is string
-              - expected_automatic_certificate_selection.operation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-              - expected_automatic_certificate_selection.expected_binding is string
-              - (expected_automatic_certificate_selection.expected_binding | length) > 0
-              - (expected_automatic_certificate_selection.expected_binding | length) <= 65536
-              - expected_automatic_certificate_selection.digest is string
-              - expected_automatic_certificate_selection.digest is match('^[0-9a-f]{64}$')
-            fail_msg: "Automatic predecessor selection is invalid"
+              - certificate_subject.type == 'deployment'
+              - material_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - revision_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - leaf_fingerprint_sha256 is match('^[0-9a-f]{64}$')
+            fail_msg: Routing procedure inputs are invalid. Refresh the review.
+          no_log: true
 
-    - name: Qualify the closed previous custom selection
-      when: expected_previous_custom_selection is defined
-      no_log: true
-      block:
-        - name: Validate the closed previous custom envelope
-          ansible.builtin.assert:
-            that:
-              - expected_previous_custom_selection is mapping
-              - >-
-                (expected_previous_custom_selection.keys() | sort | list)
-                == ['digest', 'expected_binding', 'identity', 'operation_id']
-              - expected_previous_custom_selection.identity is mapping
-              - >-
-                (expected_previous_custom_selection.identity.keys() | sort | list)
-                == ['gateway_id', 'organization_id', 'route_hosts', 'server_id', 'subject']
-              - >-
-                expected_previous_custom_selection.identity == {
-                  'organization_id': org_id,
-                  'subject': {'type': 'deployment', 'id': deployment_id},
-                  'gateway_id': gateway_id,
-                  'server_id': server_id,
-                  'route_hosts': expected_previous_custom_selection.identity.route_hosts
-                }
-              - expected_previous_custom_selection.identity.route_hosts is sequence
-              - expected_previous_custom_selection.identity.route_hosts is not string
-              - (expected_previous_custom_selection.identity.route_hosts | length) > 0
-              - (expected_previous_custom_selection.identity.route_hosts | length) <= 100
-              - expected_previous_custom_selection.identity.route_hosts == (expected_previous_custom_selection.identity.route_hosts | unique | sort | list)
-              - >-
-                (expected_previous_custom_selection.identity.route_hosts
-                | select('match', '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
-                | list | length) == (expected_previous_custom_selection.identity.route_hosts | length)
-              - expected_previous_custom_selection.operation_id is string
-              - expected_previous_custom_selection.operation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-              - expected_previous_custom_selection.expected_binding is string
-              - (expected_previous_custom_selection.expected_binding | length) > 0
-              - (expected_previous_custom_selection.expected_binding | length) <= 65536
-              - expected_previous_custom_selection.digest is string
-              - expected_previous_custom_selection.digest is match('^[0-9a-f]{64}$')
-            fail_msg: "Previous custom selection is invalid"
-
-    - name: Qualify the exact registered predecessor selection
-      when: expected_automatic_certificate_selection is defined or expected_previous_custom_selection is defined
-      no_log: true
-      block:
-        - name: Select the distinct registered predecessor envelope
+        - name: Select material validation failure before protected input reads
           ansible.builtin.set_fact:
-            custom_predecessor_selection: >-
-              {{ expected_previous_custom_selection
-                 if expected_previous_custom_selection is defined
-                 else expected_automatic_certificate_selection }}
+            custom_certificate_error: {phase: stage, code: certificate_material_invalid}
 
-        - name: Read the canonical predecessor through the selected-pool owner
-          ansible.builtin.include_tasks:
-            file: ../tasks/traefik_certificate_selection.yml
-          vars:
-            certificate_selection_action: observe
-            certificate_selection_request:
-              identity: "{{ custom_predecessor_selection.identity }}"
-              operation_id: "{{ custom_predecessor_selection.operation_id }}"
-
-        - name: Require a bounded canonical predecessor observation
-          ansible.builtin.assert:
-            that:
-              - certificate_selection_result.stdout is string
-              - (certificate_selection_result.stdout | length) <= 131072
-              - certificate_selection_result.stdout is match('^TEMPLATE_OUTPUT_JSON=')
-            fail_msg: "Registered predecessor selection changed before installation"
-
-        - name: Compare the complete registered predecessor envelope
-          ansible.builtin.set_fact:
-            custom_predecessor_unchanged: >-
-              {{ (certificate_selection_result.stdout
-                  | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
-                  | from_json) == {
-                    'automatic_certificate_selection': custom_predecessor_selection
-                  } }}
-
-        - name: Capture the freshly qualified predecessor bytes for activation CAS
-          ansible.builtin.set_fact:
-            custom_selected_binding_bytes: >-
-              {{ (certificate_selection_result.stdout
-                  | regex_replace('^TEMPLATE_OUTPUT_JSON=', '')
-                  | from_json).automatic_certificate_selection.expected_binding }}
-          when: custom_predecessor_unchanged
-
-        - name: Observe only an already-requested custom replay
-          ansible.builtin.include_tasks:
-            file: ../tasks/traefik_custom_certificate_observation.yml
-          when: not custom_predecessor_unchanged
-
-        - name: Require exact requested custom serving for original-request replay
-          ansible.builtin.assert:
-            that:
-              - binding_valid and binding_present
-              - custom_certificate_observation.classification == 'exact'
-              - custom_certificate_observation.material_id == material_id
-              - custom_certificate_observation.revision_id == revision_id
-              - custom_certificate_observation.content_digest == content_digest
-              - custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
-              - custom_certificate_observation.route_hosts == route_hosts
-              - custom_certificate_observation.binding_count == 1
-              - custom_certificate_observation.host_count == (route_hosts | length)
-              - (custom_certificate_observation.hosts | map(attribute='hostname') | list) == route_hosts
-              - (custom_certificate_observation.hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
-              - (custom_certificate_observation.hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
-              - (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
-            fail_msg: "Registered predecessor changed without exact requested custom replay"
-          when: not custom_predecessor_unchanged
-
-    - name: Read current custom certificate observation
-      ansible.builtin.include_tasks:
-        file: ../tasks/traefik_custom_certificate_observation.yml
-      vars:
-        custom_observation_expected: "{{ expected_custom_certificate_observation }}"
-      when: expected_automatic_certificate_selection is not defined and expected_previous_custom_selection is not defined
-
-    - name: Require unchanged custom certificate observation
-      ansible.builtin.assert:
-        that:
-          - >-
-            (
-              custom_certificate_observation.classification in ['absent', 'exact', 'other']
-              and expected_custom_certificate_observation.classification in ['absent', 'exact', 'other']
-              and (
-                custom_certificate_observation
-                | dict2items
-                | rejectattr('key', 'in', ['observed_at', 'digest', 'classification'])
-                | items2dict
-              ) == (
-                expected_custom_certificate_observation
-                | dict2items
-                | rejectattr('key', 'in', ['observed_at', 'digest', 'classification'])
-                | items2dict
-              )
-            ) or (
-              binding_valid and binding_present
-              and custom_certificate_observation.material_id == material_id
-              and custom_certificate_observation.revision_id == revision_id
-              and custom_certificate_observation.content_digest == content_digest
-              and custom_certificate_observation.leaf_fingerprint_sha256 == leaf_fingerprint_sha256
-              and custom_certificate_observation.route_hosts == route_hosts
-              and custom_certificate_observation.binding_count == 1
-              and custom_certificate_observation.host_count == (route_hosts | length)
-              and (custom_certificate_observation.hosts | map(attribute='hostname') | list) == route_hosts
-              and (custom_certificate_observation.hosts | selectattr('status', 'equalto', 'active') | list | length) == (route_hosts | length)
-              and (custom_certificate_observation.hosts | selectattr('trusted', 'sameas', true) | list | length) == (route_hosts | length)
-              and (custom_certificate_observation.hosts | selectattr('fingerprint_sha256', 'equalto', leaf_fingerprint_sha256) | list | length) == (route_hosts | length)
-            )
-        fail_msg: "Custom certificate state changed before installation"
-      when: expected_automatic_certificate_selection is not defined and expected_previous_custom_selection is not defined
-
-    - name: Install immutable custom certificate material
-      no_log: true
-      block:
-        - name: Validate mounted certificate material
+        - name: Validate protected mounted file-secret content before delivery
           ansible.builtin.command:
             argv:
               - python3
               - -c
               - |
                 import hashlib
-                import json
                 import sys
-                from cryptography import x509
-                from cryptography.hazmat.primitives import hashes, serialization
-
-                cert_path, key_path, expected_digest, expected_fingerprint = sys.argv[1:5]
-                expected_hosts = tuple(json.loads(sys.argv[5]))
-                files = {'tls.crt': open(cert_path, 'rb').read(), 'tls.key': open(key_path, 'rb').read()}
-                digest = hashlib.sha256()
-                digest.update(b'opsctl-file-secret:1\0')
-                for name in sorted(files):
-                    encoded_name = name.encode('ascii')
-                    value = files[name]
-                    digest.update(len(encoded_name).to_bytes(2, 'big'))
-                    digest.update(encoded_name)
+                from pathlib import Path
+                digest = hashlib.sha256(b'opsctl-file-secret:1\0')
+                for name in ('tls.crt', 'tls.key'):
+                    path = Path(sys.argv[1]) / name
+                    with path.open('rb') as stream:
+                        value = stream.read(262145)
+                    if not value or len(value) > 262144:
+                        raise SystemExit(2)
+                    encoded = name.encode('ascii')
+                    digest.update(len(encoded).to_bytes(2, 'big'))
+                    digest.update(encoded)
                     digest.update(len(value).to_bytes(8, 'big'))
                     digest.update(value)
-                if digest.hexdigest() != expected_digest:
+                if digest.hexdigest() != sys.argv[2]:
                     raise SystemExit(2)
-                certificates = x509.load_pem_x509_certificates(files['tls.crt'])
-                private_key = serialization.load_pem_private_key(files['tls.key'], password=None)
-                leaf = certificates[0]
-                if leaf.fingerprint(hashes.SHA256()).hex() != expected_fingerprint:
-                    raise SystemExit(3)
-                leaf_key = leaf.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-                private_key_public = private_key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-                if leaf_key != private_key_public:
-                    raise SystemExit(4)
-                sans = tuple(sorted(leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)))
-                def covered(host):
-                    return host in sans or any(item.startswith('*.') and host.count('.') == item.count('.') and host.endswith(item[1:]) for item in sans)
-                if not all(covered(host) for host in expected_hosts):
-                    raise SystemExit(5)
-              - "{{ certificate_source_dir }}/tls.crt"
-              - "{{ certificate_source_dir }}/tls.key"
+              - "{{ certificate_source_dir }}"
               - "{{ content_digest }}"
-              - "{{ leaf_fingerprint_sha256 }}"
-              - "{{ route_hosts | to_json }}"
           delegate_to: localhost
           become: false
           changed_when: false
+          no_log: true
 
-        - name: Ensure managed certificate directory exists
-          ansible.builtin.file:
-            path: "{{ traefik_certificate_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
+        - name: Stage validate activate and probe
+          ansible.builtin.include_tasks: ../tasks/traefik_certificate_selection.yml
+          vars:
+            certificate_source: custom
+            certificate_selection_action: publish
+            certificate_chain_source: "{{ certificate_source_dir }}/tls.crt"
+            certificate_key_source: "{{ certificate_source_dir }}/tls.key"
+      rescue:
+        - name: Observe retained selection after failed custom preparation
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          vars:
+            certificate_probe_hosts: false
 
-        - name: Inspect immutable certificate revision
-          ansible.builtin.stat:
-            path: "{{ revision_dir }}"
-          register: immutable_revision
+        - name: Preserve original custom refusal with available facts
+          ansible.builtin.set_fact:
+            certificate_selection_succeeded: false
+            certificate_procedure_error: "{{ custom_certificate_error }}"
+            certificate_observation: "{{ certificate_observation | combine({'outcome': 'failed'}) }}"
+      no_log: true
 
-        - name: Ensure certificate material directory exists
-          ansible.builtin.file:
-            path: "{{ material_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
-
-        - name: Reject invalid immutable revision identity
-          ansible.builtin.assert:
-            that:
-              - not immutable_revision.stat.exists or immutable_revision.stat.isdir
-            fail_msg: "Installed custom certificate revision is invalid"
-
-        - name: Create staged certificate revision
-          ansible.builtin.tempfile:
-            state: directory
-            path: "{{ traefik_certificate_dir }}"
-            prefix: ".revision-{{ revision_id }}."
-          register: staged_revision
-          when: not immutable_revision.stat.exists
-
-        - name: Stage certificate chain
-          ansible.builtin.copy:
-            src: "{{ certificate_source_dir }}/tls.crt"
-            dest: "{{ staged_revision.path }}/tls.crt"
-            owner: root
-            group: root
-            mode: "0600"
-          when: staged_revision is defined and not (staged_revision.skipped | default(false))
-
-        - name: Stage private key
-          ansible.builtin.copy:
-            src: "{{ certificate_source_dir }}/tls.key"
-            dest: "{{ staged_revision.path }}/tls.key"
-            owner: root
-            group: root
-            mode: "0600"
-          when: staged_revision is defined and not (staged_revision.skipped | default(false))
-
-        - name: Activate immutable certificate revision
-          ansible.builtin.command:
-            argv:
-              - python3
-              - -c
-              - |
-                import ctypes
-                import errno
-                import os
-                import sys
-                libc = ctypes.CDLL(None, use_errno=True)
-                result = libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 1)
-                if result != 0 and ctypes.get_errno() != errno.EEXIST:
-                    raise OSError(ctypes.get_errno(), 'revision activation failed')
-              - "{{ staged_revision.path }}"
-              - "{{ revision_dir }}"
-          when: staged_revision is defined and not (staged_revision.skipped | default(false))
-
-        - name: Validate installed immutable material
-          ansible.builtin.command:
-            argv:
-              - python3
-              - -c
-              - |
-                import hashlib
-                import sys
-                files = {'tls.crt': open(sys.argv[1], 'rb').read(), 'tls.key': open(sys.argv[2], 'rb').read()}
-                digest = hashlib.sha256()
-                digest.update(b'opsctl-file-secret:1\0')
-                for name in sorted(files):
-                    encoded_name = name.encode('ascii')
-                    value = files[name]
-                    digest.update(len(encoded_name).to_bytes(2, 'big'))
-                    digest.update(encoded_name)
-                    digest.update(len(value).to_bytes(8, 'big'))
-                    digest.update(value)
-                if digest.hexdigest() != sys.argv[3]:
-                    raise SystemExit(2)
-              - "{{ certificate_file }}"
-              - "{{ private_key_file }}"
-              - "{{ content_digest }}"
-          changed_when: false
-
-      always:
-        - name: Remove incomplete certificate staging files
-          ansible.builtin.file:
-            path: "{{ item }}"
-            state: absent
-          loop: >-
-            {{
-              [
-                (staged_revision | default({})).get('path', '')
-              ] | reject('equalto', '') | list
-            }}
-
-    - name: Activate through the shared selected-pool owner
-      ansible.builtin.include_tasks:
-        file: ../tasks/traefik_certificate_selection.yml
-      vars:
-        certificate_selection_action: activate
-        certificate_selection_request:
-          owner:
-            organization_id: "{{ org_id }}"
-            subject: {type: deployment, id: "{{ deployment_id }}"}
-            gateway_id: "{{ gateway_id }}"
-            server_id: "{{ server_id }}"
-            revision_id: "{{ revision_id }}"
-            source: custom
-            route_hosts: "{{ route_hosts }}"
-            fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
-          certificate_file: "{{ certificate_file }}"
-          private_key_file: "{{ private_key_file }}"
-          expected_binding: "{{ custom_selected_binding_bytes }}"
-
-    - name: Build custom certificate installation result
-      ansible.builtin.set_fact:
-        custom_certificate_installation_base:
-          adapter_key: "{{ adapter_key }}"
-          mode: "{{ certificate_mode }}"
-          deployment_id: "{{ deployment_id }}"
-          material_id: "{{ material_id }}"
-          revision_id: "{{ revision_id }}"
-          route_hosts: "{{ route_hosts }}"
-          host_count: "{{ route_hosts | length }}"
-          leaf_fingerprint_sha256: "{{ leaf_fingerprint_sha256 }}"
-          metadata_digest: "{{ metadata_digest }}"
-          content_digest: "{{ content_digest }}"
-
-    - name: Add installation result digest
-      ansible.builtin.set_fact:
-        custom_certificate_installation: >-
-          {{
-            custom_certificate_installation_base
-            | combine({
-                'digest': (
-                  custom_certificate_installation_base
-                  | to_json(sort_keys=True, separators=[',', ':'])
-                  | hash('sha256')
-                )
-              })
-          }}
-
-    - name: Emit custom certificate installation result
+    - name: Emit actual certificate facts and any closed procedure failure
       ansible.builtin.debug:
         msg: >-
-          TEMPLATE_OUTPUT_JSON={{
-            {'custom_certificate_installation': custom_certificate_installation}
-            | to_json
-          }}
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+
+    - name: Fail after preserving actual selection and restoration facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: not certificate_selection_succeeded or certificate_observation.outcome != 'succeeded'

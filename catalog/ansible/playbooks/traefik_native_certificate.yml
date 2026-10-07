@@ -1,84 +1,371 @@
 ---
-- name: Manage a gateway-local native certificate without exporting its key
+- name: Manage one gateway-local native certificate revision
   hosts: all
   gather_facts: false
   become: true
   vars:
     traefik_certificate_dir: /etc/traefik/certificates/opsctl
     traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+  pre_tasks:
+    - name: End simulation without consuming success
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
   tasks:
-    - name: Validate native certificate execution
-      ansible.builtin.assert:
-        that:
-          - native_certificate_action in ['csr', 'install', 'observe', 'retire']
-          - not (simulate | default(false) | bool)
-          - native_certificate_request is mapping
-          - native_certificate_request.organization_id == org_id
-          - native_certificate_request.server_id == server_id
-        fail_msg: Native certificate execution identity is invalid
+    - name: Initialize native result
+      ansible.builtin.set_fact:
+        native_certificate_succeeded: false
+        native_certificate_error: {phase: validate, code: routing_input_invalid}
+        native_certificate_output: {}
 
-    - name: Check gateway certificate tooling before key generation
-      ansible.builtin.command:
-        argv:
-          - "{{ ansible_python_interpreter | default('python3') }}"
-          - -c
-          - "import cryptography, yaml, shutil; assert shutil.which('openssl')"
-      register: native_certificate_tooling
-      changed_when: false
-      failed_when: false
-
-    - name: Install missing gateway certificate tooling
-      ansible.builtin.package:
-        name: [python3-cryptography, python3-yaml, openssl]
-        state: present
-      when: native_certificate_tooling.rc != 0
-
-    - name: Execute the local-key owner with bounded public inputs
+    - name: Perform only the admitted native action
       block:
-        - name: Create execution directory
-          ansible.builtin.tempfile:
-            state: directory
-            prefix: opsctl-native-certificate-
-          register: native_execution_dir
+        - name: Validate native subject revision and action
+          ansible.builtin.assert:
+            that:
+              - native_certificate_action in ['csr', 'install', 'observe', 'retire']
+              - certificate_subject.keys() | sort == ['id', 'type']
+              - certificate_subject.type in ['deployment', 'server']
+              - certificate_subject.id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - revision_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - route_hosts is sequence and route_hosts is not string
+              - route_hosts | length <= 100
+              - native_certificate_action not in ['csr', 'install'] or route_hosts | length > 0
+              - route_hosts == route_hosts | unique | sort
+              - route_hosts | select('match', '^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$') | list | length == route_hosts | length
 
-        - name: Deliver canonical certificate helper
-          ansible.builtin.copy:
-            src: ../scripts/native_origin_certificate.py
-            dest: "{{ native_execution_dir.path }}/certificate.py"
+        - name: Resolve only template-owned native key paths
+          ansible.builtin.set_fact:
+            native_subject_dir: "{{ traefik_certificate_dir }}/native-{{ certificate_subject.type }}-{{ certificate_subject.id }}"
+            native_revision_dir: "{{ traefik_certificate_dir }}/native-{{ certificate_subject.type }}-{{ certificate_subject.id }}/revision-{{ revision_id }}"
+            native_certificate_error: {phase: stage, code: native_tool_unavailable}
+
+        - name: Require existing key CSR and observation tooling without installing it
+          ansible.builtin.command:
+            argv: [python3, -c, "import cryptography, yaml, shutil; assert shutil.which('openssl')"]
+          changed_when: false
+
+        - name: Create only the authorized private CSR revision
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+          loop: ["{{ traefik_certificate_dir }}", "{{ native_subject_dir }}", "{{ native_revision_dir }}"]
+          register: native_directory_stats
+
+        - name: Require ordinary private native ancestors before mutation
+          ansible.builtin.assert:
+            that:
+              - not item.stat.exists or (item.stat.isdir and not item.stat.islnk and item.stat.uid == 0)
+              - native_certificate_action != 'install' or item.stat.exists
+          loop: "{{ native_directory_stats.results }}"
+
+        - name: Create only the authorized private CSR directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
             owner: root
             group: root
             mode: '0700'
+          loop: ["{{ traefik_certificate_dir }}", "{{ native_subject_dir }}", "{{ native_revision_dir }}"]
+          when: native_certificate_action == 'csr'
 
-        - name: Deliver the shared Traefik selection owner
-          ansible.builtin.copy:
-            src: ../scripts/traefik_certificate_selection.py
-            dest: "{{ native_execution_dir.path }}/traefik_certificate_selection.py"
+        - name: Inspect existing native key without following links
+          ansible.builtin.stat:
+            path: "{{ native_revision_dir }}/tls.key"
+            follow: false
+          register: native_key_stat
+          when: native_certificate_action in ['csr', 'install']
+
+        - name: Require exact existing private key custody
+          ansible.builtin.assert:
+            that:
+              - not native_key_stat.stat.exists or (native_key_stat.stat.isreg and not native_key_stat.stat.islnk and native_key_stat.stat.uid == 0 and native_key_stat.stat.mode == '0600')
+              - native_certificate_action == 'csr' or native_key_stat.stat.exists
+          when: native_certificate_action in ['csr', 'install']
+
+        - name: Generate only a missing local EC P-256 key
+          ansible.builtin.command:
+            argv: [openssl, genpkey, -algorithm, EC, -pkeyopt, ec_paramgen_curve:P-256, -out, "{{ native_revision_dir }}/tls.key"]
+            creates: "{{ native_revision_dir }}/tls.key"
+          when: native_certificate_action == 'csr'
+
+        - name: Keep native private key mode exact
+          ansible.builtin.file:
+            path: "{{ native_revision_dir }}/tls.key"
             owner: root
             group: root
             mode: '0600'
+          when: native_certificate_action == 'csr'
 
-        - name: Execute gateway-local certificate action
+        - name: Observe the local key's public curve
           ansible.builtin.command:
-            argv: ["{{ ansible_python_interpreter | default('python3') }}", "{{ native_execution_dir.path }}/certificate.py", "{{ native_certificate_action }}"]
-            stdin: "{{ native_certificate_request | to_json }}"
-          environment:
-            OPSCTL_CERTIFICATE_DIR: "{{ traefik_certificate_dir }}"
-            OPSCTL_DYNAMIC_DIR: "{{ traefik_dynamic_dir }}"
-          register: native_certificate_result
-          failed_when: false
-          no_log: true
+            argv: [openssl, pkey, -in, "{{ native_revision_dir }}/tls.key", -text_pub, -noout]
+          register: native_key_public
+          changed_when: false
+          when: native_certificate_action in ['csr', 'install']
 
-        - name: Require successful gateway certificate action
+        - name: Require the admitted native P-256 key
           ansible.builtin.assert:
-            that: native_certificate_result.rc == 0
-            fail_msg: "{{ native_certificate_result.stderr | truncate(512, true, '') }}"
-      always:
-        - name: Remove execution helper
-          ansible.builtin.file:
-            path: "{{ native_execution_dir.path }}"
-            state: absent
-          when: native_execution_dir is defined and native_execution_dir.path is defined
+            that: "'ASN1 OID: prime256v1' in native_key_public.stdout"
+          when: native_certificate_action in ['csr', 'install']
 
-    - name: Emit only public CSR or verified certificate identity
+        - name: Create the immutable public CSR using only admitted DNS SANs
+          ansible.builtin.stat:
+            path: "{{ native_revision_dir }}/csr.pem"
+            follow: false
+          register: native_csr_stat
+          when: native_certificate_action == 'csr'
+
+        - name: Require a bounded ordinary existing CSR
+          ansible.builtin.assert:
+            that:
+              - not native_csr_stat.stat.exists or (native_csr_stat.stat.isreg and not native_csr_stat.stat.islnk and native_csr_stat.stat.size <= 16384)
+          when: native_certificate_action == 'csr'
+
+        - name: Generate the immutable public CSR with admitted SANs
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - req
+              - -new
+              - -sha256
+              - -key
+              - "{{ native_revision_dir }}/tls.key"
+              - -subj
+              - /
+              - -addext
+              - "subjectAltName=DNS:{{ route_hosts | join(',DNS:') }}"
+              - -out
+              - "{{ native_revision_dir }}/csr.pem"
+            creates: "{{ native_revision_dir }}/csr.pem"
+          when: native_certificate_action == 'csr'
+
+        - name: Read native CSR public key
+          ansible.builtin.command:
+            argv: [openssl, req, -in, "{{ native_revision_dir }}/csr.pem", -pubkey, -noout]
+          register: native_csr_public
+          changed_when: false
+          when: native_certificate_action == 'csr'
+
+        - name: Read local key public identity without returning its private bytes
+          ansible.builtin.command:
+            argv: [openssl, pkey, -in, "{{ native_revision_dir }}/tls.key", -pubout]
+          register: native_key_spki
+          changed_when: false
+          when: native_certificate_action == 'csr'
+
+        - name: Require CSR bound to the retained local key
+          ansible.builtin.assert:
+            that: native_csr_public.stdout == native_key_spki.stdout
+          when: native_certificate_action == 'csr'
+
+        - name: Observe bounded public CSR SANs signature and public-key fingerprint
+          ansible.builtin.script:
+            cmd: >-
+              ../scripts/certificate_facts.py --csr {{ (native_revision_dir ~ '/csr.pem') | quote }}
+              --revision {{ revision_id | quote }} --hosts {{ route_hosts | to_json | quote }}
+            executable: python3
+          register: native_csr
+          changed_when: false
+          when: native_certificate_action == 'csr'
+
+        - name: Retain the actual public CSR facts only
+          ansible.builtin.set_fact:
+            native_certificate_output: "{{ native_csr.stdout | from_json }}"
+            native_certificate_succeeded: true
+            native_certificate_error: null
+          when: native_certificate_action == 'csr'
+
+        - name: Validate and retain immutable signed public material
+          when: native_certificate_action == 'install'
+          block:
+            - name: Inspect existing native chain
+              ansible.builtin.stat:
+                path: "{{ native_revision_dir }}/tls.crt"
+                follow: false
+                checksum_algorithm: sha256
+              register: native_chain_stat
+
+            - name: Refuse replacement of immutable native revision material
+              ansible.builtin.assert:
+                that:
+                  - not native_chain_stat.stat.exists or (native_chain_stat.stat.isreg and not native_chain_stat.stat.islnk and native_chain_stat.stat.checksum == certificate_chain_pem | hash('sha256'))
+
+            - name: Install the issued public chain without overwriting a revision
+              ansible.builtin.copy:
+                content: "{{ certificate_chain_pem }}"
+                dest: "{{ native_revision_dir }}/tls.crt"
+                owner: root
+                group: root
+                mode: '0600'
+                force: false
+
+            - name: Activate the pair using the retained local key and selected trust
+              ansible.builtin.include_tasks: ../tasks/traefik_certificate_selection.yml
+              vars:
+                certificate_source: native
+                certificate_selection_action: publish
+                certificate_source_remote: true
+                certificate_chain_source: "{{ native_revision_dir }}/tls.crt"
+                certificate_key_source: "{{ native_revision_dir }}/tls.key"
+
+            - name: Retain native installation truth
+              ansible.builtin.set_fact:
+                native_certificate_output: "{{ {'certificate_observation': certificate_observation} }}"
+                native_certificate_succeeded: "{{ certificate_selection_succeeded and certificate_observation.outcome == 'succeeded' }}"
+                native_certificate_error: "{{ certificate_procedure_error }}"
+
+        - name: Observe existing native or replacement selection without mutation
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          when: native_certificate_action in ['observe', 'retire']
+
+        - name: Select safe refusal before qualifying native retirement
+          ansible.builtin.set_fact:
+            native_certificate_error: {phase: remove, code: certificate_state_changed}
+          when: native_certificate_action == 'retire'
+
+        - name: Require exact consumed replacement snapshot before unused revision retirement
+          ansible.builtin.assert:
+            that:
+              - certificate_observation.outcome == 'succeeded'
+              - previous_revision_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - expected_certificate.presence in ['present', 'absent']
+              - expected_certificate.revision_id != previous_revision_id
+              - >-
+                certificate_observation | dict2items |
+                selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+                items2dict == expected_certificate
+          when: native_certificate_action == 'retire'
+
+
+        - name: Inventory the exact authorized unused revision without following links
+          ansible.builtin.stat:
+            path: "{{ native_subject_dir }}/revision-{{ previous_revision_id }}"
+            follow: false
+          register: native_retiring_stat
+          when: native_certificate_action == 'retire'
+
+        - name: Require an ordinary authorized unused revision or explicit absence
+          ansible.builtin.assert:
+            that:
+              - not native_retiring_stat.stat.exists or (native_retiring_stat.stat.isdir and not native_retiring_stat.stat.islnk and native_retiring_stat.stat.uid == 0)
+          when: native_certificate_action == 'retire'
+
+        - name: Inventory only an existing authorized unused revision
+          ansible.builtin.find:
+            paths: "{{ native_subject_dir }}/revision-{{ previous_revision_id }}"
+            recurse: false
+            hidden: true
+            file_type: any
+          register: native_retired_files
+          when: native_certificate_action == 'retire' and native_retiring_stat.stat.exists
+
+        - name: Refuse unrelated files before any native retirement unlink
+          ansible.builtin.assert:
+            that:
+              - native_retired_files.skipped_paths | default({}) | length == 0
+              - native_retired_files.files | default([]) | map(attribute='path') | map('basename') | difference(['tls.key', 'csr.pem', 'tls.crt', 'trust.pem']) | length == 0
+              - native_retired_files.files | default([]) | rejectattr('isreg', 'equalto', true) | list | length == 0
+          when: native_certificate_action == 'retire'
+
+        - name: Reobserve selection at the native retirement mutation boundary
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          vars:
+            certificate_probe_hosts: false
+          when: native_certificate_action == 'retire'
+
+        - name: Refuse changed or unknown selection immediately before native retirement
+          ansible.builtin.assert:
+            that:
+              - certificate_observation.outcome == 'succeeded'
+              - expected_certificate.revision_id != previous_revision_id
+              - >-
+                certificate_observation | dict2items |
+                selectattr('key', 'in', ['presence', 'source', 'material_id', 'revision_id', 'leaf_fingerprint_sha256']) |
+                items2dict == expected_certificate
+          when: native_certificate_action == 'retire'
+
+        - name: Observe all bounded native TLS references before retiring the exact revision
+          ansible.builtin.script:
+            cmd: >-
+              ../scripts/certificate_facts.py --selection-directory {{ traefik_dynamic_dir | quote }}
+              --unused-directory {{ (native_subject_dir ~ '/revision-' ~ previous_revision_id) | quote }}
+            executable: python3
+          changed_when: false
+          register: native_references
+          when: native_certificate_action == 'retire'
+
+        - name: Require the authorized prior revision to be unused
+          ansible.builtin.assert:
+            that: not (native_references.stdout | from_json).referenced
+          when: native_certificate_action == 'retire'
+
+        - name: Select safe removal failure before the first authorized unlink
+          ansible.builtin.set_fact:
+            native_certificate_error: {phase: remove, code: removal_failed}
+          when: native_certificate_action == 'retire'
+
+        - name: Remove only prevalidated unused revision files
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ native_retired_files.files | default([]) }}"
+          when: native_certificate_action == 'retire'
+
+        - name: Remove only the now-empty authorized revision directory
+          ansible.builtin.command:
+            argv: [rmdir, --, "{{ native_subject_dir }}/revision-{{ previous_revision_id }}"]
+          when: native_certificate_action == 'retire' and native_retiring_stat.stat.exists
+
+        - name: Reobserve the authorized revision's actual absence
+          ansible.builtin.stat:
+            path: "{{ native_subject_dir }}/revision-{{ previous_revision_id }}"
+            follow: false
+          register: native_retired_stat
+          when: native_certificate_action == 'retire'
+
+        - name: Require actual unused revision absence
+          ansible.builtin.assert:
+            that: not native_retired_stat.stat.exists
+          when: native_certificate_action == 'retire'
+
+        - name: Retain native observation or retirement facts
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          when: native_certificate_action == 'retire'
+
+        - name: Retain fresh selected facts and independently observed revision absence
+          ansible.builtin.set_fact:
+            native_certificate_succeeded: "{{ certificate_observation.outcome == 'succeeded' }}"
+            native_certificate_error: "{{ certificate_procedure_error }}"
+            native_certificate_output: >-
+              {{ {'certificate_observation': certificate_observation |
+                combine({'retired_revision_absent': true} if native_certificate_action == 'retire' else {})} }}
+          when: native_certificate_action in ['observe', 'retire']
+      rescue:
+        - name: Observe actual selected facts after any interrupted retirement
+          ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
+          when: native_certificate_action | default('') == 'retire'
+
+        - name: Preserve only fresh available selection and confirmed retirement facts
+          ansible.builtin.set_fact:
+            native_certificate_output:
+              certificate_observation: >-
+                {{ certificate_observation |
+                   combine({'outcome': 'failed'} if certificate_observation.outcome == 'succeeded' else {}) |
+                   combine({'retired_revision_absent': true if native_retired_stat.stat.exists | default(none) is sameas false else none}) }}
+          when: native_certificate_action | default('') == 'retire'
+
+        - name: Preserve safe native failure without key paths or native stderr
+          ansible.builtin.set_fact:
+            native_certificate_succeeded: false
+      no_log: true
+
+    - name: Emit available public native facts before failure
       ansible.builtin.debug:
-        msg: "{{ native_certificate_result.stdout | trim }}"
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ native_certificate_output |
+            combine({'procedure_error': native_certificate_error} if native_certificate_error is not none else {}) | to_json }}
+
+    - name: Fail a native action without inventing success
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: not native_certificate_succeeded
