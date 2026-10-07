@@ -14,7 +14,7 @@
   tasks:
     - name: Verify an explicitly bound private upstream request
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/private_http_verification.yml"
-      when: private_verification is defined
+      when: verification_kind is defined
 
     - name: Validate health verification mode
       assert:
