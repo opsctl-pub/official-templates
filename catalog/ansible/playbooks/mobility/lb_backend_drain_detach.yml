@@ -11,7 +11,8 @@
     - name: Require exact nonempty serving counterpart and captured route
       ansible.builtin.assert:
         that:
-          - phase is not defined or phase == 'gateway'
+          - phase is defined
+          - phase in ['converge', 'gateway']
           - retiring_backend is string
           - remaining_backends is sequence
           - remaining_backends is not string
@@ -21,19 +22,15 @@
           - retiring_backend not in remaining_backends
           - expected_route is mapping
           - expected_route.presence == 'present'
+          - phase != 'converge' or retiring_backend in expected_route.backends
+          - phase != 'converge' or (expected_route.backends | difference([retiring_backend]) | sort) == (remaining_backends | sort)
+          - phase != 'converge' or route_state == 'present'
+          - phase != 'converge' or (traefik_backends | map(attribute='url') | list | sort) == (remaining_backends | sort)
         fail_msg: Routing procedure inputs are invalid. Refresh the review.
       no_log: true
 
 - import_playbook: ../traefik_route_converge.yml
-  when: phase is not defined and not (simulate | default(false))
-  vars:
-    route_state: present
-    traefik_backends: >-
-      {% set backends = [] %}
-      {% for url in remaining_backends %}
-      {% set _ = backends.append({'url': url}) %}
-      {% endfor %}
-      {{ backends }}
+  when: phase == 'converge' and not (simulate | default(false))
 
 - name: Observe actual gateway exclusion without claiming runtime drain
   hosts: all
@@ -61,12 +58,12 @@
               - route_observation.presence == 'present'
               - route_observation.backends | sort == remaining_backends | sort
               - retiring_backend not in route_observation.backends
-              - phase is not defined or route_observation_base == expected_route
-              - phase is defined or route_observation.hosts == (route_hosts | sort)
-              - phase is defined or route_observation.route_port == route_port
-              - phase is defined or route_observation.https == route_https
-              - phase is defined or route_observation.redirect_http_to_https == redirect_http_to_https
-              - phase is defined or route_observation.middlewares == (route_middlewares | default([]))
+              - phase != 'gateway' or route_observation_base == expected_route
+              - phase != 'converge' or route_observation.hosts == (route_hosts | sort)
+              - phase != 'converge' or route_observation.route_port == route_port
+              - phase != 'converge' or route_observation.https == route_https
+              - phase != 'converge' or route_observation.redirect_http_to_https == redirect_http_to_https
+              - phase != 'converge' or route_observation.middlewares == (route_middlewares | default([]))
             fail_msg: Server configuration changed. Refresh its observation before retrying.
           no_log: true
 

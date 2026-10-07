@@ -286,7 +286,10 @@ absence must be consumed before removing the recorded gateway entry.
 Gateway `lb_backend_drain_detach` takes `phase=gateway`, `retiring_backend`,
 nonempty `remaining_backends`, `expected_route` and the route subject. Observe
 the already-switched route and exact exclusion; no sleep-as-drained result.
-Ordinary detach first converges its approved remaining route, then observes it.
+Ordinary detach uses explicit `phase=converge`: complete `RouteConvergeInput`
+plus `retiring_backend` and `remaining_backends`. Its frozen pre-withdrawal CAS
+must contain the retiring endpoint; desired endpoints equal the remaining set.
+The same child withdraws then observes exclusion. Missing phase refuses.
 
 Only after consumed exclusion, the normal `container_remove` child takes optional
 `drain_before_remove={container_id,container_port,timeout_s}` with exact full ID,
