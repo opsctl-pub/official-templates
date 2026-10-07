@@ -78,7 +78,8 @@
               - not supplied_file.path.startswith('/')
               - supplied_file.path != '.'
               - "'..' not in supplied_file.path.split('/')"
-              - "'\\' not in supplied_file.path"
+              - >-
+                '\\' not in supplied_file.path
               - supplied_file.mode is match('^0[0-7]{3}$')
           loop: "{{ compose_supplied_files }}"
           loop_control:
@@ -90,7 +91,8 @@
             that:
               - not relative_directory.startswith('/')
               - "'..' not in relative_directory.split('/')"
-              - "'\\' not in relative_directory"
+              - >-
+                '\\' not in relative_directory
           loop: "{{ [compose_project_directory | default('.')] + (compose_directories | default([])) }}"
           loop_control:
             loop_var: relative_directory
@@ -100,7 +102,8 @@
           ansible.builtin.assert:
             that:
               - not native_selection.startswith('/')
-              - "'\\' not in native_selection"
+              - >-
+                '\\' not in native_selection
               - compose_selection_path in (compose_supplied_files | map(attribute='path') | list)
           vars:
             compose_selection_path: >-
