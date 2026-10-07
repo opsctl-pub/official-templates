@@ -372,17 +372,17 @@
     - name: Map only qualified native mounts and networks
       ansible.builtin.set_fact:
         image_native_mounts: >-
-          {% set mounts = namespace(values=[]) %}
-          {% for mount in app_mounts | default([]) %}
-          {% set mounts.values = mounts.values + [{'type': 'volume', 'source': mount.source,
-            'target': mount.target, 'read_only': mount.read_only}] %}
-          {% endfor %}
+          {%- set mounts = namespace(values=[]) -%}
+          {%- for mount in app_mounts | default([]) -%}
+          {%- set mounts.values = mounts.values + [{'type': 'volume', 'source': mount.source,
+            'target': mount.target, 'read_only': mount.read_only}] -%}
+          {%- endfor -%}
           {{ mounts.values }}
         image_native_networks: >-
-          {% set networks = namespace(values=[]) %}
-          {% for network in app_networks | default([]) %}
-          {% set networks.values = networks.values + [{'name': network.name, 'aliases': network.aliases | default([])}] %}
-          {% endfor %}
+          {%- set networks = namespace(values=[]) -%}
+          {%- for network in app_networks | default([]) -%}
+          {%- set networks.values = networks.values + [{'name': network.name, 'aliases': network.aliases | default([])}] -%}
+          {%- endfor -%}
           {{ networks.values }}
       no_log: true
 
