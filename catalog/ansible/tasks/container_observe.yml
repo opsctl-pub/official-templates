@@ -48,23 +48,23 @@
     - name: Project safe instance fields
       ansible.builtin.set_fact:
         image_observed_container: >-
-          {% set ports = namespace(values=[]) %}
-          {% for key, bindings in (image_container_info.container.NetworkSettings.Ports | default({}, true)).items() %}
-          {% for binding in bindings | default([], true) %}
-          {% set ports.values = ports.values + [{'host_ip': binding.HostIp,
+          {%- set ports = namespace(values=[]) -%}
+          {%- for key, bindings in (image_container_info.container.NetworkSettings.Ports | default({}, true)).items() -%}
+          {%- for binding in bindings | default([], true) -%}
+          {%- set ports.values = ports.values + [{'host_ip': binding.HostIp,
             'host_port': binding.HostPort | int, 'container_port': key.split('/')[0] | int,
-            'protocol': key.split('/')[1]}] %}
-          {% endfor %}
-          {% endfor %}
-          {% set mounts = namespace(values=[]) %}
-          {% for mount in image_container_info.container.Mounts | default([]) %}
-          {% set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in
+            'protocol': key.split('/')[1]}] -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- set mounts = namespace(values=[]) -%}
+          {%- for mount in image_container_info.container.Mounts | default([]) -%}
+          {%- set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in
             ['volume', 'bind', 'tmpfs'] else 'other', 'source': mount.Name | default(none)
             if mount.Type == 'volume' else (mount.Source | default(none) if mount.Type == 'bind' else none),
-            'target': mount.Destination, 'read_only': not mount.RW}] %}
-          {% endfor %}
-          {% set digests = image_image_info.images[0].RepoDigests | default([], true) |
-            map('regex_replace', '^.*@', '') | unique | list %}
+            'target': mount.Destination, 'read_only': not mount.RW}] -%}
+          {%- endfor -%}
+          {%- set digests = image_image_info.images[0].RepoDigests | default([], true) |
+            map('regex_replace', '^.*@', '') | unique | list -%}
           {{ {'id': image_container_info.container.Id,
             'name': image_container_info.container.Name | regex_replace('^/', ''), 'replica': none,
             'image_ref': image_container_info.container.Config.Image,

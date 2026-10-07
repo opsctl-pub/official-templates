@@ -51,14 +51,14 @@
     - name: Record safe volume facts without adopting replaced incarnations
       ansible.builtin.set_fact:
         image_observed_volumes: >-
-          {% set users = namespace(values=[]) %}
-          {% for result in image_volume_user_details.results %}
-          {% set mounts = result.container.Mounts | selectattr('Type', 'equalto', 'volume') |
-            selectattr('Name', 'defined') | selectattr('Name', 'equalto', observed_volume.name) | list %}
-          {% set users.values = users.values + [{'id': result.container.Id,
+          {%- set users = namespace(values=[]) -%}
+          {%- for result in image_volume_user_details.results -%}
+          {%- set mounts = result.container.Mounts | selectattr('Type', 'equalto', 'volume') |
+            selectattr('Name', 'defined') | selectattr('Name', 'equalto', observed_volume.name) | list -%}
+          {%- set users.values = users.values + [{'id': result.container.Id,
             'state': result.container.State.Status,
-            'read_only': mounts | selectattr('RW', 'equalto', true) | list | length == 0}] %}
-          {% endfor %}
+            'read_only': mounts | selectattr('RW', 'equalto', true) | list | length == 0}] -%}
+          {%- endfor -%}
           {{ image_observed_volumes + [{'name': observed_volume.name,
             'created_at': image_volume_info.volume.CreatedAt | default(none) if image_volume_info.exists else none,
             'presence': 'absent' if not image_volume_info.exists else

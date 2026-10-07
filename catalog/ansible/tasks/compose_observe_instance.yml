@@ -32,23 +32,23 @@
 - name: Project only public instance fields
   ansible.builtin.set_fact:
     compose_instance: >-
-      {% set container = compose_instance_info.container %}
-      {% set ports = namespace(values=[]) %}
-      {% for key, bindings in (container.NetworkSettings.Ports | default({}, true)).items() %}
-      {% for binding in bindings | default([], true) %}
-      {% set ports.values = ports.values + [{'host_ip': binding.HostIp, 'host_port': binding.HostPort | int,
-        'container_port': key.split('/')[0] | int, 'protocol': key.split('/')[1]}] %}
-      {% endfor %}
-      {% endfor %}
-      {% set mounts = namespace(values=[]) %}
-      {% for mount in container.Mounts | default([]) %}
-      {% set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in ['volume', 'bind', 'tmpfs'] else 'other',
+      {%- set container = compose_instance_info.container -%}
+      {%- set ports = namespace(values=[]) -%}
+      {%- for key, bindings in (container.NetworkSettings.Ports | default({}, true)).items() -%}
+      {%- for binding in bindings | default([], true) -%}
+      {%- set ports.values = ports.values + [{'host_ip': binding.HostIp, 'host_port': binding.HostPort | int,
+        'container_port': key.split('/')[0] | int, 'protocol': key.split('/')[1]}] -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- set mounts = namespace(values=[]) -%}
+      {%- for mount in container.Mounts | default([]) -%}
+      {%- set mounts.values = mounts.values + [{'type': mount.Type if mount.Type in ['volume', 'bind', 'tmpfs'] else 'other',
         'source': mount.Name | default(none) if mount.Type == 'volume' else
           (mount.Source | default(none) if mount.Type == 'bind' else none),
-        'target': mount.Destination, 'read_only': not mount.RW}] %}
-      {% endfor %}
-      {% set digests = compose_instance_image.images[0].RepoDigests | default([], true) |
-        map('regex_replace', '^.*@', '') | unique | list %}
+        'target': mount.Destination, 'read_only': not mount.RW}] -%}
+      {%- endfor -%}
+      {%- set digests = compose_instance_image.images[0].RepoDigests | default([], true) |
+        map('regex_replace', '^.*@', '') | unique | list -%}
       {{ {'id': container.Id, 'name': container.Name | regex_replace('^/', ''),
         'replica': container.Config.Labels.get('com.docker.compose.container-number') | int
           if container.Config.Labels.get('com.docker.compose.container-number', '') is match('^[1-9][0-9]*$') else none,

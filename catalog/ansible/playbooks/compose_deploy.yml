@@ -104,14 +104,14 @@
               - compose_selection_path in (compose_supplied_files | map(attribute='path') | list)
           vars:
             compose_selection_path: >-
-              {% set path = namespace(parts=(compose_project_directory | default('.')).split('/') | reject('equalto', '.') | list,
-                escaped=false) %}
-              {% for part in native_selection.split('/') %}
-              {% if part == '..' %}
-              {% if path.parts | length == 0 %}{% set path.escaped = true %}
-              {% else %}{% set path.parts = path.parts[:-1] %}{% endif %}
-              {% elif part not in ['', '.'] %}{% set path.parts = path.parts + [part] %}{% endif %}
-              {% endfor %}
+              {%- set path = namespace(parts=(compose_project_directory | default('.')).split('/') | reject('equalto', '.') | list,
+                escaped=false) -%}
+              {%- for part in native_selection.split('/') -%}
+              {%- if part == '..' -%}
+              {%- if path.parts | length == 0 -%}{%- set path.escaped = true -%}
+              {%- else -%}{%- set path.parts = path.parts[:-1] -%}{%- endif -%}
+              {%- elif part not in ['', '.'] -%}{%- set path.parts = path.parts + [part] -%}{%- endif -%}
+              {%- endfor -%}
               {{ none if path.escaped else path.parts | join('/') }}
           loop: "{{ compose_files + (compose_env_files | default([])) }}"
           loop_control:
@@ -121,20 +121,20 @@
         - name: Collect every workspace ancestor and required original-file parent
           ansible.builtin.set_fact:
             compose_delivery_directories: >-
-              {% set paths = namespace(values=[], path='') %}
-              {% for component in compose_workspace.split('/') | reject('equalto', '') %}
-              {% set paths.path = paths.path + '/' + component %}
-              {% set paths.values = paths.values + [paths.path] %}
-              {% endfor %}
-              {% set relatives = (compose_directories | default([])) + [compose_project_directory | default('.')] +
-                (compose_supplied_files | map(attribute='path') | map('dirname') | list) %}
-              {% for relative in relatives %}
-              {% set paths.path = compose_workspace %}
-              {% for component in relative.split('/') | reject('in', ['', '.']) %}
-              {% set paths.path = paths.path + '/' + component %}
-              {% set paths.values = paths.values + [paths.path] %}
-              {% endfor %}
-              {% endfor %}
+              {%- set paths = namespace(values=[], path='') -%}
+              {%- for component in compose_workspace.split('/') | reject('equalto', '') -%}
+              {%- set paths.path = paths.path + '/' + component -%}
+              {%- set paths.values = paths.values + [paths.path] -%}
+              {%- endfor -%}
+              {%- set relatives = (compose_directories | default([])) + [compose_project_directory | default('.')] +
+                (compose_supplied_files | map(attribute='path') | map('dirname') | list) -%}
+              {%- for relative in relatives -%}
+              {%- set paths.path = compose_workspace -%}
+              {%- for component in relative.split('/') | reject('in', ['', '.']) -%}
+              {%- set paths.path = paths.path + '/' + component -%}
+              {%- set paths.values = paths.values + [paths.path] -%}
+              {%- endfor -%}
+              {%- endfor -%}
               {{ paths.values | unique | sort }}
 
         - name: Inspect every destination ancestor without following links
@@ -207,11 +207,11 @@
         - name: Preserve successful delivery facts
           ansible.builtin.set_fact:
             compose_files_written: >-
-              {% set paths = namespace(values=[]) %}
-              {% for result in compose_file_copies.results %}
-              {% if not result.failed | default(false) and not result.skipped | default(false) %}
-              {% set paths.values = paths.values + [result.supplied_file.path] %}{% endif %}
-              {% endfor %}
+              {%- set paths = namespace(values=[]) -%}
+              {%- for result in compose_file_copies.results -%}
+              {%- if not result.failed | default(false) and not result.skipped | default(false) -%}
+              {%- set paths.values = paths.values + [result.supplied_file.path] -%}{%- endif -%}
+              {%- endfor -%}
               {{ paths.values }}
             compose_changed: "{{ compose_file_copies.changed or compose_created_directories.changed }}"
 
@@ -266,11 +266,11 @@
           ansible.builtin.set_fact:
             compose_reason: compose_configuration_changed
             compose_config_argv: >-
-              {% set args = namespace(values=['docker', 'compose', '--project-name', compose_project_name,
-                '--project-directory', compose_project_src]) %}
-              {% for file in compose_files %}{% set args.values = args.values + ['--file', file] %}{% endfor %}
-              {% for file in compose_env_files | default([]) %}{% set args.values = args.values + ['--env-file', file] %}{% endfor %}
-              {% for profile in compose_profiles | default([]) %}{% set args.values = args.values + ['--profile', profile] %}{% endfor %}
+              {%- set args = namespace(values=['docker', 'compose', '--project-name', compose_project_name,
+                '--project-directory', compose_project_src]) -%}
+              {%- for file in compose_files -%}{%- set args.values = args.values + ['--file', file] -%}{%- endfor -%}
+              {%- for file in compose_env_files | default([]) -%}{%- set args.values = args.values + ['--env-file', file] -%}{%- endfor -%}
+              {%- for profile in compose_profiles | default([]) -%}{%- set args.values = args.values + ['--profile', profile] -%}{%- endfor -%}
               {{ args.values + ['config', '--format', 'json'] }}
 
         - name: Read native resolved configuration privately after original-file delivery
@@ -289,34 +289,34 @@
         - name: Project only selected native service readiness intent
           ansible.builtin.set_fact:
             compose_native_intent: >-
-              {% set services = namespace(values=[]) %}
-              {% for name, service in compose_native_config.services.items() %}
-              {% set dependencies = namespace(conditions=[]) %}
-              {% for parent in compose_native_config.services.values() %}
-              {% if name in parent.depends_on | default({}) %}
-              {% set dependencies.conditions = dependencies.conditions + [parent.depends_on[name].condition | default('service_started')] %}
-              {% endif %}
-              {% endfor %}
-              {% set replicas = service.scale | default(service.deploy.replicas | default(1)) | int %}
-              {% set condition = 'scaled_down' if replicas == 0 else ('completed' if
+              {%- set services = namespace(values=[]) -%}
+              {%- for name, service in compose_native_config.services.items() -%}
+              {%- set dependencies = namespace(conditions=[]) -%}
+              {%- for parent in compose_native_config.services.values() -%}
+              {%- if name in parent.depends_on | default({}) -%}
+              {%- set dependencies.conditions = dependencies.conditions + [parent.depends_on[name].condition | default('service_started')] -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {%- set replicas = service.scale | default(service.deploy.replicas | default(1)) | int -%}
+              {%- set condition = 'scaled_down' if replicas == 0 else ('completed' if
                 'service_completed_successfully' in dependencies.conditions else ('healthy' if
                 'service_healthy' in dependencies.conditions or
                 (service.healthcheck | default({}) | length > 0 and not service.healthcheck.disable | default(false) and
-                 service.healthcheck.test | default([]) != ['NONE']) else 'running')) %}
-              {% set services.values = services.values + [{'name': name, 'replicas': replicas,
+                 service.healthcheck.test | default([]) != ['NONE']) else 'running')) -%}
+              {%- set services.values = services.values + [{'name': name, 'replicas': replicas,
                 'condition': condition, 'allow_completion': service.restart | default('no') in ['', 'no'] and
-                  dependencies.conditions | length == 0}] %}
-              {% endfor %}
+                  dependencies.conditions | length == 0}] -%}
+              {%- endfor -%}
               {{ services.values | sort(attribute='name') }}
 
         - name: Apply only documented defaults to captured service intent
           ansible.builtin.set_fact:
             compose_expected_intent: >-
-              {% set services = namespace(values=[]) %}
-              {% for service in compose_services %}
-              {% set services.values = services.values + [service | combine({
-                'allow_completion': service.allow_completion | default(false)})] %}
-              {% endfor %}
+              {%- set services = namespace(values=[]) -%}
+              {%- for service in compose_services -%}
+              {%- set services.values = services.values + [service | combine({
+                'allow_completion': service.allow_completion | default(false)})] -%}
+              {%- endfor -%}
               {{ services.values | sort(attribute='name') }}
 
         - name: Refuse changed native selected service count readiness or completion intent
@@ -355,11 +355,11 @@
         - name: Retain complete native pre-apply resource observations
           ansible.builtin.set_fact:
             compose_prior_networks: >-
-              {% set prior = namespace(values=[]) %}
-              {% for result in compose_network_inventory %}
-              {% set prior.values = prior.values + [{'name': result.compose_network_name,
-                'id': result.network.Id if result.exists else none, 'presence': 'present' if result.exists else 'absent'}] %}
-              {% endfor %}
+              {%- set prior = namespace(values=[]) -%}
+              {%- for result in compose_network_inventory -%}
+              {%- set prior.values = prior.values + [{'name': result.compose_network_name,
+                'id': result.network.Id if result.exists else none, 'presence': 'present' if result.exists else 'absent'}] -%}
+              {%- endfor -%}
               {{ prior.values }}
             compose_prior_volumes: "{{ compose_observed_volumes }}"
             compose_phase: compose:apply
@@ -431,11 +431,11 @@
         - name: Preserve successful file delivery and native partial effects
           ansible.builtin.set_fact:
             compose_files_written: >-
-              {% set paths = namespace(values=[]) %}
-              {% for result in compose_file_copies.results | default([]) %}
-              {% if not result.failed | default(false) and not result.skipped | default(false) %}
-              {% set paths.values = paths.values + [result.supplied_file.path] %}{% endif %}
-              {% endfor %}
+              {%- set paths = namespace(values=[]) -%}
+              {%- for result in compose_file_copies.results | default([]) -%}
+              {%- if not result.failed | default(false) and not result.skipped | default(false) -%}
+              {%- set paths.values = paths.values + [result.supplied_file.path] -%}{%- endif -%}
+              {%- endfor -%}
               {{ paths.values }}
             compose_changed: >-
               {{ compose_changed or compose_file_copies.changed | default(false) or
