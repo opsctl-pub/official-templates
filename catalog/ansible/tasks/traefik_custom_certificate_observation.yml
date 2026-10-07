@@ -16,6 +16,13 @@
       hosts: []
       renewal: null
     certificate_procedure_error: {phase: observe, code: certificate_serving_unverified}
+    certificate_selection_snapshot:
+      presence: unknown
+      source: null
+      material_id: null
+      revision_id: null
+      leaf_fingerprint_sha256: null
+    certificate_selection_observed: false
   no_log: true
 
 - name: Observe the subject selection and optional actual SNI
@@ -43,6 +50,7 @@
       community.docker.docker_container_info:
         name: "{{ traefik_container_name | default('traefik') }}"
       register: certificate_gateway
+      when: not (certificate_selection_only | default(false))
 
     - name: Require the native file-provider gateway and certificate mount
       ansible.builtin.assert:
@@ -59,6 +67,7 @@
             selectattr('Destination', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
             selectattr('Source', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
             selectattr('RW', 'equalto', false) | list | length == 1
+      when: not (certificate_selection_only | default(false))
 
     - name: Read bounded selection leaf enrollment and requested SNI facts
       ansible.builtin.script:
@@ -71,6 +80,7 @@
           --timer {{ certificate_timer_name | quote }}
           --address {{ certificate_probe_address | default('127.0.0.1') | quote }}
           --port {{ certificate_probe_port | default(443) }}
+          {{ '--selection-only' if certificate_selection_only | default(false) else '' }}
           {{ ('--trust-pem ' ~ (trust_bundle_pem | quote)) if trust_bundle_pem | default(none) is not none else '' }}
         executable: python3
       register: certificate_native_observation
@@ -90,6 +100,21 @@
           {{ (certificate_native_observation.stdout | from_json).procedure_error |
             default(none if certificate_native_observation.rc == 0 else
               {'phase': 'probe', 'code': 'certificate_serving_unverified'}) }}
+      when: not (certificate_selection_only | default(false))
+
+    - name: Require the exact selection-only snapshot shape
+      ansible.builtin.assert:
+        that:
+          - certificate_native_observation.stdout | from_json is mapping
+          - (certificate_native_observation.stdout | from_json).keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+      when: certificate_selection_only | default(false)
+
+    - name: Retain selection-only facts without claiming serving or enrollment
+      ansible.builtin.set_fact:
+        certificate_selection_snapshot: "{{ certificate_native_observation.stdout | from_json }}"
+        certificate_selection_observed: "{{ certificate_native_observation.rc == 0 }}"
+        certificate_procedure_error: "{{ none if certificate_native_observation.rc == 0 else {'phase': 'observe', 'code': 'certificate_serving_unverified'} }}"
+      when: certificate_selection_only | default(false)
   rescue:
     - name: Keep unavailable native observation distinct from absence
       ansible.builtin.set_fact:

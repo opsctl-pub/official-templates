@@ -246,6 +246,46 @@ def selection(path, root, subject):
     return facts, raw
 
 
+def selection_path_present(path):
+    """Check the root-owned selection chain without following missing or linked ancestors."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError("unsafe selection path")
+    descriptor = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in path.parts[1:-1]:
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=descriptor)
+            except FileNotFoundError:
+                return False
+            os.close(descriptor)
+            descriptor = child
+            if os.fstat(descriptor).st_uid != 0:
+                raise ValueError("foreign selection directory")
+        try:
+            entry = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != 0:
+            raise ValueError("foreign selection file")
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def selection_only(args):
+    """Observe a stable selection without requiring a gateway or timer enrollment."""
+    present = selection_path_present(args.selection)
+    facts, raw = selection(args.selection, args.root, args.subject) if present else (empty("absent"), None)
+    if selection_path_present(args.selection) != present:
+        raise ValueError("selection changed during observation")
+    after, after_raw = selection(args.selection, args.root, args.subject) if present else (empty("absent"), None)
+    if after_raw != raw or snapshot(after) != snapshot(facts):
+        raise ValueError("selection changed during observation")
+    return snapshot(facts)
+
+
 def probe(host, fingerprint, trust, address, port, deadline):
     """Read one loopback SNI leaf and separately establish selected trust."""
     result = {"hostname": host, "served": "unknown", "trusted": None,
@@ -350,6 +390,7 @@ def main():
     parser.add_argument("--trust-file")
     parser.add_argument("--trust-pem")
     parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--selection-only", action="store_true")
     parser.add_argument("--require-source", choices=("automatic", "custom", "native"))
     parser.add_argument("--csr")
     parser.add_argument("--revision")
@@ -358,6 +399,12 @@ def main():
     args = parser.parse_args()
     facts = empty()
     try:
+        if args.selection_only:
+            subject_key(args.subject)
+            if args.csr or args.unused_directory or args.snapshot or args.hosts:
+                raise ValueError("conflicting observation mode")
+            print(json.dumps(selection_only(args), separators=(",", ":")))
+            return 0
         if args.unused_directory:
             value = referenced(args.selection_directory, args.unused_directory)
             print(json.dumps({"referenced": value}))
@@ -389,6 +436,9 @@ def main():
         print(encoded)
         return 0 if facts["outcome"] == "succeeded" else 1
     except (OSError, ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError, subprocess.SubprocessError):
+        if args.selection_only:
+            print(json.dumps(snapshot(empty()), separators=(",", ":")))
+            return 1
         print(json.dumps({"certificate_observation": empty(),
                           "procedure_error": {"phase": "observe", "code": "certificate_serving_unverified"}}))
         return 1
