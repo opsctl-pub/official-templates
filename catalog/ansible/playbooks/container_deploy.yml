@@ -8,7 +8,7 @@
     router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
     health_path: "{{ app_health_path | default('/health') }}"
     host_health_port: "{{ app_health_port | default((app_ports | default([]) | first) | default(none)) }}"
-    local_runtime_enabled: "{{ app_local_runtime is defined }}"
+    managed_image_resources: "{{ app_previous_container_id is defined or (app_mounts | default([]) | length > 0) or (app_networks | default([]) | length > 0) or (app_observe_volumes | default([]) | length > 0) or (app_observe_networks | default([]) | length > 0) }}"
     exposure_mode: "{{ backend_exposure_mode | default('host') }}"
     loopback_backend_enabled: "{{ exposure_mode == 'loopback' }}"
     source_dual_backend_enabled: "{{ exposure_mode == 'loopback_wireguard' }}"
@@ -32,7 +32,7 @@
     health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
     health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
     published_ports: []
-    host_port_preflight_enabled: "{{ not local_runtime_enabled and ((not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled) }}"
+    host_port_preflight_enabled: "{{ not managed_image_resources and ((not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled) }}"
     traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
     traefik_label_map: {}
     opsctl_label_map:
@@ -150,30 +150,6 @@
           raise SystemExit("source_replacement_restore_health_failed")
       PY
   pre_tasks:
-    - name: Validate exact reviewed Compose group identity
-      ansible.builtin.assert:
-        that:
-          - app_compose_runtime is mapping
-          - app_compose_runtime.protocol == 'opsctl-compose-runtime/2'
-          - app_compose_runtime.action == 'deploy'
-          - app_compose_runtime.organization_id == app_org_id
-          - app_compose_runtime.deployment_id == app_deployment_id
-          - app_compose_runtime.server_id == server_id
-          - app_compose_runtime.revision_id == app_revision_id
-          - app_compose_registry_access is mapping
-          - source_replacement is not defined
-          - not (replace_conflicts | default(false) | bool)
-        fail_msg: "Compose group requires exact reviewed identity"
-      when: app_compose_runtime is defined
-
-    - name: Execute the reviewed Compose group through the shared transition
-      ansible.builtin.include_tasks: ../tasks/container_compose.yml
-      when: app_compose_runtime is defined
-
-    - name: End grouped execution before single-image effects
-      ansible.builtin.meta: end_play
-      when: app_compose_runtime is defined
-
     - name: Validate managed runtime identity before mutation
       assert:
         that:
@@ -194,23 +170,6 @@
           - exposure_mode in ['host', 'wireguard', 'loopback', 'loopback_wireguard']
         fail_msg: "backend_exposure_mode must be host, wireguard, loopback, or loopback_wireguard"
 
-    - name: Validate opt-in local transition before legacy effects
-      assert:
-        that:
-          - app_local_runtime is mapping
-          - app_local_runtime.protocol == 'opsctl-local-runtime/1'
-          - app_local_runtime.action == 'deploy'
-          - app_local_runtime.organization_id == app_org_id
-          - app_local_runtime.deployment_id == app_deployment_id
-          - app_local_runtime.server_id == server_id
-          - app_local_runtime.revision_id == app_revision_id
-          - app_local_runtime.container_name == container_name
-          - app_local_runtime.image == app_image
-          - source_replacement is not defined
-          - not (replace_conflicts | default(false) | bool)
-        fail_msg: "Local runtime requires exact identity and excludes legacy replacement"
-      when: local_runtime_enabled
-
     - name: Validate loopback backend mapping before mutation
       assert:
         that:
@@ -222,6 +181,20 @@
           - (backend_container_port | int) <= 65535
         fail_msg: "route_port and container_port are required for backend_exposure_mode=loopback"
       when: loopback_backend_enabled or source_dual_backend_enabled
+
+    - name: Validate native managed image inputs without legacy replacement
+      ansible.builtin.assert:
+        that:
+          - source_replacement is not defined
+          - not (replace_conflicts | default(false) | bool)
+          - app_previous_container_id | default(none) is none or app_previous_container_id is match('^[0-9a-f]{64}$')
+          - app_memory_bytes | default(none) is none or (app_memory_bytes is integer and app_memory_bytes > 0)
+          - app_health_exec | default(none) is none or (app_health_exec is sequence and app_health_exec is not string and app_health_exec | length > 0 and app_health_exec | length <= 128)
+          - app_mounts | default([]) | length <= 128
+          - app_networks | default([]) | length <= 64
+        fail_msg: Native managed image inputs are invalid.
+      when: managed_image_resources
+      no_log: true
   tasks:
     - name: Ensure container health port derived when missing
       set_fact:
@@ -336,6 +309,82 @@
       when:
         - host_port_preflight_enabled
         - (published_ports | length) > 0
+
+    - name: Observe existing managed image backing before replacement
+      ansible.builtin.include_tasks:
+        file: ../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: inspect
+      when: managed_image_resources
+
+    - name: Require exact predecessor or complete missing-runtime qualification
+      ansible.builtin.assert:
+        that:
+          - image_runtime.observation_complete
+          - >-
+            (image_runtime.container is none and
+             (app_previous_container_id | default(none) is none or image_runtime.previous_container_absent)) or
+            (image_runtime.container is not none and app_previous_container_id | default(none) is not none and
+             image_runtime.container.id == app_previous_container_id)
+          - image_runtime.volumes | rejectattr('presence', 'equalto', 'present') | list | length == 0
+          - image_runtime.networks | rejectattr('presence', 'equalto', 'present') | list | length == 0
+        fail_msg: Managed runtime or native backing changed. Refresh its observation before deployment.
+      when: managed_image_resources
+      no_log: true
+
+    - name: Require every mount to name an observed native volume
+      ansible.builtin.assert:
+        that:
+          - managed_mount.source in (image_runtime.volumes | map(attribute='name') | list)
+          - managed_mount.target is string and managed_mount.target.startswith('/')
+          - managed_mount.read_only is boolean
+          - >-
+            managed_mount.read_only or
+            (image_runtime.volumes | selectattr('name', 'equalto', managed_mount.source) | first).users |
+            rejectattr('id', 'equalto', app_previous_container_id | default('')) |
+            selectattr('state', 'equalto', 'running') | selectattr('read_only', 'equalto', false) | list | length == 0
+        fail_msg: Managed volume is unavailable or has another running writer.
+      loop: "{{ app_mounts | default([]) }}"
+      loop_control:
+        loop_var: managed_mount
+        label: managed mount
+      when: managed_image_resources
+      no_log: true
+
+    - name: Require every requested network to match an observed native identity
+      ansible.builtin.assert:
+        that:
+          - >-
+            image_runtime.networks | selectattr('id', 'equalto', managed_network.id) |
+            selectattr('name', 'equalto', managed_network.name) | list | length == 1
+          - managed_network.aliases | default([]) is sequence and managed_network.aliases | default([]) is not string
+          - managed_network.aliases | default([]) | length <= 128
+        fail_msg: Managed network is unavailable or changed.
+      loop: "{{ app_networks | default([]) }}"
+      loop_control:
+        loop_var: managed_network
+        label: managed network
+      when: managed_image_resources
+      no_log: true
+
+    - name: Map only qualified native mounts and networks
+      ansible.builtin.set_fact:
+        image_native_mounts: >-
+          {% set mounts = namespace(values=[]) %}
+          {% for mount in app_mounts | default([]) %}
+          {% set mounts.values = mounts.values + [{'type': 'volume', 'source': mount.source,
+            'target': mount.target, 'read_only': mount.read_only}] %}
+          {% endfor %}
+          {{ mounts.values }}
+        image_native_networks: >-
+          {% set networks = namespace(values=[]) %}
+          {% for network in app_networks | default([]) %}
+          {% set networks.values = networks.values + [{'name': network.name, 'aliases': network.aliases | default([])}] %}
+          {% endfor %}
+          {{ networks.values }}
+      no_log: true
 
     - name: OPERATION_STEP preflight:ports start
       shell: |
@@ -1008,31 +1057,26 @@
       register: legacy_opsctl_containers_result
       changed_when: false
       failed_when: legacy_opsctl_containers_result.rc != 0
-      when: not local_runtime_enabled
+      when: not managed_image_resources
 
     - name: Parse legacy OpsCtl containers list
       set_fact:
         legacy_opsctl_containers: "{{ legacy_opsctl_containers_result.stdout | default('[]') | from_json }}"
-      when: not local_runtime_enabled
+      when: not managed_image_resources
 
     - name: Remove legacy OpsCtl-managed container "{{ item }}"
       command: docker rm -f "{{ item }}"
       loop: "{{ legacy_opsctl_containers | default([]) }}"
-      when: not local_runtime_enabled and (legacy_opsctl_containers | default([]) | length) > 0
+      when: not managed_image_resources and (legacy_opsctl_containers | default([]) | length) > 0
 
     - name: OPERATION_STEP replace:legacy_cleanup complete
       shell: |
         printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"display_name":"Remove legacy containers","removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
       args:
         executable: /bin/sh
-      when: not local_runtime_enabled and (legacy_opsctl_containers | default([]) | length) > 0
-
-    - name: Converge the shared reviewed Compose deployment
-      ansible.builtin.include_tasks: ../tasks/container_compose.yml
-      when: local_runtime_enabled
+      when: not managed_image_resources and (legacy_opsctl_containers | default([]) | length) > 0
 
     - name: Start target container
-      when: not local_runtime_enabled
       block:
         - name: Start container "{{ container_name }}"
           community.docker.docker_container:
@@ -1047,25 +1091,49 @@
             published_ports: "{{ published_ports }}"
             env: "{{ app_env | default({}) }}"
             labels: "{{ final_label_map }}"
-      rescue:
-        - name: Restore source container after container startup failure
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
+            mounts: "{{ image_native_mounts }}"
+            networks: "{{ image_native_networks }}"
+            networks_cli_compatible: true
+            network_mode: "{{ 'bridge' if image_native_networks | length == 0 else omit }}"
+            memory: "{{ app_memory_bytes | default(omit, true) }}"
+            healthcheck: >-
+              {{ {'test': ['CMD'] + app_health_exec, 'interval': '5s', 'timeout': '5s', 'retries': 20}
+                if app_health_exec | default(none) is not none else omit }}
           no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
-          when:
-            - source_replacement_verified | default(false) | bool
-            - source_replacement_removed | default(false) | bool
-        - name: Collect container startup diagnostics
-          include_tasks: ../tasks/container_failure_diagnostics.yml
+      rescue:
+        - name: Preserve startup restoration and publish available failed-attempt facts
+          block:
+            - name: Restore source container after container startup failure
+              shell: "{{ source_replacement_restore_script }}"
+              args:
+                executable: /bin/bash
+              no_log: true
+              failed_when: source_replacement_restore_result.rc != 0
+              register: source_replacement_restore_result
+              when:
+                - source_replacement_verified | default(false) | bool
+                - source_replacement_removed | default(false) | bool
 
-        - name: OPERATION_STEP container:prepare failed
-          shell: |
-            printf 'OPERATION_STEP={"name":"container:prepare","status":"failed","metadata":{"display_name":"Prepare container","reason_code":"container_start_failed"}}\n'
-          args:
-            executable: /bin/sh
+            - name: Collect container startup diagnostics
+              include_tasks: ../tasks/container_failure_diagnostics.yml
+
+            - name: OPERATION_STEP container:prepare failed
+              shell: |
+                printf 'OPERATION_STEP={"name":"container:prepare","status":"failed","metadata":{"display_name":"Prepare container","reason_code":"container_start_failed"}}\n'
+              args:
+                executable: /bin/sh
+          always:
+            - name: Observe the actual runtime after startup failure or restoration
+              ansible.builtin.include_tasks:
+                file: ../tasks/container_observe.yml
+                apply:
+                  no_log: true
+              vars:
+                image_runtime_action: deploy
+
+            - name: Publish startup-failure runtime facts without changing failure outcome
+              ansible.builtin.debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
 
         - name: Abort after container startup failure
           fail:
@@ -1086,7 +1154,6 @@
       changed_when: false
       failed_when: false
       when:
-        - not local_runtime_enabled
         - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
 
     - name: Determine health verification strategy
@@ -1100,7 +1167,6 @@
         executable: /bin/sh
 
     - name: Verify target container health
-      when: not local_runtime_enabled
       block:
         - name: Verify health endpoint at {{ health_url_local }}
           uri:
@@ -1153,24 +1219,39 @@
           args:
             executable: /bin/sh
       rescue:
-        - name: Restore source container after health validation failure
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
-          no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
-          when:
-            - source_replacement_verified | default(false) | bool
-            - source_replacement_removed | default(false) | bool
-        - name: Collect container health diagnostics
-          include_tasks: ../tasks/container_failure_diagnostics.yml
+        - name: Preserve health restoration and publish available failed-attempt facts
+          block:
+            - name: Restore source container after health validation failure
+              shell: "{{ source_replacement_restore_script }}"
+              args:
+                executable: /bin/bash
+              no_log: true
+              failed_when: source_replacement_restore_result.rc != 0
+              register: source_replacement_restore_result
+              when:
+                - source_replacement_verified | default(false) | bool
+                - source_replacement_removed | default(false) | bool
 
-        - name: OPERATION_STEP health:check failed
-          shell: |
-            printf 'OPERATION_STEP={"name":"health:check","status":"failed","metadata":{"display_name":"Check container health","reason_code":"container_health_failed"}}\n'
-          args:
-            executable: /bin/sh
+            - name: Collect container health diagnostics
+              include_tasks: ../tasks/container_failure_diagnostics.yml
+
+            - name: OPERATION_STEP health:check failed
+              shell: |
+                printf 'OPERATION_STEP={"name":"health:check","status":"failed","metadata":{"display_name":"Check container health","reason_code":"container_health_failed"}}\n'
+              args:
+                executable: /bin/sh
+          always:
+            - name: Observe the actual runtime after health failure or restoration
+              ansible.builtin.include_tasks:
+                file: ../tasks/container_observe.yml
+                apply:
+                  no_log: true
+              vars:
+                image_runtime_action: deploy
+
+            - name: Publish health-failure runtime facts without changing failure outcome
+              ansible.builtin.debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
 
         - name: Abort after container health failure
           fail:
@@ -1181,3 +1262,22 @@
         printf 'OPERATION_STEP={"name":"deploy:start","status":"completed","metadata":{"display_name":"Deploy container","container":"{{ container_name }}"}}\n'
       args:
         executable: /bin/sh
+
+    - name: Observe every ordinary image runtime and any retained resources
+      ansible.builtin.include_tasks:
+        file: ../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: deploy
+
+    - name: Publish plain image-runtime observation
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
+
+    - name: Require complete image runtime observation
+      ansible.builtin.assert:
+        that:
+          - image_runtime.observation_complete
+          - image_runtime.ready
+        fail_msg: Image runtime observation is incomplete or not ready.

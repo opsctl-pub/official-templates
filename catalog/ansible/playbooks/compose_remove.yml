@@ -1,0 +1,191 @@
+---
+- name: Remove only recorded native Compose workloads and created unused networks
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Initialize data-retaining removal outcome
+      ansible.builtin.set_fact:
+        compose_action: remove
+        compose_phase: compose:prepare
+        compose_outcome: unknown
+        compose_reason: compose_prerequisite_unavailable
+        compose_changed: false
+        compose_removed_containers: []
+      no_log: true
+
+    - name: Perform exact recorded Compose removal
+      block:
+        - name: Require bounded recorded native identities
+          ansible.builtin.assert:
+            that:
+              - compose_project_name is match('^[a-z0-9][a-z0-9_-]*$')
+              - compose_workspace.startswith('/')
+              - compose_known_containers | default([]) | length <= 128
+              - compose_known_networks is defined
+              - compose_known_networks | length <= 64
+              - compose_known_volumes | default([]) | length <= 64
+
+        - name: Observe membership and resource incarnations before effects
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Select changed-membership refusal
+          ansible.builtin.set_fact:
+            compose_reason: compose_resource_changed
+
+        - name: Require complete exact membership and recorded resource identity
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
+              - compose_known_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
+              - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
+
+        - name: Require created network identity and no foreign users before deletion effects
+          ansible.builtin.assert:
+            that:
+              - not native_network.exists or native_network.network.Name == native_network.compose_network_name
+              - >-
+                not native_network.exists or
+                (native_network.network.Containers | default({}, true)).keys() |
+                difference(compose_known_containers | default([])) | length == 0
+          loop: "{{ compose_network_inventory }}"
+          loop_control:
+            loop_var: native_network
+            label: recorded network
+          when: >-
+            compose_known_networks | selectattr('name', 'equalto', native_network.compose_network_name) |
+            selectattr('origin', 'equalto', 'created') | list | length > 0
+
+        - name: Select native removal failure
+          ansible.builtin.set_fact:
+            compose_phase: compose:remove
+            compose_reason: compose_remove_failed
+
+        - name: Publish completed removal preparation
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:prepare","status":"completed","metadata":{"display_name":"Prepare exact recorded removal"}}'
+          no_log: false
+
+        - name: Publish removal progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:remove","status":"running","metadata":{"display_name":"Remove recorded Compose workloads"}}'
+          no_log: false
+
+        - name: Remove exact recorded workload IDs retaining every volume
+          community.docker.docker_container:
+            name: "{{ recorded_container_id }}"
+            state: absent
+            keep_volumes: true
+            stop_timeout: 10
+          loop: "{{ compose_known_containers | default([]) }}"
+          loop_control:
+            loop_var: recorded_container_id
+            label: recorded instance
+          register: compose_container_removals
+
+        - name: Preserve actual workload-removal effects
+          ansible.builtin.set_fact:
+            compose_changed: "{{ compose_container_removals.changed }}"
+
+        - name: Reobserve exact workloads and retained data
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Retain only reobserved absent workload IDs
+          ansible.builtin.set_fact:
+            compose_removed_containers: "{{ compose_absent_containers }}"
+            compose_reason: compose_resource_changed
+
+        - name: Require workload absence and unchanged resources
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_observed_instances | length == 0
+              - compose_known_containers | default([]) | difference(compose_absent_containers) | length == 0
+
+        - name: Select in-use network refusal
+          ansible.builtin.set_fact:
+            compose_reason: compose_resource_in_use
+
+        - name: Require created networks to have no users
+          ansible.builtin.assert:
+            that: not native_network.exists or (native_network.network.Containers | default({}, true)) | length == 0
+          loop: "{{ compose_network_inventory }}"
+          loop_control:
+            loop_var: native_network
+            label: retained network
+          when: >-
+            compose_known_networks | selectattr('name', 'equalto', native_network.compose_network_name) |
+            selectattr('origin', 'equalto', 'created') | list | length > 0
+
+        - name: Select native network-removal failure
+          ansible.builtin.set_fact:
+            compose_reason: compose_remove_failed
+
+        - name: Remove only qualified created network IDs without detachment
+          ansible.builtin.command:
+            argv: [docker, network, rm, --, "{{ recorded_network.id }}"]
+          loop: "{{ compose_known_networks | selectattr('origin', 'equalto', 'created') | list }}"
+          loop_control:
+            loop_var: recorded_network
+            label: recorded created network
+          when: >-
+            compose_observed_networks | selectattr('id', 'equalto', recorded_network.id) |
+            selectattr('presence', 'equalto', 'present') | list | length == 1
+          register: compose_network_removals
+          changed_when: compose_network_removals.rc == 0
+
+        - name: Preserve actual network-removal effects
+          ansible.builtin.set_fact:
+            compose_changed: "{{ compose_changed or compose_network_removals.changed }}"
+
+        - name: Publish completed native removal and begin final observation
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:remove","status":"completed","metadata":{"display_name":"Remove recorded Compose workloads"}}'
+          no_log: false
+
+        - name: Select final observation phase
+          ansible.builtin.set_fact:
+            compose_phase: compose:observe
+
+        - name: Publish final native observation progress
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:observe","status":"running","metadata":{"display_name":"Observe final retained resources"}}'
+          no_log: false
+
+        - name: Reobserve final native absence and retained resources
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Require exact final workload and created-network absence
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_observed_instances | length == 0
+              - compose_observed_networks | selectattr('origin', 'equalto', 'created') | rejectattr('presence', 'equalto', 'absent') | list | length == 0
+
+        - name: Record complete removal without readiness or data deletion
+          ansible.builtin.set_fact:
+            compose_removed_containers: "{{ compose_absent_containers }}"
+            compose_outcome: succeeded
+            compose_reason: null
+            compose_phase: compose:complete
+      rescue:
+        - name: Preserve partial removal truth without native diagnostic output
+          ansible.builtin.set_fact:
+            compose_failure_reason: "{{ compose_reason }}"
+            compose_changed: >-
+              {{ compose_changed or compose_container_removals.changed | default(false) or
+                compose_network_removals.changed | default(false) }}
+
+        - name: Reobserve partial removal effects without expanding admitted membership
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+
+        - name: Retain failed versus incomplete removal and observed absence
+          ansible.builtin.set_fact:
+            compose_outcome: "{{ 'failed' if compose_observation_complete else 'unknown' }}"
+            compose_reason: "{{ compose_failure_reason if compose_observation_complete else compose_reason }}"
+            compose_removed_containers: "{{ compose_absent_containers }}"
+      no_log: true
+
+    - name: Publish exactly one final data-retaining result
+      ansible.builtin.include_tasks: ../tasks/compose_publish.yml

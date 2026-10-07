@@ -1,0 +1,243 @@
+---
+- name: Reset one bounded native observation
+  ansible.builtin.set_fact:
+    compose_observation_complete: false
+    compose_observed_instances: []
+    compose_instance_network_names: []
+    compose_absent_containers: []
+    compose_observed_services: []
+    compose_unexpected_containers: []
+    compose_observed_networks: []
+    compose_observed_volumes: []
+    compose_ready: null
+    compose_observation_failure: compose_observation_failed
+  no_log: true
+
+- name: Observe project containers and retained native resources
+  block:
+    - name: Require full recorded container identities
+      ansible.builtin.assert:
+        that: recorded_container is match('^[a-f0-9]{64}$')
+      loop: "{{ compose_known_containers | default([]) }}"
+      loop_control:
+        loop_var: recorded_container
+        label: recorded container
+
+    - name: Require full recorded network identities and closed origins
+      ansible.builtin.assert:
+        that:
+          - recorded_network.id is match('^[a-f0-9]{64}$')
+          - recorded_network.origin in ['created', 'reused', 'external', 'unknown']
+          - recorded_network.name is string and recorded_network.name | length > 0
+      loop: "{{ compose_known_networks | default([]) }}"
+      loop_control:
+        loop_var: recorded_network
+        label: recorded network
+
+    - name: List all project instances including stopped containers
+      community.docker.docker_host_info:
+        containers: true
+        containers_all: true
+        containers_filters:
+          label: "com.docker.compose.project={{ compose_project_name }}"
+        networks: true
+        networks_filters:
+          label: "com.docker.compose.project={{ compose_project_name }}"
+      register: compose_project_info
+
+    - name: Select bounded-inventory refusal
+      ansible.builtin.set_fact:
+        compose_observation_failure: compose_observation_limit
+
+    - name: Bound complete project and captured membership
+      ansible.builtin.assert:
+        that:
+          - compose_services | length <= 32
+          - compose_services | map(attribute='replicas') | sum <= 128
+          - compose_services | map(attribute='name') | unique | length == compose_services | length
+          - compose_known_containers | default([]) | length <= 128
+          - (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([]))) | unique | length <= 128
+          - compose_project_info.networks | length <= 64
+
+    - name: Select native instance observation failure
+      ansible.builtin.set_fact:
+        compose_observation_failure: compose_observation_failed
+
+    - name: Observe the union of current and recorded container identities
+      ansible.builtin.include_tasks:
+        file: compose_observe_instance.yml
+        apply:
+          no_log: true
+      loop: "{{ (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([]))) | unique | sort }}"
+      loop_control:
+        loop_var: compose_instance_id
+        label: native instance
+
+    - name: Classify every selected service using all replicas and native health
+      ansible.builtin.set_fact:
+        compose_observed_services: >-
+          {% set services = namespace(values=[]) %}
+          {% for service in compose_services %}
+          {% set rows = compose_observed_instances | selectattr('service', 'equalto', service.name) |
+            rejectattr('unexpected') | list %}
+          {% set good = namespace(count=0, completed=0, healthy=0, failed=0, stopped=0, starting=0) %}
+          {% for row in rows %}
+          {% set instance = row.instance %}
+          {% if instance.state == 'exited' and instance.exit_code == 0 %}
+          {% set good.completed = good.completed + 1 %}
+          {% endif %}
+          {% if instance.state in ['dead', 'restarting'] or instance.health == 'unhealthy' or
+            (instance.state == 'exited' and instance.exit_code != 0) %}
+          {% set good.failed = good.failed + 1 %}
+          {% endif %}
+          {% if instance.state in ['exited', 'paused'] %}{% set good.stopped = good.stopped + 1 %}{% endif %}
+          {% if instance.state in ['created', 'restarting'] or instance.health == 'starting' %}
+          {% set good.starting = good.starting + 1 %}{% endif %}
+          {% if instance.state == 'running' and instance.health == 'healthy' %}
+          {% set good.healthy = good.healthy + 1 %}{% endif %}
+          {% if (service.condition == 'completed' and instance.state == 'exited' and instance.exit_code == 0) or
+            (service.condition == 'healthy' and instance.state == 'running' and instance.health == 'healthy') or
+            (service.condition == 'running' and instance.state == 'running' and instance.health in ['none', 'healthy']) or
+            (service.condition in ['running', 'healthy'] and service.allow_completion | default(false) and
+              row.restart in ['', 'no'] and instance.state == 'exited' and instance.exit_code == 0) %}
+          {% set good.count = good.count + 1 %}
+          {% endif %}
+          {% endfor %}
+          {% set state = 'scaled_down' if service.replicas == 0 and rows | length == 0 else
+            ('drifted' if rows | length > service.replicas else
+            ('missing' if rows | length < service.replicas else
+            ('completed' if good.completed == rows | length and good.count == rows | length else
+            ('healthy' if good.healthy == rows | length and good.count == rows | length else
+            ('running' if good.count == rows | length else
+            ('failed' if good.failed > 0 else ('starting' if good.starting > 0 else
+            ('stopped' if good.stopped > 0 else 'unknown')))))))) %}
+          {% set services.values = services.values + [{'name': service.name, 'desired_replicas': service.replicas,
+            'condition': service.condition, 'state': state, 'instances': rows | map(attribute='instance') | list}] %}
+          {% endfor %}
+          {{ services.values }}
+        compose_unexpected_containers: "{{ compose_observed_instances | selectattr('unexpected') | map(attribute='instance') | list }}"
+
+    - name: Collect native configured and observed resource names
+      ansible.builtin.set_fact:
+        compose_network_names: >-
+          {% set names = namespace(values=compose_instance_network_names + compose_project_info.networks | map(attribute='Name') | list +
+            (compose_known_networks | default([]) | map(attribute='name') | list)) %}
+          {% for network in (compose_native_config | default({})).get('networks', {}).values() %}
+          {% if network.name | default('') | length > 0 %}{% set names.values = names.values + [network.name] %}{% endif %}
+          {% endfor %}
+          {{ names.values | unique | sort }}
+        compose_volume_names: >-
+          {% set names = namespace(values=compose_known_volumes | default([]) | map(attribute='name') | list) %}
+          {% for volume in (compose_native_config | default({})).get('volumes', {}).values() %}
+          {% if volume.name | default('') | length > 0 %}{% set names.values = names.values + [volume.name] %}{% endif %}
+          {% endfor %}
+          {% for row in compose_observed_instances %}
+          {% for mount in row.instance.mounts | selectattr('type', 'equalto', 'volume') %}
+          {% set names.values = names.values + [mount.source] %}
+          {% endfor %}
+          {% endfor %}
+          {{ names.values | unique | sort }}
+
+    - name: Select bounded-resource refusal
+      ansible.builtin.set_fact:
+        compose_observation_failure: compose_observation_limit
+
+    - name: Bound native resource observations
+      ansible.builtin.assert:
+        that:
+          - compose_network_names | length <= 64
+          - compose_volume_names | length <= 64
+
+    - name: Select native resource observation failure
+      ansible.builtin.set_fact:
+        compose_observation_failure: compose_observation_failed
+
+    - name: Inspect native networks
+      community.docker.docker_network_info:
+        name: "{{ compose_network_name }}"
+      loop: "{{ compose_network_names }}"
+      loop_control:
+        loop_var: compose_network_name
+        label: native network
+      register: compose_network_info
+
+    - name: Inspect native volumes
+      community.docker.docker_volume_info:
+        name: "{{ compose_volume_name }}"
+      loop: "{{ compose_volume_names }}"
+      loop_control:
+        loop_var: compose_volume_name
+        label: native volume
+      register: compose_volume_info
+
+    - name: Project native network identity origin and presence
+      ansible.builtin.set_fact:
+        compose_observed_networks: >-
+          {% set networks = namespace(values=[]) %}
+          {% for result in compose_network_info.results %}
+          {% set known = compose_known_networks | default([]) | selectattr('name', 'equalto', result.compose_network_name) | list %}
+          {% set prior = compose_prior_networks | default([]) | selectattr('name', 'equalto', result.compose_network_name) | list %}
+          {% set external = namespace(value=false) %}
+          {% for network in (compose_native_config | default({})).get('networks', {}).values() %}
+          {% if network.name | default('') == result.compose_network_name and network.external | default(false) %}
+          {% set external.value = true %}{% endif %}
+          {% endfor %}
+          {% if result.exists or known | length > 0 %}
+          {% set id = result.network.Id if result.exists else known[0].id %}
+          {% set origin = known[0].origin if known | length > 0 and known[0].id == id else
+            ('external' if external.value else ('created' if prior | length > 0 and prior[0].presence == 'absent' else
+            ('reused' if prior | length > 0 and prior[0].presence == 'present' and prior[0].id == id else 'unknown'))) %}
+          {% set networks.values = networks.values + [{'id': id, 'name': result.compose_network_name,
+            'origin': origin, 'presence': 'absent' if not result.exists else
+              ('unknown' if known | length > 0 and known[0].id != id else 'present')}] %}
+          {% endif %}
+          {% endfor %}
+          {{ networks.values }}
+        compose_network_inventory: "{{ compose_network_info.results }}"
+        compose_volume_inventory: "{{ compose_volume_info.results }}"
+
+    - name: Project native volume incarnation origin and presence
+      ansible.builtin.set_fact:
+        compose_observed_volumes: >-
+          {% set volumes = namespace(values=[]) %}
+          {% for result in compose_volume_info.results %}
+          {% set known = compose_known_volumes | default([]) | selectattr('name', 'equalto', result.compose_volume_name) | list %}
+          {% set prior = compose_prior_volumes | default([]) | selectattr('name', 'equalto', result.compose_volume_name) | list %}
+          {% set external = namespace(value=false) %}
+          {% for volume in (compose_native_config | default({})).get('volumes', {}).values() %}
+          {% if volume.name | default('') == result.compose_volume_name and volume.external | default(false) %}
+          {% set external.value = true %}{% endif %}
+          {% endfor %}
+          {% set timestamp = result.volume.CreatedAt | default(none) if result.exists else none %}
+          {% set origin = known[0].origin if known | length > 0 and
+            (not result.exists or (timestamp is not none and known[0].created_at == timestamp)) else
+            ('external' if external.value else ('created' if prior | length > 0 and prior[0].presence == 'absent' else
+            ('reused' if timestamp is not none and prior | length > 0 and prior[0].presence == 'present' and
+              prior[0].created_at == timestamp else 'unknown'))) %}
+          {% set volumes.values = volumes.values + [{'name': result.compose_volume_name, 'created_at': timestamp,
+            'origin': origin, 'presence': 'absent' if not result.exists else
+              ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp) else 'present')}] %}
+          {% endfor %}
+          {{ volumes.values }}
+
+    - name: Record complete native observation and readiness independently
+      ansible.builtin.set_fact:
+        compose_observation_complete: >-
+          {{ compose_observed_networks | selectattr('presence', 'equalto', 'unknown') | list | length == 0 and
+             compose_observed_volumes | selectattr('presence', 'equalto', 'unknown') | list | length == 0 }}
+        compose_ready: >-
+          {{ compose_unexpected_containers | length == 0 and compose_observed_services |
+            rejectattr('state', 'in', ['running', 'healthy', 'completed', 'scaled_down']) | list | length == 0 }}
+  rescue:
+    - name: Retain incomplete observation without fabricating readiness
+      ansible.builtin.set_fact:
+        compose_observation_complete: false
+        compose_ready: null
+        compose_reason: "{{ compose_observation_failure }}"
+  no_log: true
+
+- name: Clear readiness when native observation is incomplete
+  ansible.builtin.set_fact:
+    compose_ready: null
+  when: not compose_observation_complete
+  no_log: true
