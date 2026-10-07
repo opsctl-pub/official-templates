@@ -95,6 +95,24 @@ the admitted hostname for that same Server. The helper's explicit --selection-on
 returns exactly the five snapshot fields and skips probes/enrollment; its default
 observation and --snapshot behavior remain unchanged.
 
+Pre-effect setup refusal emits a valid UNKNOWN full certificate_observation and a
+fixed procedure_error before failing. The five-field snapshot stays local; it
+cannot supply full validity, binding count or enrollment facts. Unknown selection
+is never rewritten as absent.
+Dedicated Server dashboard retirement supplies certificate_dashboard_retirement=true
+with authenticated subject/organization/hosts, not a historical renewable leaf or
+backend expected_certificate. The procedure observes current selection, requires
+the exact Server dashboard route absent, pauses its timer and waits for its service,
+then reobserves and freezes the local five-field snapshot for existing strict
+selection removal CAS. Nonautomatic material remains selected and unchanged;
+certificate_observation plus automatic_retired reports actual final facts.
+Final absence retains renewal={enabled:false,active:false,next_due_at:null} only
+after the timer was observed absent or disabled/inactive; native/custom selections
+retain renewal=null. Failed or unknown final observation cannot inherit success.
+Generic retirement defaults certificate_dashboard_retirement=false and retains
+the caller's strict expected snapshot. These sequences do not claim atomic CAS
+across independent native tasks; publication still checks the frozen selection.
+
 ### Public Inputs
 
 All items take certificate_subject={type:deployment|server,id:UUID} and route_hosts
@@ -177,13 +195,15 @@ scheduling or cross-subject cleanup occurs inside the primitive.
 
 One TEMPLATE_OUTPUT_JSON object contains certificate_observation: outcome=
 succeeded/failed/incomplete, UTC observed_at, five selection fields, nullable UTC
-not_before/not_after, selected_hosts, nullable binding_count, hosts=[{hostname,
+not_before/not_after, selected_hosts, binding_count, hosts=[{hostname,
 served:matched/mismatch/unreachable/unknown,trusted:bool|null,
 leaf_fingerprint_sha256:string|null}], renewal. Automatic renewal is
 {enabled:bool|null,active:bool|null,next_due_at:UTC|null}; other sources use null.
 Selection-only hosts=[] never claims serving. Retirement adds automatic_retired
 or retired_revision_absent, nullable and true only after actual corresponding
 absence/disabled enrollment.
+binding_count is nullable for unknown presence, positive for present, and exactly0
+for absent; unavailable observation never fabricates zero.
 
 CSR returns native_certificate_csr={outcome,observed_at,csr_pem,
 public_key_sha256,revision_id}; public CSR maximum16KiB, private key never exported.

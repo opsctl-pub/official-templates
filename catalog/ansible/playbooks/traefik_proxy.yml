@@ -30,6 +30,7 @@
         - name: Initialize dashboard retirement phase
           ansible.builtin.set_fact:
             traefik_dashboard_retirement_started: false
+            traefik_dashboard_selection_admitted: false
 
         - name: Observe the Server dashboard selection before setup mutation
           ansible.builtin.include_tasks: ../tasks/traefik_custom_certificate_observation.yml
@@ -60,6 +61,7 @@
               material_id: "{{ certificate_selection_snapshot.material_id }}"
               revision_id: "{{ certificate_selection_snapshot.revision_id }}"
               leaf_fingerprint_sha256: "{{ certificate_selection_snapshot.leaf_fingerprint_sha256 }}"
+            traefik_dashboard_selection_admitted: true
           when: traefik_dashboard_enabled | default(false)
           no_log: true
 
@@ -98,11 +100,11 @@
         - name: Enter qualified dashboard retirement after disabled runtime verification
           ansible.builtin.set_fact:
             traefik_dashboard_retirement_started: true
-          when: not (traefik_dashboard_enabled | default(false)) and expected_certificate is defined
+          when: not (traefik_dashboard_enabled | default(false)) and (certificate_dashboard_retirement | default(false))
 
         - name: Retire the disabled Server dashboard selection
           ansible.builtin.include_tasks: ../tasks/traefik_server_dashboard_retirement.yml
-          when: not (traefik_dashboard_enabled | default(false)) and expected_certificate is defined
+          when: not (traefik_dashboard_enabled | default(false)) and (certificate_dashboard_retirement | default(false))
 
         - name: Issue and enroll the Server dashboard certificate
           ansible.builtin.include_tasks: ../tasks/traefik_automatic_certificate.yml
@@ -120,6 +122,19 @@
           args:
             executable: /bin/sh
       rescue:
+        - name: Publish unknown full observation on pre-effect dashboard refusal
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'certificate_observation':
+                certificate_observation |
+                combine({'outcome': 'failed'}), 'procedure_error':
+                {'phase': 'validate', 'code': 'certificate_state_changed'}
+                if certificate_selection_observed | default(false) else
+                {'phase': 'observe', 'code': 'certificate_serving_unverified'}} | to_json }}
+          when:
+            - traefik_dashboard_enabled | default(false)
+            - not (traefik_dashboard_selection_admitted | default(false))
+
         - name: Restore prior managed runtime after later setup failure
           ansible.builtin.include_tasks: ../tasks/traefik_gateway_runtime_restore.yml
           when:
