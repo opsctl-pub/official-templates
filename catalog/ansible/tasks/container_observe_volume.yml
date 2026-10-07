@@ -1,0 +1,74 @@
+---
+- name: Observe native volume incarnation and all users
+  block:
+    - name: Require a recorded volume incarnation
+      ansible.builtin.assert:
+        that:
+          - observed_volume.created_at is string
+          - observed_volume.created_at | length > 0
+
+    - name: Inspect native volume
+      community.docker.docker_volume_info:
+        name: "{{ observed_volume.name }}"
+      register: image_volume_info
+
+    - name: List stopped and running volume users
+      community.docker.docker_host_info:
+        containers: true
+        containers_all: true
+        containers_filters:
+          volume: "{{ observed_volume.name }}"
+      register: image_volume_users
+
+    - name: Bound volume user inventory
+      ansible.builtin.assert:
+        that:
+          - image_volume_users.containers | length <= 128
+
+    - name: Inspect each volume user
+      community.docker.docker_container_info:
+        name: "{{ volume_user.Id }}"
+      loop: "{{ image_volume_users.containers }}"
+      loop_control:
+        loop_var: volume_user
+        label: volume user
+      register: image_volume_user_details
+
+    - name: Require complete unchanged volume-user identities
+      ansible.builtin.assert:
+        that:
+          - user_detail.exists
+          - user_detail.container.Id == user_detail.volume_user.Id
+          - user_detail.container.State.Status in ['created', 'running', 'restarting', 'paused', 'exited', 'dead', 'removing']
+          - >-
+            user_detail.container.Mounts | selectattr('Type', 'equalto', 'volume') |
+            selectattr('Name', 'defined') | selectattr('Name', 'equalto', observed_volume.name) | list | length > 0
+      loop: "{{ image_volume_user_details.results }}"
+      loop_control:
+        loop_var: user_detail
+        label: volume user
+
+    - name: Record safe volume facts without adopting replaced incarnations
+      ansible.builtin.set_fact:
+        image_observed_volumes: >-
+          {% set users = namespace(values=[]) %}
+          {% for result in image_volume_user_details.results %}
+          {% set mounts = result.container.Mounts | selectattr('Type', 'equalto', 'volume') |
+            selectattr('Name', 'defined') | selectattr('Name', 'equalto', observed_volume.name) | list %}
+          {% set users.values = users.values + [{'id': result.container.Id,
+            'state': result.container.State.Status,
+            'read_only': mounts | selectattr('RW', 'equalto', true) | list | length == 0}] %}
+          {% endfor %}
+          {{ image_observed_volumes + [{'name': observed_volume.name,
+            'created_at': image_volume_info.volume.CreatedAt | default(none) if image_volume_info.exists else none,
+            'presence': 'absent' if not image_volume_info.exists else
+              ('present' if image_volume_info.volume.CreatedAt | default(none) == observed_volume.created_at else 'unknown'),
+            'users': users.values}] }}
+  rescue:
+    - name: Retain unknown volume observation
+      ansible.builtin.set_fact:
+        image_observation_complete: false
+        image_observed_volumes: >-
+          {{ image_observed_volumes + [{'name': observed_volume.name, 'created_at': none,
+            'presence': 'unknown', 'users': []}] }}
+  no_log: true
