@@ -1,188 +1,263 @@
-- name: Attach deployment backends through managed Traefik
+---
+- name: Update the recorded gateway peers before attaching deployment routes
   hosts: all
   gather_facts: false
   become: true
   vars:
-    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
-    short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
-    wireguard_interface_name: "wg-{{ short_deployment_id }}"
-    wireguard_private_key_path: "/etc/wireguard/{{ wireguard_interface_name }}.key"
-    wireguard_config_path: "/etc/wireguard/{{ wireguard_interface_name }}.conf"
-    wireguard_service_name: "wg-quick@{{ wireguard_interface_name }}"
-    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
-    gateway_wireguard_address: "{{ gateway_wireguard_ip if ('/' in (gateway_wireguard_ip | string)) else (gateway_wireguard_ip ~ '/' ~ (overlay_cidr | regex_replace('^.*/', ''))) }}"
-    effective_route_hosts: "{{ route_hosts | default(([route_host] if (route_host is defined and (route_host | string | length) > 0) else []), true) }}"
+    wireguard_base_dir: /etc/wireguard
+    wireguard_private_key_path: "{{ wireguard_base_dir }}/{{ gateway_interface }}.key"
+    wireguard_config_path: "{{ wireguard_base_dir }}/{{ gateway_interface }}.conf"
+    gateway_wireguard_address: "{{ gateway_wireguard_ip }}/{{ overlay_cidr.split('/')[1] }}"
   pre_tasks:
-    - name: Validate exact attach contract before any host access
-      assert:
-        that:
-          - deployment_id is defined
-          - deployment_id is string
-          - deployment_id is match('^[0-9a-fA-F-]{36}$')
-          - server_id is defined
-          - server_id is string
-          - server_id is match('^[0-9a-fA-F-]{36}$')
-          - overlay_cidr is defined
-          - overlay_cidr is string
-          - overlay_cidr is match('^[0-9a-fA-F:.]+/[0-9]+$')
-          - gateway_wireguard_ip is defined
-          - gateway_wireguard_ip is string
-          - gateway_wireguard_ip is match('^[0-9a-fA-F:.]+$')
-          - wireguard_peers is defined
-          - wireguard_peers is sequence
-          - wireguard_peers is not string
-          - route_port is defined
-          - route_port is number
-          - route_port | int >= 1
-          - route_port | int <= 65535
-          - effective_route_hosts is sequence
-          - effective_route_hosts is not string
-          - effective_route_hosts | length > 0
-          - route_https is defined
-          - route_https is boolean
-          - redirect_http_to_https is defined
-          - redirect_http_to_https is boolean
-          - not redirect_http_to_https or route_https
-          - route_middlewares is defined
-          - route_middlewares is sequence
-          - route_middlewares is not string
-          - traefik_backends is defined
-          - traefik_backends is sequence
-          - traefik_backends is not string
-          - traefik_backends | length > 0
-        fail_msg: "Traefik attach contract is incomplete or malformed"
-    - name: Validate exact attach route hosts
-      assert:
-        that:
-          - item is string
-          - item | length > 0
-        fail_msg: "Traefik attach route host is invalid"
-      loop: "{{ effective_route_hosts }}"
-    - name: Validate exact attach WireGuard peers
-      assert:
-        that:
-          - item is mapping
-          - item.public_key is defined
-          - item.public_key is string
-          - item.public_key | length > 0
-          - item.allowed_ips is defined
-          - item.allowed_ips is string
-          - item.allowed_ips | length > 0
-          - item.endpoint is defined
-          - item.endpoint is string
-          - item.endpoint | length > 0
-          - item.persistent_keepalive is defined
-          - item.persistent_keepalive is number
-        fail_msg: "Traefik attach WireGuard peer is invalid"
-      loop: "{{ wireguard_peers }}"
-    - name: Validate exact attach backends
-      assert:
-        that:
-          - item is mapping
-          - item.url is defined
-          - item.url is string
-          - item.url is match('^http://[^:/?#]+:[0-9]+/?$')
-        fail_msg: "Traefik attach backend is invalid"
-      loop: "{{ traefik_backends }}"
-    - name: Skip attach when running in simulate mode
-      meta: end_play
+    - name: Skip attach simulation without mutation or consumed success
+      ansible.builtin.meta: end_play
       when: simulate | default(false)
-
   tasks:
-    - name: Attach deployment backends
+    - name: Initialize unknown gateway attachment
+      ansible.builtin.set_fact:
+        attach_wireguard_ready: false
+        attach_wireguard_facts: {}
+        attach_failure_phase: validate
+        attach_failure_code: routing_input_invalid
+
+    - name: Qualify and update only the recorded gateway
       block:
-        - name: OPERATION_STEP attach:start
-          shell: |
-            printf 'OPERATION_STEP={"name":"attach:start","status":"running","metadata":{"display_name":"Attach load balancer backends","deployment_id":"%s","route_hosts":%s}}\n' "{{ deployment_id }}" '{{ effective_route_hosts | to_json }}'
-          args:
-            executable: /bin/sh
+        - name: Require authenticated identity and explicit native references
+          ansible.builtin.assert:
+            that:
+              - org_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - deployment_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - server_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - gateway_interface is string
+              - gateway_interface | length > 0 and gateway_interface | length <= 15
+              - gateway_interface is match('^[A-Za-z0-9_.-]+$')
+              - gateway_interface not in ['.', '..']
+              - gateway_service is mapping
+              - gateway_service.keys() | sort == ['manager', 'name', 'state']
+              - gateway_service.manager == 'systemd'
+              - gateway_service.state == 'active'
+              - gateway_service.name is string
+              - gateway_service.name | length > 0 and gateway_service.name | length <= 255
+              - gateway_service.name is match('^[A-Za-z0-9_.@-]+$')
+              - gateway_wireguard_public_key is match('^[A-Za-z0-9+/]{43}=$')
+              - gateway_wireguard_ip is match('^[0-9a-fA-F:.]+$')
+              - overlay_cidr is match('^[0-9a-fA-F:.]+/[0-9]{1,3}$')
+              - wireguard_peers is sequence and wireguard_peers is not string
+              - route_state == 'present'
+              - route_hosts is sequence and route_hosts is not string
+              - route_hosts | length > 0 and route_hosts | length <= 100
+              - route_port is integer and route_port >= 1 and route_port <= 65535
+              - route_https is boolean and redirect_http_to_https is boolean
+              - not redirect_http_to_https or route_https
+              - route_middlewares is sequence and route_middlewares is not string
+              - traefik_backends is sequence and traefik_backends is not string
+              - traefik_backends | length > 0 and traefik_backends | length <= 64
+              - expected_route is mapping
+              - expected_route.keys() | sort == ['backends', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port', 'router_name']
+              - expected_route.presence in ['present', 'absent']
 
-        - name: Ensure Traefik dynamic directory exists
-          file:
-            path: "{{ traefik_dynamic_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0755"
+        - name: Require bounded peer configuration without line injection
+          ansible.builtin.assert:
+            that:
+              - item is mapping
+              - item.keys() | sort == ['allowed_ips', 'endpoint', 'persistent_keepalive', 'public_key']
+              - item.public_key is match('^[A-Za-z0-9+/]{43}=$')
+              - item.allowed_ips is string and item.allowed_ips | length <= 1024
+              - item.allowed_ips is match('^[0-9a-fA-F:.,/ ]+$')
+              - item.endpoint is string and item.endpoint | length <= 255
+              - item.endpoint is match('^[A-Za-z0-9.\[\]:-]+$')
+              - item.persistent_keepalive is integer
+              - item.persistent_keepalive >= 0 and item.persistent_keepalive <= 65535
+          loop: "{{ wireguard_peers }}"
+          loop_control:
+            label: admitted peer
 
-        - name: Read gateway private key
-          command: "cat {{ wireguard_private_key_path }}"
-          register: gateway_private_key_result
+        - name: Mark native gateway observation
+          ansible.builtin.set_fact:
+            attach_failure_phase: observe
+            attach_failure_code: native_tool_unavailable
+
+        - name: Inspect native gateway directory and existing private files without following links
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          loop:
+            - "{{ wireguard_base_dir }}"
+            - "{{ wireguard_private_key_path }}"
+            - "{{ wireguard_config_path }}"
+          register: attach_gateway_files
+
+        - name: Require existing private gateway material without creating or adopting it
+          ansible.builtin.assert:
+            that:
+              - attach_gateway_files.results[0].stat.isdir | default(false)
+              - not attach_gateway_files.results[0].stat.islnk
+              - attach_gateway_files.results[0].stat.uid == 0
+              - item.stat.isreg | default(false)
+              - not item.stat.islnk
+              - item.stat.uid == 0 and item.stat.mode == '0600'
+              - item.stat.size > 0 and item.stat.size <= 65536
+          loop: "{{ attach_gateway_files.results[1:] }}"
+          loop_control:
+            label: existing gateway file
+
+        - name: Observe the recorded native public key
+          ansible.builtin.command:
+            argv: [wg, show, "{{ gateway_interface }}", public-key]
+          register: attach_key_before
           changed_when: false
-          no_log: true
 
-        - name: Update gateway WireGuard config
-          copy:
+        - name: Observe the recorded interface addresses
+          ansible.builtin.command:
+            argv: [ip, -json, address, show, dev, "{{ gateway_interface }}"]
+          register: attach_addresses_before
+          changed_when: false
+
+        - name: Observe the recorded service without changing it
+          ansible.builtin.systemd_service:
+            name: "{{ gateway_service.name }}"
+          register: attach_service_before
+          changed_when: false
+
+        - name: Require exact active gateway identity before peer mutation
+          ansible.builtin.assert:
+            that:
+              - attach_key_before.stdout | trim == gateway_wireguard_public_key
+              - attach_addresses_before.stdout | from_json | length == 1
+              - (attach_addresses_before.stdout | from_json)[0].ifname == gateway_interface
+              - >-
+                (attach_addresses_before.stdout | from_json)[0].addr_info |
+                selectattr('local', 'equalto', gateway_wireguard_ip) |
+                selectattr('prefixlen', 'equalto', overlay_cidr.split('/')[1] | int) | list | length == 1
+              - attach_service_before.status.LoadState == 'loaded'
+              - attach_service_before.status.ActiveState == 'active'
+              - attach_service_before.status.Id == gateway_service.name
+
+        - name: Read the retained private key privately
+          ansible.builtin.slurp:
+            src: "{{ wireguard_private_key_path }}"
+          register: attach_private_key
+
+        - name: Verify the retained private key matches the observed public key
+          ansible.builtin.command:
+            argv: [wg, pubkey]
+            stdin: "{{ attach_private_key.content | b64decode | trim }}"
+          register: attach_derived_public_key
+          changed_when: false
+
+        - name: Refuse changed retained key material
+          ansible.builtin.assert:
+            that: attach_derived_public_key.stdout | trim == gateway_wireguard_public_key
+
+        - name: Mark peer update boundary
+          ansible.builtin.set_fact:
+            attach_failure_phase: apply
+            attach_failure_code: route_apply_failed
+
+        - name: Update peers with the retained private key
+          ansible.builtin.copy:
             dest: "{{ wireguard_config_path }}"
             owner: root
             group: root
-            mode: "0600"
+            mode: '0600'
+            unsafe_writes: false
             content: |
               [Interface]
               Address = {{ gateway_wireguard_address }}
               ListenPort = 51820
-              PrivateKey = {{ gateway_private_key_result.stdout | trim }}
+              PrivateKey = {{ attach_private_key.content | b64decode | trim }}
               PostUp = iptables -C INPUT -p udp --dport 51820 -j ACCEPT || iptables -I INPUT -p udp --dport 51820 -j ACCEPT
               PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT || true
-              {% for peer in wireguard_peers | default([]) %}
+              {% for peer in wireguard_peers %}
 
               [Peer]
               PublicKey = {{ peer.public_key }}
               AllowedIPs = {{ peer.allowed_ips }}
-              {% if peer.endpoint is defined and peer.endpoint %}
               Endpoint = {{ peer.endpoint }}
-              {% endif %}
-              {% if peer.persistent_keepalive is defined and peer.persistent_keepalive %}
               PersistentKeepalive = {{ peer.persistent_keepalive }}
-              {% endif %}
               {% endfor %}
-          no_log: true
-          register: gateway_wireguard_config_write
+          register: attach_peer_update
 
-        - name: Restart gateway WireGuard service when peers changed
-          systemd:
-            name: "{{ wireguard_service_name }}"
-            enabled: true
+        - name: Restart only the recorded service after a changed peer configuration
+          ansible.builtin.systemd_service:
+            name: "{{ gateway_service.name }}"
             state: restarted
-          when: gateway_wireguard_config_write.changed
+          when: attach_peer_update.changed
 
-        - name: Render deterministic deployment route file
-          template:
-            src: "{{ playbook_dir }}/../../templates/traefik_deployment_route.yml.j2"
-            dest: "{{ route_file_path }}"
-            owner: root
-            group: root
-            mode: "0644"
+        - name: Observe the same native public key after activation
+          ansible.builtin.command:
+            argv: [wg, show, "{{ gateway_interface }}", public-key]
+          register: attach_key_after
+          changed_when: false
 
-        - name: Verify route file exists
-          stat:
-            path: "{{ route_file_path }}"
-          register: route_file_stat
+        - name: Observe the same interface addresses after activation
+          ansible.builtin.command:
+            argv: [ip, -json, address, show, dev, "{{ gateway_interface }}"]
+          register: attach_addresses_after
+          changed_when: false
 
-        - name: Assert route file rendered
-          assert:
+        - name: Observe the same recorded service after activation
+          ansible.builtin.systemd_service:
+            name: "{{ gateway_service.name }}"
+          register: attach_service_after
+          changed_when: false
+
+        - name: Require unchanged active gateway identity after activation
+          ansible.builtin.assert:
             that:
-              - route_file_stat.stat.exists
-            fail_msg: "Traefik route file was not written"
+              - attach_key_after.stdout | trim == gateway_wireguard_public_key
+              - attach_addresses_after.stdout | from_json | length == 1
+              - (attach_addresses_after.stdout | from_json)[0].ifname == gateway_interface
+              - >-
+                (attach_addresses_after.stdout | from_json)[0].addr_info |
+                selectattr('local', 'equalto', gateway_wireguard_ip) |
+                selectattr('prefixlen', 'equalto', overlay_cidr.split('/')[1] | int) | list | length == 1
+              - attach_service_after.status.LoadState == 'loaded'
+              - attach_service_after.status.ActiveState == 'active'
+              - attach_service_after.status.Id == gateway_service.name
 
-        - name: OPERATION_STEP attach:ready
-          shell: |
-            printf 'OPERATION_STEP={"name":"attach:ready","status":"completed","metadata":{"display_name":"Verify backend attachment","deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
-          args:
-            executable: /bin/sh
+        - name: Retain only observed WireGuard facts for route attachment
+          ansible.builtin.set_fact:
+            attach_wireguard_ready: true
+            attach_wireguard_facts:
+              wireguard_ip: "{{ gateway_wireguard_ip }}"
+              wireguard_public_key: "{{ attach_key_after.stdout | trim }}"
+              wireguard_interface: "{{ gateway_interface }}"
+              wireguard_service:
+                manager: systemd
+                name: "{{ attach_service_after.status.Id }}"
+                state: "{{ attach_service_after.status.ActiveState }}"
 
-        - name: OPERATION_STEP attach:complete
-          shell: |
-            printf 'OPERATION_STEP={"name":"attach:complete","status":"completed","metadata":{"display_name":"Backends attached","deployment_id":"%s","backend_count":%s}}\n' "{{ deployment_id }}" "{{ traefik_backends | length }}"
-          args:
-            executable: /bin/sh
+        - name: Emit observed active gateway before route attachment
+          ansible.builtin.debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ attach_wireguard_facts | to_json }}"
+          no_log: false
       rescue:
-        - name: OPERATION_STEP attach:failure
-          shell: |
-            printf 'OPERATION_STEP={"name":"attach:failure","status":"failed","metadata":{"display_name":"Backend attachment failed","deployment_id":"%s"}}\n' "{{ deployment_id }}"
-          args:
-            executable: /bin/sh
+        - name: Emit fixed attachment failure without claiming native success
+          ansible.builtin.debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ {'procedure_error': {'phase': attach_failure_phase, 'code': attach_failure_code}} | to_json }}"
+          no_log: false
 
-        - name: Fail attach operation
-          fail:
-            msg: "Traefik backend attach failed"
+        - name: Refuse failed gateway peer attachment
+          ansible.builtin.fail:
+            msg: Gateway peer attachment failed. Observe retained native state before retrying.
+          no_log: false
+      no_log: true
+
+- name: Attach the full reviewed route through the canonical procedure
+  ansible.builtin.import_playbook: ../traefik_route_converge.yml
+  when: attach_wireguard_ready | default(false)
+
+- name: Publish the observed gateway and route attachment
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Emit complete attachment facts
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ attach_wireguard_facts | combine({'deployment_route_observation': route_observation}) | to_json }}"
+      when:
+        - not (simulate | default(false))
+        - attach_wireguard_ready | default(false)
+        - route_observation.outcome == 'succeeded'
