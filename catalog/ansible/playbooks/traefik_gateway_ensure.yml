@@ -8,7 +8,6 @@
     traefik_image: "traefik@sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0"
     traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
     traefik_acme_dir: "/var/lib/traefik"
-    dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('unavailable') }}"
     traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
     acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
     traefik_gateway_target_major: 3
@@ -27,10 +26,6 @@
 
     - name: Converge managed Traefik gateway
       block:
-        - name: Install broker credential for explicit DNS-01 profile
-          ansible.builtin.include_tasks: ../tasks/traefik_gateway_dns_challenge_secret.yml
-          when: challenge | default('http-01') == 'dns-01'
-
         - name: Build Traefik command arguments
           include_tasks: ../tasks/traefik_gateway_command.yml
           vars:
@@ -41,9 +36,7 @@
           vars:
             traefik_gateway_policy_labels: {}
             traefik_gateway_force_recreate: false
-            traefik_gateway_sensitive: "{{ (challenge | default('http-01')) == 'dns-01' }}"
-            traefik_dns01_broker_url: "{{ broker_url | default('') }}"
-            traefik_dns01_token_file: "{{ dns_challenge_token_file }}"
+            traefik_gateway_sensitive: false
 
         - name: OPERATION_STEP traefik:ready
           shell: |
@@ -62,10 +55,6 @@
             printf 'OPERATION_STEP={"name":"traefik:failure","status":"failed","metadata":{"display_name":"Traefik gateway failed"}}\n'
           args:
             executable: /bin/sh
-
-        - name: Clean unreferenced broker credential after failure
-          ansible.builtin.include_tasks: ../tasks/traefik_gateway_dns_challenge_cleanup.yml
-          when: challenge | default('http-01') == 'dns-01'
 
         - name: Fail Traefik gateway ensure
           fail:
