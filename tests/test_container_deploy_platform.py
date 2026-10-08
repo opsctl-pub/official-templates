@@ -9,6 +9,8 @@ import unittest
 import jinja2
 import yaml
 
+from test_container_deploy_native import named, run_tasks
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYBOOK = ROOT / 'catalog/ansible/playbooks/container_deploy.yml'
@@ -16,6 +18,64 @@ PREPARATION = ROOT / 'catalog/ansible/tasks/container_image_prepare.yml'
 
 
 class PlatformPreparationTests(unittest.TestCase):
+    def test_native_platform_parser_preserves_strict_raw_input_refusals(self):
+        tasks = yaml.safe_load(PREPARATION.read_text())
+        compare = named(tasks, 'Compare prepared image with actual Docker platform')
+        require = named(tasks, 'Require compatible prepared image')
+        daemon = '{"os":"linux","architecture":"x86_64"}'
+        image = '{"os":"linux","architecture":"amd64","variant":"v1"}'
+        invalid = (
+            '{"os":"linux","os":"linux","architecture":"amd64","variant":"v1"}',
+            '{"os":"linux","\\u006fs":"linux","architecture":"amd64","variant":"v1"}',
+            '{"os":"linux","architecture":"amd64","variant":"v1"',
+            '[]', 'null', 'true',
+            '{"os":"linux","architecture":true,"variant":"v1"}',
+            '{"os":"linux","architecture":"amd64","variant":"v2"}',
+            '{"os":"linux","architecture":"arm64","variant":"v7"}',
+            '{"os":"linux","architecture":"arm","variant":""}',
+            '{"os":"linux","architecture":"amd64","variant":null}',
+            '{"os":"linux","architecture":"amd64","variant":"v1","extra":"value"}',
+            '{"os":"linux","architecture":"' + 'é' * 2050 + '","variant":"v1"}',
+            '{"os":"linux","architecture":"amd64","variant":"' + 'a' * 33 + '"}',
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw[:80]):
+                result, calls = run_tasks([compare, require], {
+                    'daemon_platform_result': {'rc': 0, 'stdout': daemon},
+                    'image_platform_result': {'rc': 0, 'stdout': raw},
+                }, [])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('image_platform_unavailable', result.stdout)
+                self.assertEqual(calls, [])
+                self.assertNotIn('TEMPLATE_OUTPUT_JSON=', result.stdout)
+        result, calls = run_tasks([compare, require], {
+            'daemon_platform_result': {'rc': 1, 'stdout': daemon},
+            'image_platform_result': {'rc': 0, 'stdout': image},
+        }, [])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('image_platform_unavailable', result.stdout)
+        self.assertEqual(calls, [])
+
+    def test_native_platform_normalization_aliases_and_variant_comparison(self):
+        tasks = yaml.safe_load(PREPARATION.read_text())
+        compare = named(tasks, 'Compare prepared image with actual Docker platform')
+        for server, image, variant, code in (
+            ('x86_64', 'AMD64', 'v1', 'matched'),
+            ('aarch64', 'arm64', 'v8', 'matched'),
+            ('armv7l', 'arm', 'v7', 'matched'),
+            ('x86_64', 'arm64', 'v8', 'image_platform_mismatch'),
+            ('armv7l', 'arm', 'v6', 'image_platform_mismatch'),
+        ):
+            with self.subTest(server=server, image=image, variant=variant):
+                result, calls = run_tasks([compare, {'ansible.builtin.assert': {'that':
+                    ['image_platform_comparison.code == expected_code']}}], {
+                    'daemon_platform_result': {'rc': 0, 'stdout': json.dumps({'os': 'linux', 'architecture': server})},
+                    'image_platform_result': {'rc': 0, 'stdout': json.dumps({'os': 'linux', 'architecture': image, 'variant': variant})},
+                    'expected_code': code,
+                }, [])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(calls, [])
+
     def test_actual_preparation_cached_pulled_mismatch_and_unknown_before_mutations(self):
         tasks = yaml.safe_load(PREPARATION.read_text())[0]['block']
         inspect = next(task for task in tasks if task['name'].startswith('Inspect local image'))

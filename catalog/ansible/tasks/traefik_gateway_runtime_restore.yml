@@ -83,107 +83,148 @@
   no_log: true
 
 - name: Restore exact prior Traefik runtime
-  shell: |
-    python3 - <<'PY'
-    import json
-    import subprocess
+  block:
+    - name: Recheck exact runtime identity immediately before restoration
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ restore_name }}"]
+      register: traefik_restore_recheck
+      changed_when: false
+      failed_when: false
 
-    prior = json.loads(r'''{{ traefik_prior_runtime | to_json }}''')
-    name = prior.get('Name', '').lstrip('/') or {{ traefik_container_name | to_json }}
-    config = prior.get('Config') or {}
-    host_config = prior.get('HostConfig') or {}
-    expected_current = json.loads(r'''{{ traefik_restore_current | to_json }}''')
-    inspected = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
-    current = json.loads(inspected.stdout)[0] if inspected.returncode == 0 else None
-    if (current or {}).get("Id") != (expected_current or {}).get("Id"):
-        raise RuntimeError("runtime_changed_before_restore")
+    - name: Refuse a changed restoration generation
+      ansible.builtin.assert:
+        that:
+          - current.get('Id') == (traefik_restore_current | default({}, true)).get('Id')
+        fail_msg: runtime_changed_before_restore
+      vars:
+        current: "{{ (traefik_restore_recheck.stdout | from_json)[0] if traefik_restore_recheck.rc == 0 else {} }}"
 
-    subprocess.run(["docker", "rm", "-f", name], check=False,
-                   capture_output=True, text=True)
-    create = ["docker", "create", "--name", name]
-    restart = host_config.get("RestartPolicy") or {}
-    restart_name = restart.get("Name") or "no"
-    if restart_name != "no":
-        value = restart_name
-        retries = restart.get("MaximumRetryCount")
-        if restart_name == "on-failure" and retries:
-            value = f"{restart_name}:{retries}"
-        create.extend(["--restart", value])
-    network_mode = host_config.get("NetworkMode")
-    if network_mode and network_mode != "default":
-        create.extend(["--network", network_mode])
-    if config.get("WorkingDir"):
-        create.extend(["--workdir", config["WorkingDir"]])
-    if config.get("User"):
-        create.extend(["--user", config["User"]])
-    entrypoint = config.get("Entrypoint") or []
-    if entrypoint:
-        create.extend(["--entrypoint", entrypoint[0]])
-    for value in config.get("Env") or []:
-        create.extend(["--env", value])
-    for key, value in sorted((config.get("Labels") or {}).items()):
-        create.extend(["--label", f"{key}={value}"])
-    for bind in host_config.get("Binds") or []:
-        create.extend(["--volume", bind])
-    for key, bindings in sorted((host_config.get("PortBindings") or {}).items()):
-        if not isinstance(bindings, list):
-            raise RuntimeError("prior_port_bindings_invalid")
-        port, protocol = key.split("/", 1)
-        for binding in bindings:
-            host_ip = str(binding.get("HostIp") or "")
-            host_port = str(binding.get("HostPort") or "")
-            if ":" in host_ip and not host_ip.startswith("["):
-                host_ip = f"[{host_ip}]"
-            value = f"{host_ip}:{host_port}:{port}/{protocol}" if host_ip else f"{host_port}:{port}/{protocol}"
-            create.extend(["--publish", value])
-    image = config.get("Image")
-    if not isinstance(image, str) or not image:
-        raise RuntimeError("prior_image_invalid")
-    create.append(image)
-    command = config.get("Cmd")
-    if isinstance(command, list):
-        create.extend(str(item) for item in command)
-    elif isinstance(command, str) and command:
-        create.append(command)
-    subprocess.run(create, check=True, capture_output=True, text=True)
-    prior_status = (prior.get("State") or {}).get("Status")
-    if prior_status in ("running", "paused", "exited"):
-        subprocess.run(["docker", "start", name], check=True,
-                       capture_output=True, text=True)
-        if prior_status != "running":
-            subprocess.run(["docker", "pause" if prior_status == "paused" else "stop", name],
-                           check=True, capture_output=True, text=True)
+    - name: Remove the failed replacement before reconstructing the prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, rm, -f, "{{ restore_name }}"]
+      failed_when: false
+      changed_when: true
 
-    current = json.loads(
-        subprocess.run(["docker", "inspect", name], check=True,
-                       capture_output=True, text=True).stdout
-    )[0]
-    current_config = current.get("Config") or {}
-    current_host = current.get("HostConfig") or {}
-    current_ports = current_host.get("PortBindings")
-    prior_ports = host_config.get("PortBindings")
-    checks = {
-        "image": current_config.get("Image") == config.get("Image"),
-        "command": current_config.get("Cmd") == config.get("Cmd"),
-        "entrypoint": current_config.get("Entrypoint") == config.get("Entrypoint"),
-        "labels": current_config.get("Labels") == config.get("Labels"),
-        "network": current_host.get("NetworkMode") == host_config.get("NetworkMode"),
-        "restart": current_host.get("RestartPolicy") == host_config.get("RestartPolicy"),
-        "binds": sorted(current_host.get("Binds") or []) == sorted(host_config.get("Binds") or []),
-        "environment": current_config.get("Env") == config.get("Env"),
-        "user": current_config.get("User") == config.get("User"),
-        "workdir": current_config.get("WorkingDir") == config.get("WorkingDir"),
-        "ports": ({} if current_ports is None else current_ports) == ({} if prior_ports is None else prior_ports),
-        "status": (current.get("State") or {}).get("Status") == (prior.get("State") or {}).get("Status"),
-    }
-    if not all(checks.values()):
-        raise RuntimeError("prior_runtime_restore_mismatch:" + json.dumps(checks, sort_keys=True))
-    PY
-  args:
-    executable: /bin/sh
-  register: traefik_restore_result
-  changed_when: true
-  failed_when: traefik_restore_result.rc != 0
+    - name: Initialize exact prior runtime create arguments
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ ['docker', 'create', '--name', restore_name] }}"
+
+    - name: Preserve prior restart, network, workdir, user and entrypoint
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + item.arguments }}"
+      loop:
+        - enabled: "{{ restart_name != 'no' }}"
+          arguments: "{{ ['--restart', restart_name ~ (':' ~ restart_retries | string if restart_name == 'on-failure' and restart_retries else '')] }}"
+        - enabled: "{{ restore_host.get('NetworkMode') and restore_host.NetworkMode != 'default' }}"
+          arguments: "{{ ['--network', restore_host.get('NetworkMode')] }}"
+        - enabled: "{{ (restore_config.get('WorkingDir') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--workdir', restore_config.get('WorkingDir')] }}"
+        - enabled: "{{ (restore_config.get('User') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--user', restore_config.get('User')] }}"
+        - enabled: "{{ restore_config.get('Entrypoint') | default([], true) | length > 0 }}"
+          arguments: "{{ ['--entrypoint', (restore_config.get('Entrypoint') | default([none], true))[0]] }}"
+      when: item.enabled | bool
+
+    - name: Preserve prior environment values
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--env', item] }}"
+      loop: "{{ restore_config.get('Env') | default([], true) }}"
+
+    - name: Preserve sorted prior labels
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--label', item.key ~ '=' ~ item.value] }}"
+      loop: "{{ restore_config.get('Labels') | default({}, true) | dict2items | sort(attribute='key', case_sensitive=true) }}"
+
+    - name: Preserve prior bind mounts
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--volume', item] }}"
+      loop: "{{ restore_host.get('Binds') | default([], true) }}"
+
+    - name: Require valid prior port binding lists
+      ansible.builtin.assert:
+        that:
+          - item.value is sequence and item.value is not string and item.value is not mapping
+          - "'/' in item.key"
+        fail_msg: prior_port_bindings_invalid
+      loop: "{{ restore_host.get('PortBindings') | default({}, true) | dict2items }}"
+
+    - name: Preserve sorted prior ports with IPv6 brackets
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: >-
+          {{ traefik_restore_create_argv + ['--publish',
+             (('[' ~ host_ip ~ ']' if ':' in host_ip and not host_ip.startswith('[') else host_ip) ~ ':' if host_ip else '')
+             ~ (item.1.get('HostPort') | default('', true) | string) ~ ':' ~ item.0.key] }}
+      vars:
+        host_ip: "{{ item.1.get('HostIp') | default('', true) | string }}"
+      loop: "{{ restore_host.get('PortBindings') | default({}, true) | dict2items | sort(attribute='key', case_sensitive=true) | subelements('value') }}"
+
+    - name: Require the exact prior image
+      ansible.builtin.assert:
+        that:
+          - restore_config.get('Image') is string and restore_config.Image | length > 0
+        fail_msg: prior_image_invalid
+
+    - name: Recreate the exact prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: >-
+          {{ traefik_restore_create_argv + [restore_config.Image]
+             + (restore_config.Cmd | map('string') | list if restore_config.get('Cmd') is sequence
+                and restore_config.get('Cmd') is not string and restore_config.get('Cmd') is not mapping
+                else [restore_config.Cmd] if restore_config.get('Cmd') is string and restore_config.Cmd else []) }}
+      changed_when: true
+
+    - name: Start the prior runtime when its saved state requires it
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, start, "{{ restore_name }}"]
+      changed_when: true
+      when: restore_status in ['running', 'paused', 'exited']
+
+    - name: Restore the saved paused or exited state
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: "{{ ['docker', 'pause' if restore_status == 'paused' else 'stop', restore_name] }}"
+      changed_when: true
+      when: restore_status in ['paused', 'exited']
+
+    - name: Inspect the reconstructed prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ restore_name }}"]
+      register: traefik_restore_result
+      changed_when: false
+
+    - name: Verify exact prior runtime configuration and state
+      ansible.builtin.assert:
+        that:
+          - current_config.get(item) == restore_config.get(item)
+        fail_msg: prior_runtime_restore_mismatch
+      vars:
+        current_config: "{{ (traefik_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
+      loop: [Image, Cmd, Entrypoint, Labels, Env, User, WorkingDir]
+
+    - name: Verify exact prior host configuration
+      ansible.builtin.assert:
+        that:
+          - current_host.get('NetworkMode') == restore_host.get('NetworkMode')
+          - current_host.get('RestartPolicy') == restore_host.get('RestartPolicy')
+          - current_host.get('Binds') | default([], true) | sort(case_sensitive=true) == restore_host.get('Binds') | default([], true) | sort(case_sensitive=true)
+          - current_host.get('PortBindings') | default({}, true) == restore_host.get('PortBindings') | default({}, true)
+          - current.get('State', {}).get('Status') == restore_status
+        fail_msg: prior_runtime_restore_mismatch
+      vars:
+        current: "{{ (traefik_restore_result.stdout | from_json)[0] }}"
+        current_host: "{{ current.HostConfig | default({}, true) }}"
+  vars:
+    restore_name: "{{ traefik_prior_runtime.get('Name', '').lstrip('/') or traefik_container_name }}"
+    restore_config: "{{ traefik_prior_runtime.Config | default({}, true) }}"
+    restore_host: "{{ traefik_prior_runtime.HostConfig | default({}, true) }}"
+    restore_status: "{{ (traefik_prior_runtime.State | default({}, true)).get('Status') }}"
+    restart_name: "{{ (restore_host.RestartPolicy | default({}, true)).get('Name') | default('no', true) }}"
+    restart_retries: "{{ (restore_host.RestartPolicy | default({}, true)).get('MaximumRetryCount') }}"
   when:
     - traefik_replacement_started | default(false)
     - traefik_prior_runtime_present
@@ -191,27 +232,42 @@
   no_log: true
 
 - name: Remove failed fresh Traefik replacement
-  shell: |
-    python3 - <<'PY'
-    import json
-    import subprocess
+  block:
+    - name: Recheck exact runtime identity immediately before fresh cleanup
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ traefik_container_name }}"]
+      register: traefik_fresh_recheck
+      changed_when: false
+      failed_when: false
 
-    name = {{ traefik_container_name | to_json }}
-    expected = json.loads(r'''{{ traefik_restore_current | to_json }}''')
-    inspected = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
-    current = json.loads(inspected.stdout)[0] if inspected.returncode == 0 else None
-    if (current or {}).get("Id") != (expected or {}).get("Id"):
-        raise RuntimeError("runtime_changed_before_cleanup")
-    if current is not None:
-        subprocess.run(["docker", "rm", "-f", name], check=True, capture_output=True)
-    if subprocess.run(["docker", "inspect", name], capture_output=True).returncode == 0:
-        raise RuntimeError("failed_fresh_traefik_still_present")
-    PY
-  args:
-    executable: /bin/sh
-  register: traefik_fresh_cleanup_result
-  changed_when: true
-  failed_when: traefik_fresh_cleanup_result.rc != 0
+    - name: Refuse a changed fresh runtime generation
+      ansible.builtin.assert:
+        that:
+          - current.get('Id') == (traefik_restore_current | default({}, true)).get('Id')
+        fail_msg: runtime_changed_before_cleanup
+      vars:
+        current: "{{ (traefik_fresh_recheck.stdout | from_json)[0] if traefik_fresh_recheck.rc == 0 else {} }}"
+
+    - name: Remove only the observed failed fresh runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, rm, -f, "{{ traefik_container_name }}"]
+      changed_when: true
+      when: traefik_fresh_recheck.rc == 0
+
+    - name: Require the failed fresh runtime to be absent
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ traefik_container_name }}"]
+      register: traefik_fresh_cleanup_result
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse remaining failed fresh runtime presence
+      ansible.builtin.assert:
+        that: traefik_fresh_cleanup_result.rc != 0
+        fail_msg: failed_fresh_traefik_still_present
   when:
     - traefik_replacement_started | default(false)
     - not traefik_prior_runtime_present

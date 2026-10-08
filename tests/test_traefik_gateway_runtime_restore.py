@@ -1,14 +1,15 @@
-"""Offline command/framing tests, not Ansible, live runtime, TLS or atomic proof."""
+"""Offline native Ansible restoration contracts, not live runtime or TLS proof."""
 
 import copy
 import json
 from pathlib import Path
 import subprocess
 import unittest
-from unittest.mock import patch
 
 from jinja2 import Environment, StrictUndefined
 import yaml
+
+from test_container_deploy_native import run_tasks
 
 
 CATALOG = Path(__file__).parents[1] / "catalog/ansible"
@@ -67,19 +68,13 @@ class GatewayRuntimeRestoreTests(unittest.TestCase):
         return all(self.environment.compile_expression(expression)(**context)
                    for expression in expressions)
 
-    def execute_inline(self, name, responses, context=None):
+    def execute_native(self, name, responses, context=None):
         task = self.task(name)
-        rendered = self.environment.from_string(task["shell"]).render(
-            **(self.context if context is None else context),
-        )
-        body = rendered.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-        with patch("subprocess.run", side_effect=responses) as commands:
-            self.commands = commands
-            exec(compile(body, str(CATALOG / "tasks/traefik_gateway_runtime_restore.yml"), "exec"), {})
+        fixture = [{'rc': item.returncode, 'stdout': item.stdout or '', 'stderr': item.stderr or ''}
+                   for item in responses]
+        result, self.calls = run_tasks([task], self.context if context is None else context, fixture)
         self.assertTrue(task["no_log"])
-        self.assertTrue(self.predicates(task["failed_when"], {
-            task["register"]: {"rc": 1},
-        }))
+        return result
 
     def response(self, value=None, code=0):
         return subprocess.CompletedProcess([], code, json.dumps([value]) if value is not None else "", "")
@@ -97,8 +92,9 @@ class GatewayRuntimeRestoreTests(unittest.TestCase):
         for status in ("running", "paused", "exited"):
             with self.subTest(status=status):
                 self.prior["State"]["Status"] = status
-                self.execute_inline("Restore exact prior Traefik runtime", self.restore_responses(status=status))
-                calls = [call.args[0] for call in self.commands.call_args_list]
+                result = self.execute_native("Restore exact prior Traefik runtime", self.restore_responses(status=status))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = self.calls
                 self.assertEqual(calls[0], ["docker", "inspect", "owned-proxy"])
                 self.assertEqual(calls[1], ["docker", "rm", "-f", "owned-proxy"])
                 self.assertEqual(calls[2], [
@@ -117,18 +113,43 @@ class GatewayRuntimeRestoreTests(unittest.TestCase):
     def test_second_read_identity_drift_refuses_before_remove_or_create(self):
         drift = {**self.current, "Id": "foreign-id"}
         for name in ("Restore exact prior Traefik runtime", "Remove failed fresh Traefik replacement"):
-            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "runtime_changed_before"):
-                self.execute_inline(name, [self.response(drift)])
-            self.assertEqual(self.commands.call_count, 1)
-            self.assertEqual(self.commands.call_args.args[0], ["docker", "inspect", "owned-proxy"])
+            with self.subTest(name=name):
+                context = {**self.context, "traefik_prior_runtime_present":
+                           name == "Restore exact prior Traefik runtime"}
+                result = self.execute_native(name, [self.response(drift)], context)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls, [["docker", "inspect", "owned-proxy"]])
+
+    def test_restore_preserves_literal_arguments_and_case_sensitive_bind_comparison(self):
+        config = self.prior["Config"]
+        config["Env"] = ["LITERAL=$HOME/${HOME}"]
+        config["Cmd"] = ["--literal=$HOME/${HOME}"]
+        config["Labels"] = {"lower": "$HOME", "Lower": "${HOME}"}
+        binds = ["/fixture/a/$HOME/${HOME}:/a:ro", "/fixture/A/$HOME/${HOME}:/A:ro"]
+        self.prior["HostConfig"]["Binds"] = binds
+        final = copy.deepcopy(self.prior)
+        final["HostConfig"]["Binds"] = list(reversed(binds))
+        result = self.execute_native("Restore exact prior Traefik runtime",
+                                     self.restore_responses(final=final))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        create = self.calls[2]
+        self.assertEqual(create, [
+            "docker", "create", "--name", "owned-proxy", "--restart", "on-failure:2",
+            "--network", "host", "--workdir", "/work", "--user", "1000:1001",
+            "--entrypoint", "/entrypoint.sh", "--env", "LITERAL=$HOME/${HOME}",
+            "--label", "Lower=${HOME}", "--label", "lower=$HOME",
+            "--volume", binds[0], "--volume", binds[1],
+            "--publish", "[::1]:18443:8443/tcp", "proxy@sha256:prior",
+            "--literal=$HOME/${HOME}",
+        ])
+        self.assertNotIn("LITERAL=$HOME", result.stdout + result.stderr)
 
     def test_create_or_final_verification_failure_never_claims_restoration(self):
-        failure = subprocess.CalledProcessError(1, ["docker", "create"])
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.execute_inline("Restore exact prior Traefik runtime", [
-                self.response(self.current), self.response(), failure,
-            ])
-        self.assertEqual(self.commands.call_count, 3)
+        result = self.execute_native("Restore exact prior Traefik runtime", [
+            self.response(self.current), self.response(), self.response(code=1),
+        ])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls), 3)
         fields = {
             "Config": ["Image", "Cmd", "Entrypoint", "Labels", "Env", "User", "WorkingDir"],
             "HostConfig": ["NetworkMode", "RestartPolicy", "Binds", "PortBindings"],
@@ -138,29 +159,35 @@ class GatewayRuntimeRestoreTests(unittest.TestCase):
             for key in keys:
                 final = copy.deepcopy(self.prior)
                 final[section][key] = None
-                with self.subTest(section=section, key=key), \
-                        self.assertRaisesRegex(RuntimeError, "prior_runtime_restore_mismatch"):
+                with self.subTest(section=section, key=key):
                     responses = self.restore_responses()
                     responses[-1] = self.response(final)
-                    self.execute_inline("Restore exact prior Traefik runtime", responses)
+                    result = self.execute_native("Restore exact prior Traefik runtime", responses)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Verify exact prior', result.stdout)
         mark = self.task("Mark exact runtime restoration complete")
         self.assertGreater(self.tasks.index(mark), self.tasks.index(self.task("Restore exact prior Traefik runtime")))
         self.assertTrue(self.predicates(mark["when"], self.context))
-        self.assertNotIn("traefik_runtime_restored", self.task("Restore exact prior Traefik runtime")["shell"])
+        self.assertNotIn("traefik_runtime_restored", yaml.safe_dump(self.task("Restore exact prior Traefik runtime")))
 
     def test_fresh_cleanup_exact_identity_absence_and_remaining_presence_refusal(self):
         name = "Remove failed fresh Traefik replacement"
-        self.execute_inline(name, [self.response(self.current), self.response(), self.response(code=1)])
-        self.assertEqual([call.args[0] for call in self.commands.call_args_list], [
+        context = {**self.context, "traefik_prior_runtime_present": False}
+        result = self.execute_native(name, [self.response(self.current), self.response(), self.response(code=1)], context)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls, [
             ["docker", "inspect", "owned-proxy"], ["docker", "rm", "-f", "owned-proxy"],
             ["docker", "inspect", "owned-proxy"],
         ])
-        self.assertTrue(self.commands.call_args_list[1].kwargs["check"])
-        with self.assertRaisesRegex(RuntimeError, "failed_fresh_traefik_still_present"):
-            self.execute_inline(name, [self.response(self.current), self.response(), self.response(self.current)])
-        context = {**self.context, "traefik_restore_current": None}
-        self.execute_inline(name, [self.response(code=1), self.response(code=1)], context)
-        self.assertEqual(self.commands.call_count, 2)
+        result = self.execute_native(name, [self.response(self.current), self.response(), self.response(self.current)], context)
+        self.assertNotEqual(result.returncode, 0)
+        result = self.execute_native(name, [self.response(self.current), self.response(code=1)], context)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls), 2)
+        context = {**context, "traefik_restore_current": None}
+        result = self.execute_native(name, [self.response(code=1), self.response(code=1)], context)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.calls), 2)
 
     def test_actual_owner_predicate_rejects_replacement_drift_and_accepts_prior_or_absent(self):
         task = self.task("Refuse restoration over another runtime owner")

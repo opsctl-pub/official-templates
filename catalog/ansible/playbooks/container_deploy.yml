@@ -48,107 +48,6 @@
     source_replacement_recheck_complete: false
     source_replacement_recheck_failed: false
     source_replacement_original: {}
-    source_replacement_restore_script: |
-      python3 - <<'PY'
-      import json
-      import subprocess
-      import base64
-      import sys
-
-      original = json.loads(r'''{{ source_replacement_original | to_json }}''')
-      expected = json.loads(r'''{{ source_replacement | to_json }}''')
-      name = original["name"]
-      config = original.get("config") or {}
-      host_config = original.get("host_config") or {}
-
-      subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
-
-      create = ["docker", "create", "--name", name]
-      restart_policy = host_config.get("RestartPolicy") or {}
-      restart_name = restart_policy.get("Name")
-      if restart_name and restart_name != "no":
-          create.extend(["--restart", restart_name])
-      network_mode = host_config.get("NetworkMode")
-      if network_mode and network_mode != "default":
-          create.extend(["--network", network_mode])
-      working_dir = config.get("WorkingDir")
-      if working_dir:
-          create.extend(["--workdir", working_dir])
-      user = config.get("User")
-      if user:
-          create.extend(["--user", user])
-      entrypoint = config.get("Entrypoint") or []
-      if entrypoint:
-          create.extend(["--entrypoint", entrypoint[0]])
-      for env_value in config.get("Env") or []:
-          if isinstance(env_value, str):
-              create.extend(["--env", env_value])
-      for label_key, label_value in sorted((config.get("Labels") or {}).items()):
-          create.extend(["--label", f"{label_key}={label_value}"])
-      for bind in host_config.get("Binds") or []:
-          if isinstance(bind, str):
-              create.extend(["--volume", bind])
-      for container_key, bindings in (host_config.get("PortBindings") or {}).items():
-          if not isinstance(bindings, list):
-              continue
-          container_port, protocol = container_key.split("/", 1)
-          for binding in bindings:
-              if not isinstance(binding, dict):
-                  continue
-              host_ip = str(binding.get("HostIp") or "")
-              host_port = str(binding.get("HostPort") or "")
-              if ":" in host_ip and not host_ip.startswith("["):
-                  host_ip = f"[{host_ip}]"
-              published = f"{host_ip}:{host_port}:{container_port}/{protocol}" if host_ip else f"{host_port}:{container_port}/{protocol}"
-              create.extend(["--publish", published])
-
-      image = config.get("Image")
-      if not isinstance(image, str) or not image:
-          raise SystemExit("source_replacement_restore_image_invalid")
-      create.append(image)
-      command = config.get("Cmd")
-      if isinstance(command, list):
-          create.extend(str(item) for item in command)
-      elif isinstance(command, str) and command:
-          create.append(command)
-      subprocess.run(create, check=True, capture_output=True, text=True)
-      subprocess.run(["docker", "start", name], check=True, capture_output=True, text=True)
-
-      inspected = subprocess.run(
-          ["docker", "inspect", name], check=True, capture_output=True, text=True
-      )
-      current = json.loads(inspected.stdout)[0]
-      current_config = current.get("Config") or {}
-      current_host_config = current.get("HostConfig") or {}
-      for key in ("Image", "Cmd", "Entrypoint", "Env", "WorkingDir", "User", "Labels", "ExposedPorts", "Volumes"):
-          if current_config.get(key) != config.get(key):
-              raise SystemExit("source_replacement_restore_config_mismatch")
-      if (current_host_config.get("PortBindings") or {}) != (host_config.get("PortBindings") or {}):
-          raise SystemExit("source_replacement_restore_bindings_mismatch")
-      if (current_host_config.get("Binds") or []) != (host_config.get("Binds") or []):
-          raise SystemExit("source_replacement_restore_mounts_mismatch")
-      if not (current.get("State") or {}).get("Running"):
-          raise SystemExit("source_replacement_restore_not_running")
-
-      health_path = {{ app_health_container_path | default('/health') | to_json }}
-      health_port = expected.get("container_port")
-      health = subprocess.run(
-          [
-              sys.executable, "-c",
-              base64.b64decode({{ lookup('file', playbook_dir + '/../scripts/container_http_health.py') | b64encode | to_json }}).decode(),
-              "--container", name,
-              "--organization", str((config.get("Labels") or {}).get("com.opsctl.org_id") or ""),
-              "--deployment", str((config.get("Labels") or {}).get("com.opsctl.deployment_id") or ""),
-              "--revision", str((config.get("Labels") or {}).get("com.opsctl.revision_id") or ""),
-              "--port", str(health_port), "--path", health_path,
-          ],
-          stdout=subprocess.DEVNULL,
-          stderr=subprocess.DEVNULL,
-          timeout=35,
-      )
-      if health.returncode != 0:
-          raise SystemExit("source_replacement_restore_health_failed")
-      PY
   pre_tasks:
     - name: Validate managed runtime identity before mutation
       assert:
@@ -396,80 +295,77 @@
         - (deploy_host_ports | length) > 0
 
     - name: Detect host port conflicts
-      shell: |
-        python3 - <<'PY'
-        import json, subprocess, sys
+      block:
+        - name: Observe published ports for running containers
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - docker
+              - ps
+              - --format
+              - '{% raw %}{{if .Names}}{{.Names}}{{else}}{{.ID}}{{end}}\t{{.Ports}}{% endraw %}'
+          register: port_conflicts_result
+          changed_when: false
 
-        ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
-        target_container = {{ container_name | to_json }}
-        target_org = {{ app_org_id | default('') | to_json }}
-        target_project = {{ app_project_id | default('') | to_json }}
-        target_app = {{ app_slug | default(container_name) | to_json }}
-        source_replacement = json.loads('''{{ source_replacement | default(None) | to_json }}''')
-        require_project = bool(target_project)
-        if not ports:
-            print("[]")
-            sys.exit(0)
+        - name: Build conflict entries from the requested published ports
+          block: &container_port_conflict_tasks
+            - name: Initialize this port observation
+              ansible.builtin.set_fact:
+                container_port_scan_entries: []
+                container_port_scan_owned: false
 
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{ '{{json .}}' }}"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(result.returncode)
+            - name: Retain matching host ports in observation order
+              ansible.builtin.set_fact:
+                container_port_scan_entries: "{{ container_port_scan_entries + [{'name': row[0], 'ports': matching_ports}] }}"
+              vars:
+                row: "{{ item.split('\t', 1) }}"
+                listening_ports: "{{ (row[1] | default('')) | regex_findall(':([0-9]+)->') | map('int') | list }}"
+                matching_ports: "{{ deploy_host_ports | select('in', listening_ports) | unique(case_sensitive=true) | sort(case_sensitive=true) | list }}"
+              loop: "{{ port_scan_stdout.splitlines() }}"
+              when:
+                - row[0] | length > 0
+                - matching_ports | length > 0
 
-        seen = {}
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ports_field = data.get("Ports") or ""
-            matches = sorted({port for port in ports if f":{port}->" in ports_field})
-            if not matches:
-                continue
-            name = data.get("Names") or data.get("ID")
-            if not name:
-                continue
-            if name == target_container and not source_replacement:
-                inspect_result = subprocess.run(
-                    ["docker", "inspect", target_container],
-                    capture_output=True,
-                    text=True,
-                )
-                if inspect_result.returncode == 0:
-                    try:
-                        inspect_payload = json.loads(inspect_result.stdout)
-                    except json.JSONDecodeError:
-                        inspect_payload = []
-                    inspect_item = inspect_payload[0] if inspect_payload else {}
-                    labels = ((inspect_item.get("Config") or {}).get("Labels") or {})
-                    owned = (
-                        labels.get("com.opsctl.managed") == "true"
-                        and labels.get("com.opsctl.org_id") == target_org
-                        and labels.get("com.opsctl.app") == target_app
-                        and ((not require_project) or labels.get("com.opsctl.project_id") == target_project)
-                    )
-                    if owned:
-                        continue
-            seen.setdefault(name, set()).update(matches)
+            - name: Recheck ownership of a conflicting target container
+              block:
+                - name: Inspect the target before excluding its own published ports
+                  ansible.builtin.command:
+                    expand_argument_vars: false
+                    argv: [docker, inspect, "{{ container_name }}"]
+                  register: container_port_scan_target
+                  changed_when: false
+                  no_log: true
 
-        conflicts = [
-            {"name": name, "ports": sorted(list(values))}
-            for name, values in seen.items()
-        ]
-        print(json.dumps(conflicts))
-        PY
-      args:
-        executable: /bin/bash
-      register: port_conflicts_result
-      changed_when: false
-      failed_when: port_conflicts_result.rc != 0
+                - name: Qualify the target's managed organization, application and optional Project
+                  ansible.builtin.set_fact:
+                    container_port_scan_owned: >-
+                      {{ labels.get('com.opsctl.managed') == 'true'
+                         and labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+                         and labels.get('com.opsctl.app') == (app_slug | default(container_name))
+                         and (not (app_project_id | default(''))
+                              or labels.get('com.opsctl.project_id') == app_project_id) }}
+                  vars:
+                    labels: "{{ ((container_port_scan_target.stdout | from_json)[0].Config | default({}, true)).get('Labels') | default({}, true) }}"
+                  no_log: true
+              rescue:
+                - name: Keep the target conflict when ownership cannot be established
+                  ansible.builtin.set_fact:
+                    container_port_scan_owned: false
+              when:
+                - port_scan_exclude_owned
+                - container_name in (container_port_scan_entries | map(attribute='name') | list)
+
+            - name: Exclude only a qualified owned target
+              ansible.builtin.set_fact:
+                container_port_scan_entries: "{{ container_port_scan_entries | rejectattr('name', 'equalto', container_name) | list }}"
+              when: container_port_scan_owned
+          vars:
+            port_scan_stdout: "{{ port_conflicts_result.stdout }}"
+            port_scan_exclude_owned: "{{ not (source_replacement | default(none)) }}"
+
+        - name: Retain the native conflict list for the existing result consumer
+          ansible.builtin.set_fact:
+            port_conflicts_result: "{{ port_conflicts_result | combine({'stdout': container_port_scan_entries | to_json}) }}"
       when:
         - host_port_preflight_enabled
         - (deploy_host_ports | length) > 0
@@ -519,51 +415,51 @@
           )
 
     - name: Determine removable conflict containers
-      shell: |
-        python3 - <<'PY'
-        import json, subprocess, sys
+      block:
+        - name: Initialize the removable conflict observation
+          ansible.builtin.set_fact:
+            removable_conflict_payload: []
+            removable_conflict_names: []
 
-        conflicts = json.loads('''{{ port_conflict_entries | default([]) | to_json }}''')
-        target_org = {{ app_org_id | default('') | to_json }}
-        project_id = {{ app_project_id | default('') | to_json }}
-        require_project = bool(project_id)
+        - name: Inspect only the conflicting container names
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: "{{ ['docker', 'inspect'] + conflict_names }}"
+          vars:
+            conflict_names: "{{ port_conflict_entries | selectattr('name', 'defined') | map(attribute='name') | select | list }}"
+          register: removable_conflict_inspection
+          changed_when: false
+          no_log: true
+          when: conflict_names | length > 0
 
-        names = [item.get("name") for item in conflicts if item.get("name")]
-        if not names:
-            print("[]")
-            sys.exit(0)
+        - name: Decode the observed conflicting containers
+          block:
+            - name: Read conflicting container metadata
+              ansible.builtin.set_fact:
+                removable_conflict_payload: "{{ removable_conflict_inspection.stdout | from_json }}"
+              no_log: true
+          rescue:
+            - name: Retain no removable containers after malformed inspection JSON
+              ansible.builtin.set_fact:
+                removable_conflict_payload: []
+          when: removable_conflict_inspection is not skipped
 
-        result = subprocess.run(["docker", "inspect"] + names, capture_output=True, text=True)
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(result.returncode)
+        - name: Retain only managed conflicts in the requested organization and optional Project
+          ansible.builtin.set_fact:
+            removable_conflict_names: "{{ removable_conflict_names + [item.get('Name', '').lstrip('/')] }}"
+          vars:
+            labels: "{{ item.get('Config', {}).get('Labels') | default({}, true) }}"
+          loop: "{{ removable_conflict_payload }}"
+          when:
+            - labels.get('com.opsctl.managed') == 'true'
+            - labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+            - not (app_project_id | default('')) or labels.get('com.opsctl.project_id') == app_project_id
+            - item.get('Name', '').lstrip('/') | length > 0
+          no_log: true
 
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            print("[]")
-            sys.exit(0)
-
-        removable = []
-        for item in data:
-            labels = item.get("Config", {}).get("Labels") or {}
-            if labels.get("com.opsctl.managed") != "true":
-                continue
-            if labels.get("com.opsctl.org_id") != target_org:
-                continue
-            if require_project and labels.get("com.opsctl.project_id") != project_id:
-                continue
-            name = item.get("Name", "").lstrip("/")
-            if name:
-                removable.append(name)
-
-        print(json.dumps(sorted(removable)))
-        PY
-      args:
-        executable: /bin/bash
-      register: removable_conflicts
-      changed_when: false
-      failed_when: removable_conflicts.rc != 0
+        - name: Retain the native removable conflict result
+          ansible.builtin.set_fact:
+            removable_conflicts: "{{ {'rc': 0, 'stdout': removable_conflict_names | sort(case_sensitive=true) | to_json} }}"
       when:
         - host_port_preflight_enabled
         - (port_conflict_entries | length) > 0
@@ -580,125 +476,161 @@
         - source_replacement is not defined
 
     - name: Validate exact source replacement container
-      shell: |
-        python3 - <<'PY'
-        import json, subprocess, sys
-        from uuid import UUID
+      block:
+        - name: Require the complete source replacement identity
+          ansible.builtin.assert:
+            that:
+              - source_replacement is mapping
+              - source_replacement.keys() | sort(case_sensitive=true) == required_replacement_fields | sort(case_sensitive=true)
+            fail_msg: source_replacement_identity_invalid
+          vars:
+            required_replacement_fields:
+              - intent
+              - container_name
+              - app_slug
+              - org_id
+              - project_id
+              - deployment_id
+              - image
+              - current_exposure_modes
+              - exposure_mode
+              - wireguard_ip
+              - route_port
+              - container_port
+              - replace_conflicts
 
-        conflicts = json.loads('''{{ port_conflict_entries | default([]) | to_json }}''')
-        expected = json.loads('''{{ source_replacement | default(None) | to_json }}''')
-        required = {
-            "intent", "container_name", "app_slug", "org_id", "project_id",
-            "deployment_id", "image", "current_exposure_modes", "exposure_mode", "wireguard_ip",
-            "route_port", "container_port", "replace_conflicts",
-        }
-        if not isinstance(expected, dict) or set(expected) != required:
-            raise SystemExit("source_replacement_identity_invalid")
-        if expected["intent"] != "replace_exact_source_container":
-            raise SystemExit("source_replacement_intent_invalid")
-        if expected["replace_conflicts"] is not True:
-            raise SystemExit("source_replacement_flag_invalid")
-        for key in ("org_id", "deployment_id"):
-            try:
-                if str(UUID(str(expected[key]))) != expected[key]:
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise SystemExit("source_replacement_identity_invalid")
-        project_id = expected["project_id"]
-        if project_id is not None:
-            try:
-                if str(UUID(str(project_id))) != project_id:
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise SystemExit("source_replacement_identity_invalid")
-        if len(conflicts) != 1 or conflicts[0].get("name") != expected["container_name"]:
-            raise SystemExit("source_replacement_conflict_set_invalid")
-        name = expected["container_name"]
-        result = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(result.returncode)
-        try:
-            data = json.loads(result.stdout)
-            item = data[0]
-        except (json.JSONDecodeError, IndexError, TypeError):
-            raise SystemExit("source_replacement_inspect_invalid")
-        config = item.get("Config") or {}
-        labels = config.get("Labels") or {}
-        if labels.get("com.opsctl.managed") != "true":
-            raise SystemExit("source_replacement_not_opsctl_owned")
-        deployment_label = labels.get("com.opsctl.deployment_id")
-        if deployment_label in (None, ""):
-            deployment_label = None
-        if deployment_label is not None and deployment_label != expected["deployment_id"]:
-            raise SystemExit("source_replacement_deployment_mismatch")
-        for key, expected_value in {
-            "com.opsctl.org_id": expected["org_id"],
-            "com.opsctl.app": expected["app_slug"],
-        }.items():
-            if labels.get(key) != expected_value:
-                raise SystemExit("source_replacement_identity_mismatch")
-        if deployment_label != expected["deployment_id"]:
-            actual_project = labels.get("com.opsctl.project_id")
-            if actual_project in (None, ""):
-                actual_project = None
-            if actual_project != expected["project_id"]:
-                raise SystemExit("source_replacement_identity_mismatch")
-        if config.get("Image") != expected["image"]:
-            raise SystemExit("source_replacement_image_mismatch")
-        if expected["current_exposure_modes"] != ["loopback", "loopback_wireguard"]:
-            raise SystemExit("source_replacement_current_exposure_modes_invalid")
-        if expected["exposure_mode"] != "loopback_wireguard":
-            raise SystemExit("source_replacement_exposure_invalid")
-        route_port = expected["route_port"]
-        container_port = expected["container_port"]
-        loopback_binding = f"127.0.0.1:{route_port}:{container_port}"
-        wireguard_binding = f"{expected['wireguard_ip']}:{route_port}:{container_port}"
-        expected_binding_sets = {
-            frozenset({loopback_binding}),
-            frozenset({loopback_binding, wireguard_binding}),
-        }
-        actual_bindings = set()
-        ports = ((item.get("NetworkSettings") or {}).get("Ports") or {})
-        if not isinstance(ports, dict):
-            raise SystemExit("source_replacement_bindings_invalid")
-        for container_key, bindings in ports.items():
-            if container_key != f"{container_port}/tcp":
-                raise SystemExit("source_replacement_bindings_invalid")
-            if not isinstance(bindings, list):
-                raise SystemExit("source_replacement_bindings_invalid")
-            for binding in bindings:
-                if not isinstance(binding, dict):
-                    raise SystemExit("source_replacement_bindings_invalid")
-                host_ip = binding.get("HostIp")
-                host_port = binding.get("HostPort")
-                if not isinstance(host_ip, str) or not host_ip.strip():
-                    raise SystemExit("source_replacement_bindings_invalid")
-                try:
-                    host_port = int(str(host_port))
-                except (TypeError, ValueError):
-                    raise SystemExit("source_replacement_bindings_invalid")
-                if not 1 <= host_port <= 65535:
-                    raise SystemExit("source_replacement_bindings_invalid")
-                actual_bindings.add(
-                    f"{host_ip}:{host_port}:{container_port}"
-                )
-        if frozenset(actual_bindings) not in expected_binding_sets:
-            raise SystemExit("source_replacement_bindings_mismatch")
-        print(json.dumps({
-            "containers": [name],
-            "original": {
-                "name": name,
-                "config": config,
-                "host_config": item.get("HostConfig") or {},
-            },
-        }))
-        PY
-      args:
-        executable: /bin/bash
-      register: source_replacement_validation
-      changed_when: false
-      failed_when: source_replacement_validation.rc != 0
+        - name: Require exact replacement intent
+          ansible.builtin.assert:
+            that: source_replacement.intent == 'replace_exact_source_container'
+            fail_msg: source_replacement_intent_invalid
+
+        - name: Require the strict replacement flag
+          ansible.builtin.assert:
+            that: source_replacement.replace_conflicts is sameas true
+            fail_msg: source_replacement_flag_invalid
+
+        - name: Require canonical source replacement UUIDs
+          ansible.builtin.assert:
+            that: item is string and item | length == 36 and item is match(canonical_uuid)
+            fail_msg: source_replacement_identity_invalid
+          vars:
+            canonical_uuid: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          loop: "{{ [source_replacement.org_id, source_replacement.deployment_id] + ([source_replacement.project_id] if source_replacement.project_id is not none else []) }}"
+
+        - name: Require exactly the selected conflicting source container
+          ansible.builtin.assert:
+            that:
+              - port_conflict_entries | length == 1
+              - port_conflict_entries[0].get('name') == source_replacement.container_name
+            fail_msg: source_replacement_conflict_set_invalid
+
+        - name: Inspect the exact source replacement container
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, inspect, "{{ source_replacement.container_name }}"]
+          register: source_replacement_inspection
+          changed_when: false
+
+        - name: Decode the exact source replacement inspection
+          block:
+            - name: Read the original source runtime
+              ansible.builtin.set_fact:
+                source_replacement_runtime: "{{ (source_replacement_inspection.stdout | from_json)[0] }}"
+          rescue:
+            - name: Refuse an invalid source inspection
+              ansible.builtin.fail:
+                msg: source_replacement_inspect_invalid
+
+        - name: Require an OpsCtl-owned source
+          ansible.builtin.assert:
+            that: replacement_labels.get('com.opsctl.managed') == 'true'
+            fail_msg: source_replacement_not_opsctl_owned
+
+        - name: Refuse a different deployment label
+          ansible.builtin.assert:
+            that:
+              - replacement_labels.get('com.opsctl.deployment_id') in [none, '', source_replacement.deployment_id]
+            fail_msg: source_replacement_deployment_mismatch
+
+        - name: Require exact source organization, application and applicable Project
+          ansible.builtin.assert:
+            that:
+              - replacement_labels.get('com.opsctl.org_id') == source_replacement.org_id
+              - replacement_labels.get('com.opsctl.app') == source_replacement.app_slug
+              - >-
+                replacement_labels.get('com.opsctl.deployment_id') == source_replacement.deployment_id
+                or (replacement_labels.get('com.opsctl.project_id') or none) == source_replacement.project_id
+            fail_msg: source_replacement_identity_mismatch
+
+        - name: Require the exact source image
+          ansible.builtin.assert:
+            that: replacement_config.get('Image') == source_replacement.image
+            fail_msg: source_replacement_image_mismatch
+
+        - name: Require the supported original exposure modes
+          ansible.builtin.assert:
+            that: source_replacement.current_exposure_modes == ['loopback', 'loopback_wireguard']
+            fail_msg: source_replacement_current_exposure_modes_invalid
+
+        - name: Require the exact requested replacement exposure
+          ansible.builtin.assert:
+            that: source_replacement.exposure_mode == 'loopback_wireguard'
+            fail_msg: source_replacement_exposure_invalid
+
+        - name: Require a mapping of actual source ports
+          ansible.builtin.assert:
+            that: replacement_ports is mapping
+            fail_msg: source_replacement_bindings_invalid
+
+        - name: Require only the expected TCP container port and binding lists
+          ansible.builtin.assert:
+            that:
+              - item.key == (source_replacement.container_port | string) ~ '/tcp'
+              - item.value is sequence and item.value is not string and item.value is not mapping
+            fail_msg: source_replacement_bindings_invalid
+          loop: "{{ replacement_ports | dict2items }}"
+
+        - name: Require actual nonempty host addresses and valid integer ports
+          ansible.builtin.assert:
+            that:
+              - item.1 is mapping
+              - item.1.get('HostIp') is string and item.1.HostIp | trim | length > 0
+              - item.1.get('HostPort') | string | trim is match('^[+-]?\\d+$')
+              - item.1.get('HostPort') | int >= 1
+              - item.1.get('HostPort') | int <= 65535
+            fail_msg: source_replacement_bindings_invalid
+          loop: "{{ replacement_ports | dict2items | subelements('value') }}"
+
+        - name: Initialize exact source binding comparison
+          ansible.builtin.set_fact:
+            source_replacement_actual_bindings: []
+
+        - name: Retain actual source bindings without inferring interfaces
+          ansible.builtin.set_fact:
+            source_replacement_actual_bindings: >-
+              {{ source_replacement_actual_bindings + [item.1.HostIp ~ ':'
+                 ~ (item.1.HostPort | int | string) ~ ':' ~ (source_replacement.container_port | string)] }}
+          loop: "{{ replacement_ports | dict2items | subelements('value') }}"
+
+        - name: Require exactly the allowed loopback or dual source bindings
+          ansible.builtin.assert:
+            that:
+              - source_replacement_actual_bindings | unique(case_sensitive=true) | sort(case_sensitive=true) | list in [[loopback_binding], [loopback_binding, wireguard_binding] | unique(case_sensitive=true) | sort(case_sensitive=true) | list]
+            fail_msg: source_replacement_bindings_mismatch
+          vars:
+            loopback_binding: "{{ '127.0.0.1:' ~ source_replacement.route_port ~ ':' ~ source_replacement.container_port }}"
+            wireguard_binding: "{{ source_replacement.wireguard_ip ~ ':' ~ source_replacement.route_port ~ ':' ~ source_replacement.container_port }}"
+
+        - name: Retain the validated exact source and original configuration
+          ansible.builtin.set_fact:
+            source_replacement_validation: >-
+              {{ {'rc': 0, 'stdout': {'containers': [source_replacement.container_name],
+                 'original': {'name': source_replacement.container_name, 'config': replacement_config,
+                              'host_config': source_replacement_runtime.get('HostConfig') or {}}} | to_json} }}
+      vars:
+        replacement_config: "{{ source_replacement_runtime.get('Config') | default({}, true) }}"
+        replacement_labels: "{{ replacement_config.get('Labels') | default({}, true) }}"
+        replacement_ports: "{{ (source_replacement_runtime.get('NetworkSettings') | default({}, true)).get('Ports') | default({}, true) }}"
       no_log: true
       when:
         - host_port_preflight_enabled
@@ -746,81 +678,30 @@
         - (removable_containers | default([]) | length) > 0
 
     - name: Re-check host port conflicts after removal
-      shell: |
-        python3 - <<'PY'
-        import json, subprocess, sys
+      block:
+        - name: Observe published ports after conflict removal
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - docker
+              - ps
+              - --format
+              - '{% raw %}{{if .Names}}{{.Names}}{{else}}{{.ID}}{{end}}\t{{.Ports}}{% endraw %}'
+          register: port_conflicts_retry_result
+          changed_when: false
+          failed_when:
+            - port_conflicts_retry_result.rc != 0
+            - not (source_replacement_verified | default(false) | bool)
 
-        ports = json.loads('''{{ deploy_host_ports | default([]) | to_json }}''')
-        target_container = {{ container_name | to_json }}
-        target_org = {{ app_org_id | default('') | to_json }}
-        target_project = {{ app_project_id | default('') | to_json }}
-        target_app = {{ app_slug | default(container_name) | to_json }}
-        require_project = bool(target_project)
-        if not ports:
-            print("[]")
-            sys.exit(0)
+        - name: Build fresh post-removal conflict entries
+          block: *container_port_conflict_tasks
+          vars:
+            port_scan_stdout: "{{ port_conflicts_retry_result.stdout if port_conflicts_retry_result.rc == 0 else '' }}"
+            port_scan_exclude_owned: true
 
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{ '{{json .}}' }}"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(result.returncode)
-
-        seen = {}
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ports_field = data.get("Ports") or ""
-            matches = sorted({port for port in ports if f":{port}->" in ports_field})
-            if not matches:
-                continue
-            name = data.get("Names") or data.get("ID")
-            if not name:
-                continue
-            if name == target_container:
-                inspect_result = subprocess.run(
-                    ["docker", "inspect", target_container],
-                    capture_output=True,
-                    text=True,
-                )
-                if inspect_result.returncode == 0:
-                    try:
-                        inspect_payload = json.loads(inspect_result.stdout)
-                    except json.JSONDecodeError:
-                        inspect_payload = []
-                    inspect_item = inspect_payload[0] if inspect_payload else {}
-                    labels = ((inspect_item.get("Config") or {}).get("Labels") or {})
-                    owned = (
-                        labels.get("com.opsctl.managed") == "true"
-                        and labels.get("com.opsctl.org_id") == target_org
-                        and labels.get("com.opsctl.app") == target_app
-                        and ((not require_project) or labels.get("com.opsctl.project_id") == target_project)
-                    )
-                    if owned:
-                        continue
-            seen.setdefault(name, set()).update(matches)
-
-        conflicts = [
-            {"name": name, "ports": sorted(list(values))}
-            for name, values in seen.items()
-        ]
-        print(json.dumps(conflicts))
-        PY
-      args:
-        executable: /bin/bash
-      register: port_conflicts_retry_result
-      changed_when: false
-      failed_when:
-        - port_conflicts_retry_result.rc != 0
-        - not (source_replacement_verified | default(false) | bool)
+        - name: Retain the post-removal native conflict result
+          ansible.builtin.set_fact:
+            port_conflicts_retry_result: "{{ port_conflicts_retry_result | combine({'stdout': container_port_scan_entries | to_json}) }}"
       when:
         - host_port_preflight_enabled
         - replace_conflicts | default(false) | bool
@@ -856,12 +737,8 @@
             msg: "post_removal_conflict_recheck_failed"
       rescue:
         - name: Restore source container after conflict recheck failure
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
+          ansible.builtin.include_tasks: ../tasks/container_source_runtime_restore.yml
           no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
         - name: Abort after source restoration
           fail:
             msg: "Source replacement transaction failed and was restored."
@@ -882,12 +759,8 @@
             msg: "port_conflict"
       rescue:
         - name: Restore source container after post-removal conflict failure
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
+          ansible.builtin.include_tasks: ../tasks/container_source_runtime_restore.yml
           no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
         - name: Abort after source restoration
           fail:
             msg: "Source replacement transaction failed and was restored."
@@ -903,12 +776,8 @@
             msg: "post_removal_conflict_recheck_missing"
       rescue:
         - name: Restore source container after missing conflict recheck
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
+          ansible.builtin.include_tasks: ../tasks/container_source_runtime_restore.yml
           no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
         - name: Abort after source restoration
           fail:
             msg: "Source replacement transaction failed and was restored."
@@ -987,76 +856,59 @@
         executable: /bin/sh
 
     - name: Discover legacy OpsCtl-managed containers for deployment identity
-      shell: |
-        python3 - <<'PY'
-        import json, subprocess, sys
+      block:
+        - name: Observe names of existing running and stopped containers
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, ps, -a, --format, '{% raw %}{{.Names}}{% endraw %}']
+          register: legacy_container_names
+          changed_when: false
 
-        target_container = {{ container_name | to_json }}
-        target_org = {{ app_org_id | default('') | to_json }}
-        target_project = {{ app_project_id | default('') | to_json }}
-        target_app = {{ app_slug | default(container_name) | to_json }}
-        require_project = bool(target_project)
+        - name: Initialize legacy deployment observation
+          ansible.builtin.set_fact:
+            legacy_container_payload: []
+            legacy_container_matches: []
 
-        ps = subprocess.run(
-            ["docker", "ps", "-a", "--format", "{{ '{{json .}}' }}"],
-            capture_output=True,
-            text=True,
-        )
-        if ps.returncode != 0:
-            sys.stderr.write(ps.stderr)
-            sys.exit(ps.returncode)
+        - name: Inspect only the observed legacy candidate names
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: "{{ ['docker', 'inspect'] + legacy_container_names.stdout.splitlines() }}"
+          register: legacy_container_inspection
+          changed_when: false
+          no_log: true
+          when: legacy_container_names.stdout | trim | length > 0
 
-        names = []
-        for line in ps.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            name = row.get("Names")
-            if name:
-                names.append(name)
+        - name: Decode the observed legacy container metadata
+          block:
+            - name: Read legacy candidate inspection facts
+              ansible.builtin.set_fact:
+                legacy_container_payload: "{{ legacy_container_inspection.stdout | from_json }}"
+              no_log: true
+          rescue:
+            - name: Retain no legacy matches after malformed inspection JSON
+              ansible.builtin.set_fact:
+                legacy_container_payload: []
+          when: legacy_container_inspection is not skipped
 
-        if not names:
-            print("[]")
-            sys.exit(0)
+        - name: Retain only managed organization, application and optional Project matches
+          ansible.builtin.set_fact:
+            legacy_container_matches: "{{ legacy_container_matches + [candidate_name] }}"
+          vars:
+            candidate_name: "{{ (item.get('Name') or '').lstrip('/') }}"
+            labels: "{{ (item.get('Config') or {}).get('Labels') or {} }}"
+          loop: "{{ legacy_container_payload }}"
+          when:
+            - labels.get('com.opsctl.managed') == 'true'
+            - labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+            - labels.get('com.opsctl.app') == (app_slug | default(container_name))
+            - not (app_project_id | default('')) or labels.get('com.opsctl.project_id') == app_project_id
+            - candidate_name | length > 0
+            - candidate_name != container_name
+          no_log: true
 
-        inspect = subprocess.run(["docker", "inspect"] + names, capture_output=True, text=True)
-        if inspect.returncode != 0:
-            sys.stderr.write(inspect.stderr)
-            sys.exit(inspect.returncode)
-
-        try:
-            payload = json.loads(inspect.stdout)
-        except json.JSONDecodeError:
-            print("[]")
-            sys.exit(0)
-
-        legacy = []
-        for item in payload:
-            labels = (item.get("Config") or {}).get("Labels") or {}
-            if labels.get("com.opsctl.managed") != "true":
-                continue
-            if labels.get("com.opsctl.org_id") != target_org:
-                continue
-            if labels.get("com.opsctl.app") != target_app:
-                continue
-            if require_project and labels.get("com.opsctl.project_id") != target_project:
-                continue
-            name = (item.get("Name") or "").lstrip("/")
-            if not name or name == target_container:
-                continue
-            legacy.append(name)
-
-        print(json.dumps(sorted(set(legacy))))
-        PY
-      args:
-        executable: /bin/bash
-      register: legacy_opsctl_containers_result
-      changed_when: false
-      failed_when: legacy_opsctl_containers_result.rc != 0
+        - name: Retain the sorted unique legacy result
+          ansible.builtin.set_fact:
+            legacy_opsctl_containers_result: "{{ {'rc': 0, 'stdout': legacy_container_matches | unique(case_sensitive=true) | sort(case_sensitive=true) | to_json} }}"
       when: not managed_image_resources
 
     - name: Parse legacy OpsCtl containers list
@@ -1104,12 +956,8 @@
         - name: Preserve startup restoration and publish available failed-attempt facts
           block:
             - name: Restore source container after container startup failure
-              shell: "{{ source_replacement_restore_script }}"
-              args:
-                executable: /bin/bash
+              ansible.builtin.include_tasks: ../tasks/container_source_runtime_restore.yml
               no_log: true
-              failed_when: source_replacement_restore_result.rc != 0
-              register: source_replacement_restore_result
               when:
                 - source_replacement_verified | default(false) | bool
                 - source_replacement_removed | default(false) | bool
@@ -1222,12 +1070,8 @@
         - name: Preserve health restoration and publish available failed-attempt facts
           block:
             - name: Restore source container after health validation failure
-              shell: "{{ source_replacement_restore_script }}"
-              args:
-                executable: /bin/bash
+              ansible.builtin.include_tasks: ../tasks/container_source_runtime_restore.yml
               no_log: true
-              failed_when: source_replacement_restore_result.rc != 0
-              register: source_replacement_restore_result
               when:
                 - source_replacement_verified | default(false) | bool
                 - source_replacement_removed | default(false) | bool

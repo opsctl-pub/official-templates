@@ -1,73 +1,87 @@
 ---
 - name: Collect bounded container failure diagnostics
-  shell: |
-    python3 - <<'PY'
-    import subprocess
+  block:
+    - name: Initialize unavailable diagnostics
+      ansible.builtin.set_fact:
+        container_failure_state: Container state unavailable.
+        container_failure_logs: Container logs unavailable.
+      no_log: true
 
-    container_name = {{ container_name | to_json }}
-    state_format = """{% raw %}status={{.State.Status}}
-    running={{.State.Running}}
-    exit_code={{.State.ExitCode}}
-    state_error={{json .State.Error}}
-    oom_killed={{.State.OOMKilled}}
-    restarting={{.State.Restarting}}
-    restart_count={{.RestartCount}}
-    health_status={{if .State.Health}}{{.State.Health.Status}}{{else}}unavailable{{end}}{% endraw %}"""
+    - name: Observe bounded container state
+      block:
+        - name: Read failure state without application configuration
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - docker
+              - inspect
+              - --format
+              - |-
+                {% raw %}status={{.State.Status}}
+                running={{.State.Running}}
+                exit_code={{.State.ExitCode}}
+                state_error={{json .State.Error}}
+                oom_killed={{.State.OOMKilled}}
+                restarting={{.State.Restarting}}
+                restart_count={{.RestartCount}}
+                health_status={{if .State.Health}}{{.State.Health.Status}}{{else}}unavailable{{end}}{% endraw %}
+              - "{{ container_name }}"
+          register: container_failure_state_result
+          changed_when: false
+          timeout: 10
+          no_log: true
 
-    print("Container failure diagnostics:")
-    try:
-        state = subprocess.run(
-            ["docker", "inspect", "--format", state_format, container_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except Exception:
-        state = None
+        - name: Retain available container state
+          ansible.builtin.set_fact:
+            container_failure_state: "{{ container_failure_state_result.stdout | trim | default('Container state unavailable.', true) }}"
+          no_log: true
+      rescue:
+        - name: Retain unavailable container state
+          ansible.builtin.set_fact:
+            container_failure_state: Container state unavailable.
+          no_log: true
 
-    if state is None or state.returncode != 0:
-        print("Container state unavailable.")
-    else:
-        print(state.stdout.strip() or "Container state unavailable.")
+    - name: Observe bounded merged container logs
+      block:
+        - name: Read merged log bytes without changing stream order
+          ansible.builtin.shell: |
+            set -o pipefail
+            docker logs --tail 100 {{ container_name | quote }} 2>&1 | base64
+          args:
+            executable: /bin/bash
+          register: container_failure_logs_result
+          changed_when: false
+          timeout: 10
+          no_log: true
 
-    try:
-        logs = subprocess.run(
-            ["docker", "logs", "--tail", "100", container_name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        )
-    except Exception:
-        logs = None
+        - name: Decode log bytes and retain first occurrence of each line
+          ansible.builtin.set_fact:
+            container_failure_log_lines: >-
+              {{ (container_failure_logs_result.stdout | b64decode).encode('utf-8', 'surrogateescape')
+                 .decode('utf-8', 'replace').splitlines() | unique(case_sensitive=true) | list }}
+          no_log: true
 
-    if logs is None or logs.returncode != 0:
-        print("Container logs unavailable.")
-        raise SystemExit(0)
+        - name: Bound the UTF-8 log tail including its truncation marker
+          ansible.builtin.set_fact:
+            container_failure_logs: >-
+              {{ log_prefix ~
+                 (payload.encode('utf-8')[:byte_limit - (marker.encode('utf-8') | length)]
+                    .decode('utf-8', 'ignore').rstrip(line_endings) ~ marker
+                  if payload.encode('utf-8') | length > byte_limit else payload)
+                 if container_failure_log_lines | length else 'Container logs unavailable.' }}
+          vars:
+            log_prefix: "Container log tail:\n"
+            line_endings: "\r\n"
+            payload: "{{ container_failure_log_lines | join('\n') }}"
+            byte_limit: 16384
+            marker: "\n... [truncated]"
+          no_log: true
+      rescue:
+        - name: Retain unavailable container logs
+          ansible.builtin.set_fact:
+            container_failure_logs: Container logs unavailable.
+          no_log: true
 
-    unique_lines = []
-    seen = set()
-    for line in logs.stdout.decode("utf-8", errors="replace").splitlines():
-        if line in seen:
-            continue
-        seen.add(line)
-        unique_lines.append(line)
-
-    if not unique_lines:
-        print("Container logs unavailable.")
-        raise SystemExit(0)
-
-    payload = "\n".join(unique_lines).encode("utf-8")
-    byte_limit = 16 * 1024
-    marker = b"\n... [truncated]"
-    if len(payload) > byte_limit:
-        payload = payload[:byte_limit - len(marker)]
-        payload = payload.decode("utf-8", errors="ignore").encode("utf-8")
-        payload = payload.rstrip(b"\r\n") + marker
-
-    print("Container log tail:")
-    print(payload.decode("utf-8", errors="replace"))
-    PY
-  args:
-    executable: /bin/bash
-  changed_when: false
-  failed_when: false
+    - name: Publish bounded container failure diagnostics
+      ansible.builtin.debug:
+        msg: "{{ 'Container failure diagnostics:\n' ~ container_failure_state ~ '\n' ~ container_failure_logs }}"

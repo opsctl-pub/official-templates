@@ -132,6 +132,7 @@
 
     - name: Inspect local image "{{ app_image }}"
       ansible.builtin.command:
+        expand_argument_vars: false
         argv:
           - docker
           - image
@@ -163,6 +164,7 @@
       block:
         - name: Read actual Docker daemon platform
           ansible.builtin.command:
+            expand_argument_vars: false
             argv:
               - docker
               - info
@@ -176,6 +178,7 @@
 
         - name: Pull image "{{ app_image }}" from registry
           ansible.builtin.command:
+            expand_argument_vars: false
             argv: [docker, pull, "{{ app_image }}"]
           register: pull_result
           changed_when: true
@@ -185,6 +188,7 @@
 
         - name: Inspect prepared image platform
           ansible.builtin.command:
+            expand_argument_vars: false
             argv:
               - docker
               - image
@@ -199,70 +203,91 @@
           no_log: true
 
         - name: Compare prepared image with actual Docker platform
-          shell: |
-            python3 - <<'PY'
-            import json
-            import os
+          block:
+            - name: Require successful bounded platform observations
+              ansible.builtin.assert:
+                that:
+                  - daemon_platform_result.rc | default(1) | string == '0'
+                  - image_platform_result.rc | default(1) | string == '0'
+                  - (daemon_platform_result.stdout | default('')).encode('utf-8') | length <= 4096
+                  - (image_platform_result.stdout | default('')).encode('utf-8') | length <= 4096
 
-            def platform(body, fields):
-                def unique(pairs):
-                    value = {}
-                    for key, item in pairs:
-                        if key in value:
-                            raise ValueError
-                        value[key] = item
-                    return value
+            - name: Parse platform observations without coercing field types
+              ansible.builtin.set_fact:
+                observed_daemon_platform: "{{ daemon_platform_result.stdout | from_json }}"
+                observed_image_platform: "{{ image_platform_result.stdout | from_json }}"
+                normalized_image_platforms: {}
 
-                if len(body.encode()) > 4096:
-                    raise ValueError
-                value = json.loads(body, object_pairs_hook=unique)
-                if not isinstance(value, dict) or set(value) != fields:
-                    raise ValueError
-                if any(not isinstance(item, str) or len(item) > 32 for item in value.values()):
-                    raise ValueError
-                raw = value['architecture'].lower()
-                arch = {'x86_64': 'amd64', 'amd64': 'amd64',
-                        'aarch64': 'arm64', 'arm64': 'arm64',
-                        'armv7l': 'arm', 'arm': 'arm'}.get(raw)
-                variant = value.get('variant') or None
-                if raw == 'armv7l' and variant is None:
-                    variant = 'v7'
-                if value['os'] != 'linux' or arch is None:
-                    raise ValueError
-                if arch == 'arm' and variant not in {'v6', 'v7', 'v8'}:
-                    raise ValueError
-                if arch == 'arm64' and variant not in {None, 'v8'}:
-                    raise ValueError
-                if arch == 'amd64' and variant not in {None, 'v1'}:
-                    raise ValueError
-                return {'os': 'linux', 'architecture': arch,
-                        'variant': variant if arch == 'arm' else None}
+            - name: Require closed flat platform objects and unique decoded JSON keys
+              ansible.builtin.assert:
+                that:
+                  - item.value is mapping
+                  - item.value.keys() | sort(case_sensitive=true) == item.fields | sort(case_sensitive=true)
+                  - item.value.values() | select('string') | list | length == item.fields | length
+                  - item.value.values() | map('length') | max <= 32
+                  - decoded_keys | length == item.fields | length
+                  - decoded_keys | unique(case_sensitive=true) | list | length == decoded_keys | length
+              vars:
+                json_string_token: '("(?:[^"\\]|\\.)*")\s*(:?)'
+                decoded_keys: >-
+                  {{ item.raw | regex_findall(json_string_token) | selectattr('1', 'equalto', ':')
+                     | map('first') | map('from_json') | list }}
+              loop:
+                - value: "{{ observed_daemon_platform }}"
+                  raw: "{{ daemon_platform_result.stdout }}"
+                  fields: [os, architecture]
+                - value: "{{ observed_image_platform }}"
+                  raw: "{{ image_platform_result.stdout }}"
+                  fields: [os, architecture, variant]
 
-            result = {'code': 'image_platform_unavailable'}
-            try:
-                if os.environ['DAEMON_RC'] != '0' or os.environ['IMAGE_RC'] != '0':
-                    raise ValueError
-                server = platform(os.environ['DAEMON_PLATFORM'], {'os', 'architecture'})
-                image = platform(os.environ['IMAGE_PLATFORM'], {'os', 'architecture', 'variant'})
-                result = {'code': 'matched' if server == image else 'image_platform_mismatch',
-                          'server': server, 'image': image}
-            except (ValueError, TypeError, KeyError, RecursionError):
-                pass
-            print(json.dumps(result))
-            PY
-          environment:
-            DAEMON_PLATFORM: "{{ daemon_platform_result.stdout | default('') }}"
-            IMAGE_PLATFORM: "{{ image_platform_result.stdout | default('') }}"
-            DAEMON_RC: "{{ daemon_platform_result.rc | default(1) | string }}"
-            IMAGE_RC: "{{ image_platform_result.rc | default(1) | string }}"
-          register: platform_comparison
-          changed_when: false
-          no_log: true
-          timeout: 5
+            - name: Require supported Linux architecture and variant pairs
+              ansible.builtin.assert:
+                that:
+                  - item.os == 'linux'
+                  - architecture is not none
+                  - architecture != 'arm' or variant in ['v6', 'v7', 'v8']
+                  - architecture != 'arm64' or variant in [none, 'v8']
+                  - architecture != 'amd64' or variant in [none, 'v1']
+              vars:
+                raw_architecture: "{{ item.architecture | lower }}"
+                architecture: "{{ architecture_aliases.get(raw_architecture) }}"
+                variant: "{{ item.get('variant') or ('v7' if raw_architecture == 'armv7l' else none) }}"
+              loop: "{{ [observed_daemon_platform, observed_image_platform] }}"
 
-        - name: Retain closed platform comparison
-          set_fact:
-            image_platform_comparison: "{{ platform_comparison.stdout | from_json }}"
+            - name: Normalize the actual server and image platforms
+              ansible.builtin.set_fact:
+                normalized_image_platforms: >-
+                  {{ normalized_image_platforms | combine({item.key: {
+                     'os': 'linux', 'architecture': architecture,
+                     'variant': variant if architecture == 'arm' else none}}) }}
+              vars:
+                raw_architecture: "{{ item.value.architecture | lower }}"
+                architecture: "{{ architecture_aliases[raw_architecture] }}"
+                variant: "{{ item.value.get('variant') or ('v7' if raw_architecture == 'armv7l' else none) }}"
+              loop:
+                - key: server
+                  value: "{{ observed_daemon_platform }}"
+                - key: image
+                  value: "{{ observed_image_platform }}"
+
+            - name: Retain closed platform comparison
+              ansible.builtin.set_fact:
+                image_platform_comparison: >-
+                  {{ normalized_image_platforms | combine({'code':
+                     'matched' if normalized_image_platforms.server == normalized_image_platforms.image
+                     else 'image_platform_mismatch'}) }}
+          rescue:
+            - name: Retain unavailable platform comparison after invalid observation
+              ansible.builtin.set_fact:
+                image_platform_comparison: {code: image_platform_unavailable}
+          vars:
+            architecture_aliases:
+              x86_64: amd64
+              amd64: amd64
+              aarch64: arm64
+              arm64: arm64
+              armv7l: arm
+              arm: arm
           no_log: true
 
         - name: Require compatible prepared image
@@ -278,12 +303,8 @@
           when: inspect_result.rc != 0
       rescue:
         - name: Restore source container after image pull failure
-          shell: "{{ source_replacement_restore_script }}"
-          args:
-            executable: /bin/bash
+          ansible.builtin.include_tasks: container_source_runtime_restore.yml
           no_log: true
-          failed_when: source_replacement_restore_result.rc != 0
-          register: source_replacement_restore_result
           when:
             - source_replacement_verified | default(false) | bool
             - source_replacement_removed | default(false) | bool
@@ -312,6 +333,7 @@
       always:
         - name: Docker logout after image preparation
           ansible.builtin.command:
+            expand_argument_vars: false
             argv: [docker, logout, "{{ auth.host }}"]
           no_log: true
           failed_when: false
