@@ -1,0 +1,207 @@
+---
+- name: Observe configured public SSH host identity
+  hosts: all
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Qualify the sole selected management inventory Server
+      run_once: true
+      block:
+        - name: Require a closed request and matching inventory identity
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - ansible_play_hosts_all | length == 1
+              - ssh_host_key_request | default(none) is mapping
+              - ssh_host_key_request.keys() | sort(case_sensitive=true) == ['operation_id', 'server_id']
+              - ssh_host_key_request.operation_id is string
+              - ssh_host_key_request.server_id is string
+              - ssh_host_key_request.operation_id | length == 36
+              - ssh_host_key_request.server_id | length == 36
+              - ssh_host_key_request.operation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+              - ssh_host_key_request.server_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+              - server_id | default(none) == ssh_host_key_request.server_id
+          no_log: true
+      rescue:
+        - name: Refuse invalid host-key observation scope
+          ansible.builtin.fail:
+            msg: Host-key observation request or inventory is invalid
+
+  tasks:
+    - name: OPERATION_STEP ssh-host-key observation start
+      ansible.builtin.debug:
+        msg: 'OPERATION_STEP={"name":"ssh-host-key:observe","status":"running"}'
+
+    - name: Initialize safe unavailable observation
+      ansible.builtin.set_fact:
+        observed_host_key: null
+        host_key_reason: openssh_unavailable
+        validated_host_keys: []
+        public_host_key_candidates: []
+
+    - name: Observe configured key material without exposing configuration
+      block:
+        - name: Observe required native OpenSSH tools
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: true
+            get_checksum: false
+            get_mime: false
+          loop: [/usr/sbin/sshd, /usr/bin/ssh-keygen, /usr/bin/timeout]
+          register: host_key_tools
+          no_log: true
+
+        - name: Require installed executable OpenSSH tools
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - item.stat.exists | default(false)
+              - item.stat.isreg | default(false)
+              - item.stat.executable | default(false)
+          loop: "{{ host_key_tools.results }}"
+          no_log: true
+
+        - name: Observe supported native deadline tooling before key access
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', /usr/bin/timeout, --help]
+            expand_argument_vars: false
+            stdin: ''
+          async: 30
+          poll: 1
+          register: host_key_deadline_tool
+          changed_when: false
+          no_log: true
+
+        - name: Require GNU-compatible descendant deadline semantics
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - "'GNU coreutils' in host_key_deadline_tool.stdout"
+              - "'--signal' in host_key_deadline_tool.stdout"
+              - "'--foreground' in host_key_deadline_tool.stdout"
+          no_log: true
+
+        - name: Record configuration discovery phase
+          ansible.builtin.set_fact:
+            host_key_reason: configuration_unavailable
+
+        - name: Read effective managed default OpenSSH configuration
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', /usr/sbin/sshd, -T]
+            expand_argument_vars: false
+            stdin: ''
+          async: 30
+          poll: 1
+          register: host_key_configuration
+          changed_when: false
+          no_log: true
+
+        - name: Retain configured declarations in native order
+          ansible.builtin.set_fact:
+            configured_host_keys: >-
+              {{ host_key_configuration.stdout_lines
+                 | select('match', '^hostkey\s+')
+                 | map('regex_replace', '^hostkey\s+', '') | list }}
+          no_log: true
+
+        - name: Record bounded candidate phase
+          ansible.builtin.set_fact:
+            host_key_reason: candidate_limit
+
+        - name: Refuse excessive configured candidates before extraction
+          ansible.builtin.assert:
+            quiet: true
+            that: configured_host_keys | length <= 8
+          no_log: true
+
+        - name: Record candidate observation phase
+          ansible.builtin.set_fact:
+            host_key_reason: no_supported_host_key
+
+        - name: Extract actual public identity from each configured key
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', /usr/bin/ssh-keygen, -y, -P, '', -f, "{{ item }}"]
+            expand_argument_vars: false
+            stdin: ''
+          async: 30
+          poll: 1
+          register: extracted_host_keys
+          failed_when: false
+          changed_when: false
+          loop: "{{ configured_host_keys }}"
+          no_log: true
+
+        - name: Retain bounded supported public lines only
+          ansible.builtin.set_fact:
+            public_host_key_candidates: >-
+              {{ (public_host_key_candidates | default([])) +
+                 [{'key': item.stdout.split()[0:2] | join(' ')}] }}
+          loop: "{{ extracted_host_keys.results }}"
+          when:
+            - item.rc | default(-1) == 0
+            - item.stdout | default('') is match('^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,2}(\s[^\r\n]*)?\s*$')
+            - item.stdout.split()[0:2] | join(' ') | length <= 4096
+          no_log: true
+
+        - name: Validate public wire identity with the native key owner
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', /usr/bin/ssh-keygen, -l, -f, /dev/stdin]
+            expand_argument_vars: false
+            stdin: "{{ item.key }}"
+          async: 30
+          poll: 1
+          register: host_key_validations
+          failed_when: false
+          changed_when: false
+          loop: "{{ public_host_key_candidates | default([]) }}"
+          no_log: true
+
+        - name: Retain only natively validated public identities
+          ansible.builtin.set_fact:
+            validated_host_keys: "{{ validated_host_keys + [item.item.key] }}"
+          loop: "{{ host_key_validations.results }}"
+          when: item.rc | default(-1) == 0
+          no_log: true
+
+        - name: Choose first validated key by family then declaration order
+          ansible.builtin.set_fact:
+            observed_host_key: >-
+              {{ ((validated_host_keys | select('match', '^ssh-ed25519 ') | list) +
+                  (validated_host_keys | select('match', '^ecdsa-sha2-nistp(256|384|521) ') | list) +
+                  (validated_host_keys | select('match', '^ssh-rsa ') | list))
+                 | first | default(none) }}
+          no_log: true
+
+        - name: Retain successful observation disposition
+          ansible.builtin.set_fact:
+            host_key_reason: "{{ 'observed' if observed_host_key is string else 'no_supported_host_key' }}"
+      rescue:
+        - name: Preserve finite safe observation refusal
+          ansible.builtin.set_fact:
+            observed_host_key: null
+            host_key_reason: >-
+              {{ host_key_reason if host_key_reason in
+                 ['openssh_unavailable', 'configuration_unavailable', 'candidate_limit', 'no_supported_host_key']
+                 else 'observation_failed' }}
+
+    - name: Emit sole public host-key observation
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'ssh_host_key_observation': {
+            'operation_id': ssh_host_key_request.operation_id,
+            'server_id': ssh_host_key_request.server_id,
+            'outcome': 'observed' if observed_host_key is string else 'unavailable',
+            'host_public_key': observed_host_key,
+            'reason': host_key_reason }} | to_json }}
+
+    - name: OPERATION_STEP ssh-host-key observation terminal
+      ansible.builtin.debug:
+        msg: >-
+          OPERATION_STEP={{ {'name': 'ssh-host-key:observe',
+            'status': 'completed' if observed_host_key is string else 'failed'} | to_json }}
+
+    - name: Fail unavailable observation without native diagnostics
+      ansible.builtin.fail:
+        msg: Configured SSH host identity is unavailable
+      when: observed_host_key is not string
