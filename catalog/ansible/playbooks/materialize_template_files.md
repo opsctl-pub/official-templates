@@ -18,7 +18,8 @@ Each destination is a canonical relative POSIX path of 1..256 UTF-8 bytes. Absol
 paths, empty/dot/dot-dot segments, backslashes, colons, ASCII control characters and
 DEL refuse. Paths and flat staged keys are case-sensitive and unique; no file can
 also be another file's ancestor. `source` matches `source-[0-9]{2}` exactly.
-`mode` is the string `0600` or `0700`. `size_bytes` is a strict integer (not a
+`mode` is exactly one of the strings `0600`, `0644`, `0700`, `0755`, preserved
+from authenticated regular-source custody without normalization. `size_bytes` is a strict integer (not a
 boolean), 0..262144 per file, at most 1048576 total. `sha256` is exactly 64 lowercase
 hexadecimal characters. Record order is retained.
 
@@ -31,6 +32,8 @@ any target workspace is allocated. No file contents are slurped or logged.
 
 Native `tempfile` allocates a fresh target directory at mode `0700`. Only required
 parents are created, also `0700`; original bytes are copied with the supplied modes.
+This engine-agnostic procedure does not check Bash executability; the content and
+admission owner requires a Bash entry point already at `0700` or `0755`.
 There is no caller-selected target workspace and no overwrite of an old invocation.
 Copying is not Jinja rendering: binary data, template delimiters and dollar
 expressions remain literal. File-detail tasks use `no_log`; copy diffs are disabled.

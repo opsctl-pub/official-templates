@@ -145,6 +145,43 @@ class UserAnsibleControllerTests(unittest.TestCase):
         observed = source.stat()
         return {'stat': {'dev': observed.st_dev, 'inode': observed.st_ino}}
 
+    def test_fresh_source_ownership_preserves_all_authenticated_regular_modes(self):
+        """Actual same-UID ownership tasks; no privileged mapping or mount proof."""
+        workspace = self.root / 'fresh-source'
+        workspace.mkdir(mode=0o700)
+        parent = workspace / 'nested'
+        parent.mkdir(mode=0o700)
+        originals = {}
+        for mode in (0o600, 0o644, 0o700, 0o755):
+            path = parent / format(mode, '04o')
+            payload = bytes(range(256)) + b'{{ literal }} ${HOME}'
+            path.write_bytes(payload)
+            path.chmod(mode)
+            originals[path] = (payload, mode)
+        keys = self.root / 'keys'
+        keys.mkdir(mode=0o700)
+        for name in ('credential', 'inputs.json'):
+            (keys / name).write_bytes(b'private synthetic fixture')
+            (keys / name).chmod(0o600)
+        result, facts = self.run_tasks([
+            named(self.prepare, 'Observe the accepted workspace before changing only fresh ownership'),
+            named(self.prepare, 'Require its actual private directory identity'),
+            named(self.prepare, 'Give only fresh delivered files the qualified nonroot ownership'),
+        ], {'controller_source_workspace': str(workspace)},
+            exports=['controller_source_identity'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(facts['controller_source_identity']['stat']['mode'], '0700')
+        for path, (payload, mode) in originals.items():
+            self.assertEqual(path.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            self.assertEqual((path.stat().st_uid, path.stat().st_gid), (os.getuid(), os.getgid()))
+        for directory in (workspace, parent, keys):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+        for name in ('credential', 'inputs.json'):
+            self.assertEqual((keys / name).read_bytes(), b'private synthetic fixture')
+            self.assertEqual(stat.S_IMODE((keys / name).stat().st_mode), 0o600)
+        self.assertNotIn('private synthetic fixture', result.stdout + result.stderr)
+
     def test_reentry_precedes_allocation_and_reservation_failure_cleans_only_fresh_source(self):
         record = self.root / 'existing'
         record.mkdir(mode=0o700)

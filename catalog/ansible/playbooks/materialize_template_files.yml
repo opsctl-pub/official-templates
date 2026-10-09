@@ -76,7 +76,7 @@
               - template_delivery_backslash not in supplied_file.path
               - "':' not in supplied_file.path"
               - supplied_file.source is regex('source-[0-9]{2}', match_type='fullmatch')
-              - supplied_file.mode in ['0600', '0700']
+              - supplied_file.mode in ['0600', '0644', '0700', '0755']
               - supplied_file.size_bytes >= 0 and supplied_file.size_bytes <= 262144
               - supplied_file.sha256 is regex('[0-9a-f]{64}', match_type='fullmatch')
           loop: "{{ template_supplied_files }}"

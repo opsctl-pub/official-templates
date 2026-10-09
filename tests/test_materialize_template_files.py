@@ -16,6 +16,8 @@ PLAYBOOK = ROOT / 'catalog/ansible/playbooks/materialize_template_files.yml'
 PAYLOADS = (
     b'#!/bin/sh\n# private-template-marker\nprintf "{{ literal }} ${HOME} $HOME"\n',
     bytes(range(256)) + b'\x00private-binary-marker\r\n{{ raw }}${HOME}',
+    b'public readable {{ literal }} ${HOME}\n',
+    b'#!/bin/sh\n# preserved executable; never executed\n',
 )
 
 
@@ -33,7 +35,8 @@ def frozen_input():
         sentinel.chmod(0o600)
         records = []
         for index, (path, mode, payload) in enumerate(zip(
-            ('bin/run.sh', 'assets/data.bin'), ('0700', '0600'), PAYLOADS,
+            ('bin/run.sh', 'assets/data.bin', 'config/public.txt', 'tools/public.sh'),
+            ('0700', '0600', '0644', '0755'), PAYLOADS,
         )):
             source = f'source-{index:02d}'
             source_file = staged / source
@@ -111,10 +114,15 @@ class MaterializeTemplateFilesTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(delivered.parent.lstat().st_mode), 0o700)
                 expected.append({key: supplied[key] for key in ('path', 'mode', 'size_bytes', 'sha256')})
             self.assertEqual(delivery['files'], expected)
+            for supplied, payload in zip(args['template_supplied_files'], PAYLOADS):
+                staged = Path(args['template_source_directory']) / supplied['source']
+                self.assertEqual(staged.read_bytes(), payload)
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o400)
             self.assert_sentinel(sentinel)
 
     def test_unsafe_inputs_and_sources_refuse_before_target_allocation(self):
-        for case in ('checksum', 'path', 'overlap', 'symlink', 'missing-entrypoint'):
+        for case in ('checksum', 'path', 'overlap', 'symlink', 'missing-entrypoint',
+                     '0666', '0620', '04755', '01700'):
             with self.subTest(case=case), frozen_input() as (directory, targets, sentinel, args):
                 expected = 'invalid_inputs'
                 if case == 'checksum':
@@ -135,8 +143,10 @@ class MaterializeTemplateFilesTests(unittest.TestCase):
                         )
                     args['template_source_directory'] = str(links)
                     expected = 'source_unavailable'
-                else:
+                elif case == 'missing-entrypoint':
                     args['template_entrypoint'] = 'bin/missing.sh'
+                else:
+                    args['template_supplied_files'][0]['mode'] = case
                 result, delivery = self.invoke(directory, targets, args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(delivery['outcome'], 'refused')

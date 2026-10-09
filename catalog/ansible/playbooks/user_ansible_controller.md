@@ -67,7 +67,7 @@ installed-source evidence, not a remote behavior or containment qualification.
 | Phase | Native owner and explicit binding |
 | --- | --- |
 | Input/source checks | `ansible.builtin.assert`, no-follow `stat` and the accepted materialization validation; preserve ordered manifest, byte/mode/checksum and entrypoint equality. |
-| Fresh delivery | Native `tempfile`, `copy` and `file`; chown only newly allocated owned copies to the qualified numeric UID/GID. Retain directories `0700`, ordinary files `0600`, executable files `0700`; originals remain unchanged. |
+| Fresh delivery | Native `tempfile`, `copy` and `file`; chown only newly allocated owned copies to the qualified numeric UID/GID, without changing modes. Retain workspace/parents `0700` and authenticated regular-source modes exactly `0600`, `0644`, `0700` or `0755`; originals remain unchanged and payload source binds remain read-only. |
 | Image inspection | `community.docker.docker_image_info`; require the qualified immutable image already prepared. Refuse nonempty `Config.Volumes`; inspect image environment/interpreter and override entrypoint plus healthcheck. No registry access from the restricted payload. |
 | Network creation | `community.docker.docker_network`: `driver: bridge`, `enable_ipv6: false`, explicit operation labels and qualified `driver_options`/IPAM. Record the full network ID and actual bridge interface. `internal` is not a destination allowlist. |
 | Container creation | `community.docker.docker_container`: `state: present`, `pull: never`, `detach: true`, `auto_remove: false`, `restart_policy: no`, `output_logs: false`, exact image/labels and numeric `user: UID:GID`. Record full container ID before start. |
@@ -92,6 +92,9 @@ rootful Docker alone does not prove user-namespace remapping is disabled. Never
 weaken private modes or chown an original/Secret projection. The module supports
 `mounts.tmpfs_options` only with API >=1.46; the baseline does not pin that API.
 Use only observed-supported options or refuse, not an implicit version fallback.
+Private generated inputs and copied credentials remain `0600`; staged credential
+checks still require `0400` or `0600`. Regular-source mode preservation does not
+relax those private permissions.
 The candidate divides the writable budget between `/tmp`, `/dev` and `/dev/shm`,
 rounding each allocation down to a 4096-byte boundary. Before marker release,
 observe effective cgroup limits rather than infer enforcement from create options.
