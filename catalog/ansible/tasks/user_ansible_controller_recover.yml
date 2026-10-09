@@ -1,0 +1,273 @@
+---
+- name: Rejoin only the frozen nonprivate original record
+  block:
+    - name: Require the closed recovery carrier without execution inputs
+      ansible.builtin.assert:
+        that:
+          - template_execution_recovery is mapping
+          - template_execution_recovery.keys() | list | sort(case_sensitive=true) == ['controller_server_id', 'input_digest', 'log_bytes', 'mode', 'operation_id', 'source_digest']
+          - template_execution_recovery.operation_id is string
+          - template_execution_recovery.operation_id is regex(controller_uuid_pattern, match_type='fullmatch')
+          - template_execution_recovery.controller_server_id is string
+          - template_execution_recovery.controller_server_id is regex(controller_uuid_pattern, match_type='fullmatch')
+          - template_execution_recovery.source_digest is string
+          - template_execution_recovery.source_digest is regex('[0-9a-f]{64}', match_type='fullmatch')
+          - template_execution_recovery.input_digest is string
+          - template_execution_recovery.input_digest is regex('[0-9a-f]{64}', match_type='fullmatch')
+          - template_execution_recovery.mode in ['observe', 'settle']
+          - template_execution_recovery.log_bytes is integer
+          - template_execution_recovery.log_bytes is not boolean
+          - template_execution_recovery.log_bytes >= 0 and template_execution_recovery.log_bytes <= 65536
+
+    - name: Retain safe recovery identity and unknown original liabilities
+      ansible.builtin.set_fact:
+        controller_safe_operation_id: "{{ template_execution_recovery.operation_id }}"
+        controller_safe_server_id: "{{ template_execution_recovery.controller_server_id }}"
+        controller_cleanup_operation: "{{ template_execution_recovery.operation_id }}"
+        controller_log_budget: "{{ template_execution_recovery.log_bytes }}"
+        controller_record: "/var/lib/opsctl/user-ansible/{{ template_execution_recovery.operation_id }}"
+        controller_outcome: unknown
+        controller_reason: execution_unknown
+        controller_material_cleanup: retained
+        controller_network_cleanup: retained
+        controller_deadline_cleanup: retained
+        controller_recovery_qualified: false
+        controller_logs: ''
+        controller_logs_truncated: false
+
+    - name: Observe existing original ancestors without allocating or adopting them
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      loop: [/var, /var/lib, /var/lib/opsctl, /var/lib/opsctl/user-ansible, "{{ controller_record }}"]
+      register: controller_recovery_ancestors
+
+    - name: Refuse missing linked or unowned original ancestry
+      ansible.builtin.assert:
+        that:
+          - item.stat.isdir | default(false)
+          - not item.stat.islnk | default(true)
+          - item.stat.uid == 0
+          - item.stat.mode[2] not in ['2', '3', '6', '7']
+          - item.stat.mode[3] not in ['2', '3', '6', '7']
+      loop: "{{ controller_recovery_ancestors.results }}"
+
+    - name: Retain exact current record identity without claiming ownership by its name
+      ansible.builtin.set_fact:
+        controller_record_identity: "{{ {'stat': (controller_recovery_ancestors.results | last).stat} }}"
+
+    - name: Require the original private record directory
+      ansible.builtin.assert:
+        that: controller_record_identity.stat.mode == '0700'
+
+    - name: Observe bounded regular nonprivate journal metadata before reading
+      ansible.builtin.stat:
+        path: "{{ controller_record }}/journal.json"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: controller_journal_before
+
+    - name: Refuse unqualified or oversized journals without a read
+      ansible.builtin.assert:
+        that:
+          - controller_journal_before.stat.isreg | default(false)
+          - not controller_journal_before.stat.islnk | default(true)
+          - controller_journal_before.stat.uid == 0
+          - controller_journal_before.stat.mode == '0600'
+          - controller_journal_before.stat.size > 0 and controller_journal_before.stat.size <= 16384
+
+    - name: Read only the bounded root-controlled journal
+      ansible.builtin.slurp:
+        src: "{{ controller_record }}/journal.json"
+      register: controller_journal_bytes
+
+    - name: Reobserve the journal after the bounded read
+      ansible.builtin.stat:
+        path: "{{ controller_record }}/journal.json"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+        get_mime: false
+      register: controller_journal_after
+
+    - name: Refuse concurrent changed identity or contents
+      ansible.builtin.assert:
+        that:
+          - controller_journal_after.stat.isreg | default(false)
+          - not controller_journal_after.stat.islnk | default(true)
+          - controller_journal_after.stat.uid == 0
+          - controller_journal_after.stat.mode == '0600'
+          - controller_journal_after.stat.dev == controller_journal_before.stat.dev
+          - controller_journal_after.stat.inode == controller_journal_before.stat.inode
+          - controller_journal_after.stat.size == controller_journal_before.stat.size
+          - controller_journal_after.stat.checksum == (controller_journal_bytes.content | b64decode | hash('sha256'))
+
+    - name: Decode only the unchanged nonprivate journal
+      ansible.builtin.set_fact:
+        controller_journal: "{{ controller_journal_bytes.content | b64decode | from_json }}"
+
+    - name: Require exact frozen identities and confined native names
+      ansible.builtin.assert:
+        that:
+          - controller_journal is mapping
+          - controller_journal.private_identities is mapping
+          - controller_journal.private_identities.keys() | list | difference(['keys', 'gate']) | length == 0
+          - controller_journal.operation_id == template_execution_recovery.operation_id
+          - controller_journal.controller_server_id == template_execution_recovery.controller_server_id
+          - controller_journal.source_digest == template_execution_recovery.source_digest
+          - controller_journal.input_digest == template_execution_recovery.input_digest
+          - controller_journal.record_dev == controller_record_identity.stat.dev
+          - controller_journal.record_inode == controller_record_identity.stat.inode
+          - controller_journal.source_parent == controller_record + '/source'
+          - controller_journal.unit == 'opsctl-user-ansible-' + template_execution_recovery.operation_id
+          - controller_journal.network_name == 'opsctl-user-' + template_execution_recovery.operation_id
+          - controller_journal.chain == 'OC' + (template_execution_recovery.operation_id | replace('-', '') | truncate(20, true, ''))
+          - controller_journal.uid is integer and controller_journal.uid is not boolean and controller_journal.uid > 0
+          - controller_journal.gid is integer and controller_journal.gid is not boolean and controller_journal.gid > 0
+          - controller_journal.uid <= 2147483647 and controller_journal.gid <= 2147483647
+          - controller_journal.log_bytes is integer and controller_journal.log_bytes is not boolean
+          - controller_journal.log_bytes >= 1 and controller_journal.log_bytes <= 65536
+          - template_execution_recovery.log_bytes <= controller_journal.log_bytes
+          - controller_journal.writer_closed is boolean
+          - controller_journal.chain_owned is boolean
+          - controller_journal.outcome in ['unknown', 'refused', 'succeeded', 'failed', 'timed_out']
+          - controller_journal.reason in ['invalid_inputs', 'unsupported_profile', 'delivery_failed', 'policy_failed', 'deadline_failed', 'execution_unknown', 'exited', 'execution_failed', 'deadline_expired', 'existing_invocation', 'log_collection_failed', 'cleanup_failed']
+          - controller_journal.phase in ['reserved', 'private_delivery', 'network_pending', 'policy_pending', 'container_pending', 'deadline_pending', 'gate_pending', 'released', 'closed']
+          - controller_journal.material_cleanup in ['not_allocated', 'retained', 'removed']
+          - controller_journal.network_cleanup in ['not_allocated', 'retained', 'removed']
+          - controller_journal.deadline_cleanup in ['not_allocated', 'retained', 'removed']
+          - controller_journal.container_id is none or (controller_journal.container_id is string and controller_journal.container_id is regex('[0-9a-f]{64}', match_type='fullmatch'))
+          - controller_journal.network_id is none or (controller_journal.network_id is string and controller_journal.network_id is regex('[0-9a-f]{64}', match_type='fullmatch'))
+          - controller_journal.network_id is none or controller_journal.bridge == 'br-' + controller_journal.network_id[:12]
+          - controller_journal.source_workspace is none or (controller_journal.source_workspace is string and controller_journal.source_workspace.startswith(controller_record + '/source/opsctl-template-') and controller_journal.source_workspace | dirname == controller_record + '/source')
+          - controller_journal.source_workspace is none or controller_journal.source_identity is mapping
+          - controller_journal.timed_out is boolean
+          - controller_journal.original_reason is none or controller_journal.original_reason in ['invalid_inputs', 'unsupported_profile', 'delivery_failed', 'policy_failed', 'deadline_failed', 'execution_unknown', 'exited', 'execution_failed', 'deadline_expired', 'existing_invocation', 'log_collection_failed', 'cleanup_failed']
+          - controller_journal.exit_code is none or (controller_journal.exit_code is integer and controller_journal.exit_code is not boolean and controller_journal.exit_code >= 0 and controller_journal.exit_code <= 255)
+
+    - name: Require exact recorded source filesystem identity when allocated
+      ansible.builtin.assert:
+        that:
+          - controller_journal.source_identity.keys() | list | sort(case_sensitive=true) == ['dev', 'inode', 'uid']
+          - controller_journal.source_identity.dev is integer and controller_journal.source_identity.dev is not boolean
+          - controller_journal.source_identity.inode is integer and controller_journal.source_identity.inode is not boolean
+          - controller_journal.source_identity.uid == controller_journal.uid
+      when: controller_journal.source_workspace is not none
+
+    - name: Rejoin only validated original safe facts
+      ansible.builtin.set_fact:
+        controller_cleanup_uid: "{{ controller_journal.uid }}"
+        controller_container_id: "{{ controller_journal.container_id }}"
+        controller_unit: "{{ controller_journal.unit }}"
+        controller_network_name: "{{ controller_journal.network_name }}"
+        controller_chain: "{{ controller_journal.chain }}"
+        controller_chain_owned: "{{ controller_journal.chain_owned }}"
+        controller_writer_closed: "{{ controller_journal.writer_closed }}"
+        controller_creation_attempted: "{{ controller_journal.phase in ['container_pending', 'deadline_pending', 'gate_pending', 'released', 'closed'] }}"
+        controller_material_cleanup: "{{ controller_journal.material_cleanup }}"
+        controller_network_cleanup: "{{ controller_journal.network_cleanup }}"
+        controller_deadline_cleanup: "{{ controller_journal.deadline_cleanup }}"
+        controller_outcome: "{{ controller_journal.outcome }}"
+        controller_reason: "{{ controller_journal.reason }}"
+        controller_original_reason: "{{ controller_journal.original_reason }}"
+        controller_execution_known: "{{ controller_journal.outcome in ['succeeded', 'failed', 'timed_out'] }}"
+        controller_recovery_qualified: true
+
+    - name: Require exact recorded private directory metadata
+      ansible.builtin.assert:
+        that:
+          - item.value is mapping
+          - item.value.keys() | list | sort(case_sensitive=true) == ['dev', 'inode', 'mode', 'uid']
+          - item.value.dev is integer and item.value.dev is not boolean
+          - item.value.inode is integer and item.value.inode is not boolean
+          - item.value.uid == (controller_journal.uid if item.key == 'keys' else 0)
+          - item.value.mode == ('0700' if item.key == 'keys' else '0755')
+      loop: "{{ controller_journal.private_identities | dict2items }}"
+
+    - name: Rejoin optional recorded allocation identities without adopting missing ones
+      ansible.builtin.set_fact:
+        controller_network_id: "{{ controller_journal.network_id }}"
+        controller_bridge: "{{ controller_journal.bridge }}"
+      when: controller_journal.network_id is not none
+
+    - name: Rejoin only the recorded source filesystem identity
+      ansible.builtin.set_fact:
+        controller_source_workspace: "{{ controller_journal.source_workspace }}"
+        controller_source_identity: "{{ {'stat': controller_journal.source_identity} }}"
+      when: controller_journal.source_workspace is not none
+
+    - name: Observe only the full original container ID without mutation
+      community.docker.docker_container_info:
+        name: "{{ controller_container_id }}"
+      register: controller_recovery_container
+      when: controller_container_id is not none
+
+    - name: Refuse a conflicting current native identity
+      ansible.builtin.assert:
+        that:
+          - controller_recovery_container.container.Id == controller_container_id
+          - controller_recovery_container.container.Config.Labels['opsctl.operation'] == template_execution_recovery.operation_id
+          - controller_recovery_container.container.Config.Labels['opsctl.source_digest'] == template_execution_recovery.source_digest
+          - controller_recovery_container.container.Config.Labels['opsctl.input_digest'] == template_execution_recovery.input_digest
+      when:
+        - controller_container_id is not none
+        - controller_recovery_container.exists
+
+    - name: Retain native process observation independently from original execution
+      ansible.builtin.set_fact:
+        controller_process_closed: >-
+          {{ not controller_recovery_container.exists or
+          (not controller_recovery_container.container.State.Running and controller_recovery_container.container.State.Pid == 0) }}
+        controller_close_presence: "{{ 'stopped' if controller_recovery_container.exists else 'absent' }}"
+      when: controller_container_id is not none
+
+    - name: Expose durable original exit only with current closure observation
+      ansible.builtin.set_fact:
+        controller_exit_code: "{{ controller_journal.exit_code }}"
+        controller_timed_out: "{{ controller_journal.timed_out }}"
+      when: controller_process_closed
+
+    - name: Require an unchanged journal through native observation
+      ansible.builtin.stat:
+        path: "{{ controller_record }}/journal.json"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+        get_mime: false
+      register: controller_recovery_after_observation
+
+    - name: Refuse concurrent preparation rather than return a mixed snapshot
+      ansible.builtin.assert:
+        that:
+          - controller_recovery_after_observation.stat.inode == controller_journal_after.stat.inode
+          - controller_recovery_after_observation.stat.dev == controller_journal_after.stat.dev
+          - controller_recovery_after_observation.stat.checksum == controller_journal_after.stat.checksum
+
+    - name: Read bounded positive official-only logs without invoking closure
+      ansible.builtin.include_tasks: user_ansible_controller_cleanup.yml
+      vars:
+        controller_collect_only: true
+      when:
+        - template_execution_recovery.mode == 'observe'
+        - controller_log_budget > 0
+        - controller_container_id is not none
+
+    - name: Settle exact qualified liabilities without starting or renewing execution
+      ansible.builtin.include_tasks: user_ansible_controller_cleanup.yml
+      vars:
+        controller_record_owned: true
+      when: template_execution_recovery.mode == 'settle'
+  rescue:
+    - name: Preserve original execution while reporting uncertain current closure
+      ansible.builtin.set_fact:
+        controller_original_reason: "{{ controller_original_reason if controller_original_reason is not none else controller_reason }}"
+        controller_reason: execution_unknown
+        controller_process_closed: false
+        controller_exit_code: null
+        controller_timed_out: false
+        controller_logs: ''
+        controller_logs_truncated: false
+  no_log: true

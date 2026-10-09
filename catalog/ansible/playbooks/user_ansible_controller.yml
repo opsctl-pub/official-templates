@@ -30,10 +30,46 @@
         controller_logs_truncated: false
         controller_safe_operation_id: null
         controller_safe_server_id: null
+        controller_route_qualified: false
+        controller_writer_closed: false
+        controller_execution_known: false
 
     - name: Publish controller preparation progress
       ansible.builtin.debug:
         msg: 'OPERATION_STEP={"name":"template:controller","status":"running","metadata":{"display_name":"Prepare user Ansible controller"}}'
+
+    - name: Qualify one carrier and the existing root management session before allocation
+      block:
+        - name: Require one authorized inventory host and exactly one invocation alternative
+          ansible.builtin.assert:
+            that:
+              - ansible_play_hosts_all | length == 1
+              - (template_execution is defined) != (template_execution_recovery is defined)
+
+        - name: Select root management refusal before any target change
+          ansible.builtin.set_fact:
+            controller_reason: unsupported_profile
+
+        - name: Read the authorized SSH context UID without escalation
+          ansible.builtin.command:
+            argv: [id, -u]
+            expand_argument_vars: false
+          become: false
+          changed_when: false
+          register: controller_management_uid
+
+        - name: Require native management root rather than privilege escalation
+          ansible.builtin.assert:
+            that: controller_management_uid.stdout == '0'
+
+        - name: Retain the qualified routing boundary
+          ansible.builtin.set_fact:
+            controller_route_qualified: true
+      rescue:
+        - name: Retain safe preallocation refusal
+          ansible.builtin.set_fact:
+            controller_original_reason: "{{ controller_reason }}"
+      no_log: true
 
     - name: Prepare run and observe the frozen invocation
       block:
@@ -127,21 +163,92 @@
           delay: 1
           no_log: true
 
+        - name: Observe serialized original closure before classifying terminal execution
+          ansible.builtin.command:
+            argv: [/bin/sh, "{{ controller_record }}/close.sh", "{{ controller_record }}", "{{ controller_cleanup_operation }}", normal]
+            expand_argument_vars: false
+          register: controller_original_closure
+          no_log: true
+
+        - name: Require the exact helper closure decision rather than timer activation
+          ansible.builtin.assert:
+            that:
+              - controller_original_closure.rc == 0
+              - controller_original_closure.stdout is regex('process_closed:(normal|deadline|exited|absent):(stopped|absent)', match_type='fullmatch')
+
         - name: Retain actual exit status independently of logs
           ansible.builtin.set_fact:
             controller_exit_code: "{{ controller_terminal.container.State.ExitCode }}"
             controller_process_closed: true
-            controller_reason: "{{ 'exited' if controller_terminal.container.State.ExitCode == 0 else 'execution_failed' }}"
-            controller_outcome: "{{ 'succeeded' if controller_terminal.container.State.ExitCode == 0 else 'failed' }}"
+            controller_timed_out: "{{ controller_original_closure.stdout.split(':')[1] == 'deadline' }}"
+            controller_reason: >-
+              {{ 'deadline_expired' if controller_original_closure.stdout.split(':')[1] == 'deadline'
+              else ('exited' if controller_terminal.container.State.ExitCode == 0 else 'execution_failed') }}
+            controller_outcome: >-
+              {{ 'timed_out' if controller_original_closure.stdout.split(':')[1] == 'deadline'
+              else ('succeeded' if controller_terminal.container.State.ExitCode == 0 else 'failed') }}
+            controller_execution_known: true
+
+        - name: Retain journal generation before ordinary outcome persistence
+          ansible.builtin.set_fact:
+            controller_original_journal_expected: "{{ controller_journal | to_json | hash('sha256') }}"
+
+        - name: Freeze the observed ordinary outcome before settlement
+          ansible.builtin.set_fact:
+            controller_journal: >-
+              {{ controller_journal | combine({'outcome': controller_outcome,
+              'reason': controller_reason, 'exit_code': controller_exit_code,
+              'timed_out': controller_timed_out}) }}
+
+        - name: Persist known original execution without overwriting concurrent settlement
+          ansible.builtin.shell: |
+            exec timeout -k 2 15 /bin/sh <<'OPSCTL_OUTCOME'
+            set -eu
+            umask 077
+            test -d "$RECORD" && test ! -L "$RECORD"
+            test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
+            test ! -L "$RECORD/lock"
+            exec 8>"$RECORD/lock"
+            flock -x -w 5 8
+            test -f "$RECORD/writer-closed" && test ! -L "$RECORD/writer-closed"
+            test "$(stat -c '%u:%a' "$RECORD/writer-closed")" = 0:600
+            test -f "$RECORD/journal.json" && test ! -L "$RECORD/journal.json"
+            test "$(stat -c '%u:%a' "$RECORD/journal.json")" = 0:600
+            actual=$(sha256sum "$RECORD/journal.json")
+            test "${actual%% *}" = "$EXPECTED"
+            pending=$(mktemp "$RECORD/journal.XXXXXXXX")
+            trap 'rm -f -- "$pending"' EXIT HUP INT TERM
+            printf '%s' "$JOURNAL" >"$pending"
+            mv -- "$pending" "$RECORD/journal.json"
+            OPSCTL_OUTCOME
+          args:
+            executable: /bin/sh
+          environment:
+            PATH: /usr/sbin:/usr/bin:/sbin:/bin
+            RECORD: "{{ controller_record }}"
+            DEVICE: "{{ controller_record_identity.stat.dev | string }}"
+            INODE: "{{ controller_record_identity.stat.inode | string }}"
+            EXPECTED: "{{ controller_original_journal_expected }}"
+            JOURNAL: "{{ controller_journal | to_json }}"
+          diff: false
       rescue:
         - name: Preserve the original finite reason without raw exception output
           ansible.builtin.set_fact:
             controller_original_reason: "{{ controller_reason }}"
-            controller_outcome: "{{ 'failed' if controller_reason == 'execution_unknown' else 'refused' }}"
+            controller_outcome: "{{ controller_outcome if controller_execution_known else ('unknown' if controller_reason == 'execution_unknown' else 'refused') }}"
       always:
         - name: Settle only this invocation's native liabilities
           ansible.builtin.include_tasks: ../tasks/user_ansible_controller_cleanup.yml
       no_log: true
+      when:
+        - controller_route_qualified
+        - template_execution is defined
+
+    - name: Observe or settle only the exact original recorded invocation
+      ansible.builtin.include_tasks: ../tasks/user_ansible_controller_recover.yml
+      when:
+        - controller_route_qualified
+        - template_execution_recovery is defined
 
     - name: Publish safe terminal progress
       ansible.builtin.debug:
@@ -167,4 +274,6 @@
     - name: Fail without echoing private native diagnostics
       ansible.builtin.fail:
         msg: "User Ansible controller did not succeed: {{ controller_reason }}"
-      when: controller_outcome != 'succeeded'
+      when: >-
+        controller_outcome != 'succeeded' or controller_reason in ['cleanup_failed', 'log_collection_failed'] or
+        'retained' in [controller_material_cleanup, controller_network_cleanup, controller_deadline_cleanup]

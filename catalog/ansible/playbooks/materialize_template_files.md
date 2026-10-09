@@ -13,6 +13,7 @@ target user; controller observations explicitly disable escalation.
 | `template_source_directory` | Absolute, canonical controller-side staged directory. It and every ancestor must be actual directories, not symlinks. No repeated/trailing separator (except `/`), dot/dot-dot segment, backslash or control character. |
 | `template_supplied_files` | Ordered list of 1..32 records containing exactly `path`, `source`, `mode`, `size_bytes`, `sha256`. |
 | `template_entrypoint` | Exact relative `path` member of that list; not an interpreter or command. |
+| `template_workspace_parent` | Optional existing canonical target directory, mode `0700`, owned by the actual management user. Allocate only a fresh child, never adopt the parent. |
 
 Each destination is a canonical relative POSIX path of 1..256 UTF-8 bytes. Absolute
 paths, empty/dot/dot-dot segments, backslashes, colons, ASCII control characters and
@@ -35,6 +36,11 @@ parents are created, also `0700`; original bytes are copied with the supplied mo
 This engine-agnostic procedure does not check Bash executability; the content and
 admission owner requires a Bash entry point already at `0700` or `0755`.
 There is no caller-selected target workspace and no overwrite of an old invocation.
+An optional parent requires safe no-follow ancestry owned by root or the actual
+target user; a root-owned sticky temporary ancestor is permitted. Missing, linked,
+unsafe or foreign-owned parents refuse before allocation without default-storage
+fallback. Omitting it retains native temporary allocation. The caller retains
+the parent; failure cleanup removes only the verified fresh child.
 Copying is not Jinja rendering: binary data, template delimiters and dollar
 expressions remain literal. File-detail tasks use `no_log`; copy diffs are disabled.
 Delivered regular-file type, mode, size and SHA-256 are checked before success.

@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYBOOK = ROOT / 'catalog/ansible/playbooks/materialize_template_files.yml'
@@ -59,7 +61,7 @@ def frozen_input():
 
 
 class MaterializeTemplateFilesTests(unittest.TestCase):
-    def invoke(self, directory, targets, args):
+    def invoke(self, directory, targets, args, foreign_parent=False):
         parameters = directory / 'inputs.json'
         parameters.write_text(json.dumps(args))
         parameters.chmod(0o400)
@@ -69,9 +71,28 @@ class MaterializeTemplateFilesTests(unittest.TestCase):
             'ANSIBLE_LOCAL_TEMP': str(directory / 'ansible-local'),
             'ANSIBLE_REMOTE_TEMP': str(directory / 'ansible-remote'),
         }
+        playbook = PLAYBOOK
+        if foreign_parent:
+            procedure = yaml.safe_load(PLAYBOOK.read_text())
+            preparation = next(task for task in procedure[0]['tasks'] if 'block' in task)['block']
+            parent = next(task for task in preparation
+                          if task.get('name') == 'Validate the optional existing private target parent')
+            index = next(index for index, task in enumerate(parent['block'])
+                         if task.get('register') == 'template_delivery_parent_stats')
+            parent['block'].insert(index + 1, {
+                'name': 'Model only a foreign final-parent UID on actual metadata',
+                'ansible.builtin.set_fact': {'template_delivery_parent_stats':
+                    "{% set rows = template_delivery_parent_stats.results %}"
+                    "{{ template_delivery_parent_stats | combine({'results': rows[:-1] + "
+                    "[rows[-1] | combine({'stat': rows[-1].stat | combine({'uid': "
+                    + str(os.getuid() + 1) + "})})]}) }}"},
+                'no_log': True,
+            })
+            playbook = directory / 'foreign-parent.yml'
+            playbook.write_text(yaml.safe_dump(procedure, sort_keys=False))
         result = subprocess.run(
             ['ansible-playbook', '-i', '127.0.0.1,', '-c', 'local',
-             str(PLAYBOOK), '-e', '@' + str(parameters)],
+             str(playbook), '-e', '@' + str(parameters)],
             env=environment, capture_output=True, text=True, timeout=120,
         )
         messages = []
@@ -90,6 +111,61 @@ class MaterializeTemplateFilesTests(unittest.TestCase):
     def assert_sentinel(self, sentinel):
         self.assertEqual(sentinel.read_bytes(), b'unrelated-private-sentinel')
         self.assertEqual(stat.S_IMODE(sentinel.lstat().st_mode), 0o600)
+
+    def test_private_parent_confines_fresh_child_and_preserves_standalone_default(self):
+        for selected in (True, False):
+            with self.subTest(parent=selected), frozen_input() as (directory, targets, sentinel, args):
+                parent = targets / 'private-parent'
+                if selected:
+                    parent.mkdir(mode=0o700)
+                    args['template_workspace_parent'] = str(parent)
+                result, delivery = self.invoke(directory, targets, args)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(delivery['outcome'], 'delivered')
+                workspace = Path(delivery['workspace'])
+                self.assertEqual(workspace.parent, parent if selected else targets)
+                self.assertTrue(workspace.name.startswith('opsctl-template-'))
+                self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)
+                for record, payload in zip(args['template_supplied_files'], PAYLOADS):
+                    path = workspace / record['path']
+                    self.assertEqual(path.read_bytes(), payload)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), int(record['mode'], 8))
+                    original = Path(args['template_source_directory']) / record['source']
+                    self.assertEqual(original.read_bytes(), payload)
+                    self.assertEqual(stat.S_IMODE(original.stat().st_mode), 0o400)
+                self.assertEqual(delivery['files'], [
+                    {key: record[key] for key in ('path', 'mode', 'size_bytes', 'sha256')}
+                    for record in args['template_supplied_files']])
+                self.assert_sentinel(sentinel)
+
+    def test_private_parent_refusals_precede_allocation(self):
+        """Foreign ownership is a finite metadata substitution, not privileged chown."""
+        for case in ('unsafe', 'missing', 'link', 'foreign'):
+            with self.subTest(case=case), frozen_input() as (directory, targets, sentinel, args):
+                parent = targets / 'private-parent'
+                if case != 'missing':
+                    parent.mkdir(mode=0o700)
+                if case == 'unsafe':
+                    parent.chmod(0o777)
+                if case == 'link':
+                    link = directory / 'linked-parent'
+                    link.symlink_to(parent)
+                    args['template_workspace_parent'] = str(link)
+                else:
+                    args['template_workspace_parent'] = str(parent)
+                before = list(targets.iterdir())
+                result, delivery = self.invoke(directory, targets, args, foreign_parent=case == 'foreign')
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(delivery['outcome'], 'refused')
+                self.assertEqual(delivery['cleanup'], 'not_allocated')
+                self.assertIsNone(delivery['workspace'])
+                self.assertEqual(delivery['files'], [])
+                self.assertEqual(list(targets.iterdir()), before)
+                if parent.exists():
+                    self.assertEqual(list(parent.iterdir()), [])
+                for record, payload in zip(args['template_supplied_files'], PAYLOADS):
+                    self.assertEqual((Path(args['template_source_directory']) / record['source']).read_bytes(), payload)
+                self.assert_sentinel(sentinel)
 
     def test_nested_binary_literal_files_preserve_order_bytes_modes_and_checksums(self):
         with frozen_input() as (directory, targets, sentinel, args):

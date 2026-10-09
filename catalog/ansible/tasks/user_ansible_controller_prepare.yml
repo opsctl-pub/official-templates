@@ -84,6 +84,9 @@
     controller_unit: "opsctl-user-ansible-{{ template_execution.operation_id }}"
     controller_network_name: "opsctl-user-{{ template_execution.operation_id }}"
     controller_chain: "OC{{ template_execution.operation_id | replace('-', '') | truncate(20, true, '') }}"
+    controller_cleanup_operation: "{{ template_execution.operation_id }}"
+    controller_cleanup_uid: "{{ template_execution.uid }}"
+    controller_log_budget: "{{ template_execution.limits.log_bytes }}"
 
 - name: Refuse re-entry instead of renewing or redispatching an invocation
   ansible.builtin.stat:
@@ -107,6 +110,96 @@
   ansible.builtin.assert:
     that: not controller_existing_record.stat.exists
 
+- name: Reserve the exact Operation record exclusively before any delivery
+  block:
+    - name: Allocate this exact root-controlled invocation record
+      ansible.builtin.command:
+        argv: [mkdir, -m, '0700', --, "{{ controller_record }}"]
+        expand_argument_vars: false
+
+    - name: Record allocation before further changes
+      ansible.builtin.set_fact:
+        controller_record_owned: true
+        controller_material_cleanup: retained
+
+    - name: Retain actual newly allocated record identity
+      ansible.builtin.stat:
+        path: "{{ controller_record }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: controller_record_identity
+
+    - name: Require the fresh private root-owned record
+      ansible.builtin.assert:
+        that:
+          - controller_record_identity.stat.isdir | default(false)
+          - not controller_record_identity.stat.islnk | default(true)
+          - controller_record_identity.stat.uid == 0
+          - controller_record_identity.stat.mode == '0700'
+
+    - name: Freeze only nonprivate recovery identity and allocation intentions
+      ansible.builtin.set_fact:
+        controller_journal:
+          operation_id: "{{ template_execution.operation_id }}"
+          controller_server_id: "{{ template_execution.controller_server_id }}"
+          source_digest: "{{ template_execution.source_digest }}"
+          input_digest: "{{ template_execution.input_digest }}"
+          record_dev: "{{ controller_record_identity.stat.dev }}"
+          record_inode: "{{ controller_record_identity.stat.inode }}"
+          uid: "{{ template_execution.uid }}"
+          gid: "{{ template_execution.gid }}"
+          log_bytes: "{{ template_execution.limits.log_bytes }}"
+          source_parent: "{{ controller_record }}/source"
+          source_workspace: null
+          source_identity: null
+          private_identities: {}
+          container_id: null
+          network_id: null
+          network_name: "{{ controller_network_name }}"
+          unit: "{{ controller_unit }}"
+          chain: "{{ controller_chain }}"
+          chain_owned: false
+          bridge: null
+          writer_closed: false
+          phase: reserved
+          outcome: unknown
+          reason: execution_unknown
+          original_reason: null
+          exit_code: null
+          timed_out: false
+          material_cleanup: retained
+          network_cleanup: not_allocated
+          deadline_cleanup: not_allocated
+
+    - name: Persist exclusive identity before source or private allocation
+      ansible.builtin.copy:
+        dest: "{{ controller_record }}/journal.json"
+        content: "{{ controller_journal | to_json }}"
+        owner: root
+        group: root
+        mode: '0600'
+      diff: false
+
+    - name: Create only the pre-journaled private source parent
+      ansible.builtin.file:
+        path: "{{ controller_record }}/source"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+  rescue:
+    - name: Retain ambiguous exclusive reservation without adopting a competing record
+      ansible.builtin.set_fact:
+        controller_existing_invocation: "{{ not (controller_record_owned | default(false)) }}"
+        controller_reason: existing_invocation
+        controller_process_closed: false
+        controller_material_cleanup: retained
+
+    - name: Refuse failed exclusive reservation before delivery
+      ansible.builtin.fail:
+        msg: Controller record reservation could not be qualified
+
 - name: Select source-delivery failure
   ansible.builtin.set_fact:
     controller_reason: delivery_failed
@@ -128,7 +221,8 @@
         content: >-
           {{ {'template_source_directory': template_execution.staging_directory,
           'template_supplied_files': template_execution.supplied_files,
-          'template_entrypoint': template_execution.entrypoint} | to_json }}
+          'template_entrypoint': template_execution.entrypoint,
+          'template_workspace_parent': controller_record + '/source'} | to_json }}
       delegate_to: localhost
       become: false
       diff: false
@@ -187,6 +281,8 @@
           - controller_delivery.rc == 0
           - controller_delivery_result.workspace is string
           - controller_delivery_result.entrypoint == template_execution.entrypoint
+          - controller_delivery_result.workspace.startswith(controller_record + '/source/opsctl-template-')
+          - controller_delivery_result.workspace | dirname == controller_record + '/source'
 
     - name: Record the fresh source workspace for owned cleanup
       ansible.builtin.set_fact:
@@ -222,22 +318,22 @@
     group: "{{ template_execution.gid }}"
     recurse: true
 
-- name: Allocate this exact root-controlled invocation record
-  ansible.builtin.command:
-    argv: [mkdir, -m, '0700', --, "{{ controller_record }}"]
-    expand_argument_vars: false
-
-- name: Record allocation before further changes
+- name: Journal the exact fresh source identity before private delivery
   ansible.builtin.set_fact:
-    controller_record_owned: true
+    controller_journal: >-
+      {{ controller_journal | combine({'source_workspace': controller_source_workspace,
+      'source_identity': {'dev': controller_source_identity.stat.dev,
+      'inode': controller_source_identity.stat.inode, 'uid': template_execution.uid},
+      'phase': 'private_delivery'}) }}
 
-- name: Retain actual newly allocated record identity
-  ansible.builtin.stat:
-    path: "{{ controller_record }}"
-    follow: false
-    get_checksum: false
-    get_mime: false
-  register: controller_record_identity
+- name: Persist source identity and private allocation intent
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Create private keys and public gate directories with distinct owners
   ansible.builtin.file:
@@ -249,6 +345,33 @@
   loop:
     - {path: keys, uid: "{{ template_execution.uid }}", gid: "{{ template_execution.gid }}", mode: '0700'}
     - {path: gate, uid: 0, gid: 0, mode: '0755'}
+
+- name: Observe the fresh private directory identities before copying any bytes
+  ansible.builtin.stat:
+    path: "{{ controller_record }}/{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  loop: [keys, gate]
+  register: controller_private_allocations
+
+- name: Retain exact private identities for later confined settlement
+  ansible.builtin.set_fact:
+    controller_journal: >-
+      {{ controller_journal | combine({'private_identities':
+      controller_journal.private_identities | combine({item.item:
+      {'dev': item.stat.dev, 'inode': item.stat.inode,
+      'uid': item.stat.uid, 'mode': item.stat.mode}})}) }}
+  loop: "{{ controller_private_allocations.results }}"
+
+- name: Persist exact private allocation identities before delivery
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Observe confined frozen credential files before delivery
   ansible.builtin.stat:
@@ -489,6 +612,16 @@
 - name: Retain possible network liability before native allocation
   ansible.builtin.set_fact:
     controller_network_cleanup: retained
+    controller_journal: "{{ controller_journal | combine({'phase': 'network_pending', 'network_cleanup': 'retained'}) }}"
+
+- name: Persist possible network allocation before entering the daemon
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Allocate the exclusively owned IPv4 bridge
   community.docker.docker_network:
@@ -506,6 +639,18 @@
     controller_network_id: "{{ controller_network.network.Id }}"
     controller_bridge: "br-{{ controller_network.network.Id[:12] }}"
     controller_network_cleanup: retained
+    controller_journal: >-
+      {{ controller_journal | combine({'network_id': controller_network.network.Id,
+      'bridge': 'br-' + controller_network.network.Id[:12], 'phase': 'policy_pending'}) }}
+
+- name: Persist full network identity before policy installation
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Create an owned forwarding chain before any container starts
   ansible.builtin.command:
@@ -515,6 +660,16 @@
 - name: Retain only the newly created chain's ownership
   ansible.builtin.set_fact:
     controller_chain_owned: true
+    controller_journal: "{{ controller_journal | combine({'chain_owned': true}) }}"
+
+- name: Persist exact chain ownership before rule installation
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Permit only the exact selected IPv4 SSH destinations
   ansible.builtin.command:
@@ -586,6 +741,16 @@
   ansible.builtin.set_fact:
     controller_creation_attempted: true
     controller_writable_bytes: "{{ template_execution.limits.tmpfs_mib * 1048576 // 12288 * 4096 }}"
+    controller_journal: "{{ controller_journal | combine({'phase': 'container_pending'}) }}"
+
+- name: Persist creation uncertainty without adopting a named container
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Create only the stopped trusted gate with bounded writable mounts
   community.docker.docker_container:
@@ -646,6 +811,18 @@
   ansible.builtin.set_fact:
     controller_container_id: "{{ controller_created.container.Id }}"
     controller_reason: deadline_failed
+    controller_journal: >-
+      {{ controller_journal | combine({'container_id': controller_created.container.Id,
+      'phase': 'deadline_pending', 'deadline_cleanup': 'retained'}) }}
+
+- name: Persist full stopped identity and deadline intent before any start
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Record exact container identity privately before configuration verification
   ansible.builtin.copy:
@@ -654,6 +831,17 @@
     mode: '0600'
     owner: root
     group: root
+
+- name: Persist exact immutable label identities for native closure
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/{{ item.key }}"
+    content: "{{ item.value }}\n"
+    mode: '0600'
+    owner: root
+    group: root
+  loop:
+    - {key: source-digest, value: "{{ template_execution.source_digest }}"}
+    - {key: input-digest, value: "{{ template_execution.input_digest }}"}
 
 - name: Observe configuration before any trusted-gate start
   community.docker.docker_container_info:
@@ -720,6 +908,16 @@
 - name: Retain possible execution before the trusted-gate transport call
   ansible.builtin.set_fact:
     controller_reason: execution_unknown
+    controller_journal: "{{ controller_journal | combine({'phase': 'gate_pending'}) }}"
+
+- name: Persist start and release uncertainty before entering the lock
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
 
 - name: Start only the trusted gate then install and observe namespace policy under the lock
   ansible.builtin.shell: |
@@ -787,3 +985,22 @@
 - name: Record execution entered only through the released gate
   ansible.builtin.set_fact:
     controller_reason: execution_unknown
+    controller_writer_closed: true
+    controller_journal: "{{ controller_journal | combine({'phase': 'released', 'writer_closed': true}) }}"
+
+- name: Persist completed preparation without inventing an execution outcome
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/journal.json"
+    content: "{{ controller_journal | to_json }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
+
+- name: Record completed preparation before allowing private material release
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/writer-closed"
+    content: "closed\n"
+    owner: root
+    group: root
+    mode: '0600'

@@ -216,10 +216,79 @@
           ansible.builtin.set_fact:
             template_delivery_reason: delivery_failed
 
+        - name: Validate the optional existing private target parent
+          when: template_workspace_parent is defined
+          block:
+            - name: Require a canonical absolute parent before target observation
+              ansible.builtin.assert:
+                that:
+                  - template_workspace_parent is string
+                  - template_workspace_parent.startswith('/')
+                  - template_workspace_parent != '/'
+                  - "'' not in template_workspace_parent.split('/')[1:]"
+                  - "'.' not in template_workspace_parent.split('/')"
+                  - "'..' not in template_workspace_parent.split('/')"
+                  - template_workspace_parent is not search(template_delivery_controls)
+                  - template_delivery_backslash not in template_workspace_parent
+
+            - name: Read the actual authorized target UID without escalation
+              ansible.builtin.command:
+                argv: [id, -u]
+                expand_argument_vars: false
+              become: false
+              changed_when: false
+              register: template_delivery_target_uid
+
+            - name: Collect only the selected parent's absolute ancestors
+              ansible.builtin.set_fact:
+                template_delivery_target_ancestors: >-
+                  {%- set paths = namespace(values=['/'], path='') -%}
+                  {%- for part in template_workspace_parent.split('/')[1:] -%}
+                  {%- set paths.path = paths.path + '/' + part -%}
+                  {%- set paths.values = paths.values + [paths.path] -%}
+                  {%- endfor -%}
+                  {{ paths.values }}
+
+            - name: Observe target parent ancestors without following links
+              ansible.builtin.stat:
+                path: "{{ target_ancestor }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              become: false
+              loop: "{{ template_delivery_target_ancestors }}"
+              loop_control:
+                loop_var: target_ancestor
+                label: target parent
+              register: template_delivery_parent_stats
+
+            - name: Refuse unsafe or unowned target parent ancestry
+              ansible.builtin.assert:
+                that:
+                  - item.stat.isdir | default(false)
+                  - not item.stat.islnk | default(true)
+                  - item.stat.uid in [0, template_delivery_target_uid.stdout | int]
+                  - >-
+                    (item.stat.mode[2] not in ['2', '3', '6', '7'] and
+                    item.stat.mode[3] not in ['2', '3', '6', '7']) or
+                    (item.stat.uid == 0 and item.stat.mode[0] == '1')
+              loop: "{{ template_delivery_parent_stats.results }}"
+              loop_control:
+                label: target parent
+
+            - name: Require the exact existing private parent owned by this target user
+              ansible.builtin.assert:
+                that:
+                  - template_delivery_target_uid.stdout is regex('[0-9]+', match_type='fullmatch')
+                  - (template_delivery_parent_stats.results | last).stat.uid == template_delivery_target_uid.stdout | int
+                  - (template_delivery_parent_stats.results | last).stat.mode == '0700'
+
         - name: Allocate a fresh private workspace as the authorized target user
           ansible.builtin.tempfile:
             state: directory
             prefix: opsctl-template-
+            path: "{{ template_workspace_parent | default(omit) }}"
+          become: false
           register: template_delivery_allocation
 
         - name: Observe the allocated workspace identity before any file delivery

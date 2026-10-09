@@ -7,6 +7,8 @@ is implemented here. The platform
 Runner may run only the accepted official control procedure; user Ansible,
 controller-side plugins, lookups and local tasks belong inside the container on
 the separately authorized user-owned controller Server.
+The observe/settle increment is authored; isolated behavior review and connected
+result-consumer qualification remain separate acceptance boundaries.
 
 ## Inputs And Authority
 
@@ -160,6 +162,16 @@ live embedded-resolver/IPv6 containment remain unqualified.
 
 ## Independent Deadline And Closure
 
+The management SSH user must already be root: native `id -u` runs without
+escalation before allocation. Fresh invocation exclusively reserves its `0700`
+Operation record and atomically writes a bounded `0600` nonprivate journal before
+materialization or local private variables. Delivery uses a fresh child of the
+journaled source parent. Existing records refuse before delivery, and a lost
+reservation reply never authorizes adoption. The journal retains frozen identity,
+full native IDs, filesystem identities, allocation intentions, writer completion,
+original outcome and independent liabilities. Lost delivery replies retain the
+owned source parent; they establish neither removal nor writer completion.
+
 Create the container stopped, record full ID/operation labels in a root-controlled
 record, then install and verify the operation-owned systemd deadline. It must
 survive Runner/SSH loss. API response timeout, Ansible async expiry and
@@ -199,6 +211,32 @@ cleanup still need connected proof; systemd installation alone is not that proof
 Log collection failure does not prevent independently safe owned cleanup. Existing
 invocations refuse redispatch and retain unknown process/material liability.
 
+## Observe And Settle
+
+Exactly one carrier is allowed: fresh `template_execution` or closed
+`template_execution_recovery` containing only `operation_id`,
+`controller_server_id`, `source_digest`, `input_digest`, `mode` and `log_bytes`.
+Mode is `observe` or `settle`; the strict integer log budget is `0..65536`, no
+greater than the original recorded budget. Recovery accepts no source manifest,
+target authority, private-key lookup or input reread.
+
+Observe reads only bounded unchanged journal/native full-ID facts; it creates no
+lock, renews no deadline, and starts or removes nothing. Successful exact absence
+differs from an unavailable daemon. Settle uses existing close/cleanup owners
+without redispatch, private copying or gate release. Known original outcome is
+independent of current closure; an unfinished writer retains material even after
+process closure. Verified removal leaves a nonprivate tombstone. Replay reobserves
+rather than recreates resources, and finite locked journal settlement refuses a
+changed generation rather than replacing concurrent original observations.
+
+At recovery `log_bytes: 0`, skip payload logs entirely and return `logs: ''`,
+`logs_truncated: false`, including unknown/failure. The first central profile uses
+zero; positive recovery logs are official-only pending authorized redaction
+delivery. Fresh logging is unchanged. Log failure does not block independently
+safe owned cleanup. The central admitted consumer owns management-success and
+original Job/UID qualification; later settlement never rewrites original failed
+Operation/Run history or upgrades liability to successful management execution.
+
 ## Logs And Plain Results
 
 Keep exit observation independent of output collection. `detach: false` calls
@@ -226,7 +264,7 @@ redaction do not promise that arbitrary payload output contains no secrets.
 `operation_id`, `controller_server_id`, `outcome`, `reason`, `original_reason`,
 `container_id`, `exit_code`, `timed_out`, `process_closed`, `material_cleanup`,
 `network_cleanup`, `deadline_cleanup`, `logs` and `logs_truncated`.
-Outcomes are `refused`, `succeeded`, `failed` or `timed_out`; reasons are
+Outcomes are `unknown`, `refused`, `succeeded`, `failed` or `timed_out`; reasons are
 `invalid_inputs`, `unsupported_profile`, `delivery_failed`, `policy_failed`,
 `deadline_failed`, `execution_unknown`, `exited`, `execution_failed`,
 `deadline_expired`, `existing_invocation`, `log_collection_failed` or `cleanup_failed`. Cleanup states are `not_allocated`,
@@ -247,6 +285,7 @@ mirrored API proof protocol is required.
 The finite candidate native closure is adjacent `user_ansible_controller.yml`,
 `../tasks/user_ansible_controller_prepare.yml`,
 `../tasks/user_ansible_controller_cleanup.yml`,
+`../tasks/user_ansible_controller_recover.yml`,
 `../scripts/user_ansible_controller_close.sh` and
 `../scripts/user_ansible_controller_start.sh`. Central
 admission/private-key delivery precedes connected executable consumer wiring. Native

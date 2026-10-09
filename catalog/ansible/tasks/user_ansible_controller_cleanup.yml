@@ -7,6 +7,7 @@
       when:
         - not (controller_creation_attempted | default(false))
         - not (controller_existing_invocation | default(false))
+        - controller_record_owned | default(false)
 
     - name: Require a fresh closure observation before any corresponding release
       ansible.builtin.set_fact:
@@ -15,7 +16,7 @@
 
     - name: Close the exact recorded process through the public helper
       ansible.builtin.command:
-        argv: [/bin/sh, "{{ controller_record }}/close.sh", "{{ controller_record }}", "{{ template_execution.operation_id }}", normal]
+        argv: [/bin/sh, "{{ controller_record }}/close.sh", "{{ controller_record }}", "{{ controller_cleanup_operation }}", normal]
         expand_argument_vars: false
       when: controller_container_id is not none
       register: controller_closed
@@ -25,7 +26,9 @@
       ansible.builtin.set_fact:
         controller_process_closed: true
         controller_close_presence: "{{ controller_closed.stdout.split(':')[2] }}"
-        controller_timed_out: "{{ controller_closed.stdout.split(':')[1] == 'deadline' }}"
+        controller_timed_out: >-
+          {{ controller_timed_out if controller_execution_known | default(false)
+          else controller_closed.stdout.split(':')[1] == 'deadline' }}
       when:
         - controller_container_id is not none
         - controller_closed.rc == 0
@@ -39,7 +42,9 @@
       ansible.builtin.set_fact:
         controller_reason: deadline_expired
         controller_outcome: timed_out
-      when: controller_timed_out
+      when:
+        - controller_timed_out
+        - not (controller_execution_known | default(false))
   rescue:
     - name: Preserve the original reason and this phase liability
       ansible.builtin.set_fact:
@@ -47,7 +52,8 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: "{{ 'existing_invocation' if controller_existing_invocation | default(false) else 'cleanup_failed' }}"
-        controller_outcome: "{{ 'refused' if controller_existing_invocation | default(false) else 'failed' }}"
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else ('refused' if controller_existing_invocation | default(false) else 'unknown') }}"
+  when: not (controller_collect_only | default(false))
   no_log: true
 
 - name: Settle the independent deadline after process closure
@@ -79,10 +85,12 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: cleanup_failed
-        controller_outcome: failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
+    - not (controller_collect_only | default(false))
+    - controller_writer_closed | default(false)
   no_log: true
 
 - name: Collect bounded logs independently of safe liability cleanup
@@ -122,7 +130,7 @@
         DOCKER_CERT_PATH: ''
         DOCKER_API_VERSION: ''
         CONTAINER: "{{ controller_container_id }}"
-        BUDGET: "{{ template_execution.limits.log_bytes | string }}"
+        BUDGET: "{{ controller_log_budget | string }}"
       register: controller_bounded_logs
       changed_when: false
       no_log: true
@@ -145,10 +153,11 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'log_collection_failed') }}
         controller_reason: log_collection_failed
-        controller_outcome: failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
-    - controller_process_closed
+    - controller_process_closed or (controller_collect_only | default(false))
     - not (controller_existing_invocation | default(false))
+    - controller_log_budget | default(0) | int > 0
   no_log: true
 
 - name: Remove only the exact closed container or observe its absence
@@ -164,7 +173,9 @@
       ansible.builtin.assert:
         that:
           - controller_before_remove.container.Id == controller_container_id
-          - controller_before_remove.container.Config.Labels['opsctl.operation'] == template_execution.operation_id
+          - controller_before_remove.container.Config.Labels['opsctl.operation'] == controller_cleanup_operation
+          - controller_before_remove.container.Config.Labels['opsctl.source_digest'] == controller_journal.source_digest
+          - controller_before_remove.container.Config.Labels['opsctl.input_digest'] == controller_journal.input_digest
           - not controller_before_remove.container.State.Running
           - controller_before_remove.container.State.Pid == 0
       when:
@@ -208,10 +219,12 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: cleanup_failed
-        controller_outcome: failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
+    - not (controller_collect_only | default(false))
+    - controller_writer_closed | default(false)
   no_log: true
 
 - name: Settle only the exact owned network and policy
@@ -231,11 +244,12 @@
     - name: Refuse network cleanup with a changed owner or remaining member
       ansible.builtin.assert:
         that:
-          - controller_network_before_remove.exists
           - controller_network_before_remove.network.Id == controller_network_id
-          - controller_network_before_remove.network.Labels['opsctl.operation'] == template_execution.operation_id
+          - controller_network_before_remove.network.Labels['opsctl.operation'] == controller_cleanup_operation
           - controller_network_before_remove.network.Containers | default({}, true) | length == 0
-      when: controller_network_id is defined
+      when:
+        - controller_network_id is defined
+        - controller_network_before_remove.exists
       no_log: true
 
     - name: Observe owned hook presence after possibly partial installation
@@ -244,7 +258,7 @@
         expand_argument_vars: false
       loop:
         - [iptables, -w, '5', -C, DOCKER-USER, -j, "{{ controller_chain | default('') }}"]
-        - [iptables, -w, '5', -C, INPUT, -i, "{{ controller_bridge | default('') }}", -m, comment, --comment, "{{ template_execution.operation_id | default('') }}", -j, REJECT]
+        - [iptables, -w, '5', -C, INPUT, -i, "{{ controller_bridge | default('') }}", -m, comment, --comment, "{{ controller_cleanup_operation | default('') }}", -j, REJECT]
       register: controller_owned_hooks
       changed_when: false
       failed_when: controller_owned_hooks.rc not in [0, 1]
@@ -278,7 +292,7 @@
 
     - name: Remove the revalidated empty operation network
       community.docker.docker_network:
-        name: "{{ controller_network_name }}"
+        name: "{{ controller_network_id }}"
         state: absent
       when: controller_network_id is defined
 
@@ -304,10 +318,13 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: cleanup_failed
-        controller_outcome: failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
+    - not (controller_collect_only | default(false))
+    - controller_network_cleanup != 'removed'
+    - controller_writer_closed | default(false)
   no_log: true
 
 - name: Release only revalidated fresh private material
@@ -328,8 +345,10 @@
           - not controller_source_before_remove.stat.islnk | default(true)
           - controller_source_before_remove.stat.dev == controller_source_identity.stat.dev
           - controller_source_before_remove.stat.inode == controller_source_identity.stat.inode
-          - controller_source_before_remove.stat.uid == template_execution.uid
-      when: controller_source_workspace is defined
+          - controller_source_before_remove.stat.uid == controller_cleanup_uid
+      when:
+        - controller_source_workspace is defined
+        - controller_source_before_remove.stat.exists
 
     - name: Reobserve the exclusively allocated root record before release
       ansible.builtin.stat:
@@ -339,6 +358,28 @@
         get_mime: false
       register: controller_record_before_remove
       when: controller_record_owned | default(false)
+
+    - name: Observe each recorded private directory without following links
+      ansible.builtin.stat:
+        path: "{{ controller_record }}/{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      loop: [keys, gate]
+      register: controller_private_before_remove
+
+    - name: Require exact private allocation identities before release
+      ansible.builtin.assert:
+        that:
+          - item.stat.isdir | default(false)
+          - not item.stat.islnk | default(true)
+          - controller_journal.private_identities[item.item] is mapping
+          - item.stat.dev == controller_journal.private_identities[item.item].dev
+          - item.stat.inode == controller_journal.private_identities[item.item].inode
+          - item.stat.uid == controller_journal.private_identities[item.item].uid
+          - item.stat.mode == controller_journal.private_identities[item.item].mode
+      loop: "{{ controller_private_before_remove.results }}"
+      when: item.stat.exists
 
     - name: Refuse private-record release on changed identity or ownership
       ansible.builtin.assert:
@@ -360,11 +401,37 @@
         mode: '0600'
       when: controller_record_owned | default(false)
 
-    - name: Remove only fresh private invocation material
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop: "{{ ([controller_source_workspace] if controller_source_workspace is defined else []) + ([controller_record + '/keys', controller_record + '/gate'] if controller_record_owned | default(false) else []) }}"
+    - name: Release private material only under the exact completed-writer closure lock
+      ansible.builtin.shell: |
+        exec timeout -k 2 30 /bin/sh <<'OPSCTL_MATERIAL'
+        set -eu
+        umask 077
+        test -d "$RECORD" && test ! -L "$RECORD"
+        test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
+        test ! -L "$RECORD/lock"
+        exec 8>"$RECORD/lock"
+        flock -x -w 5 8
+        test -f "$RECORD/closed" && test ! -L "$RECORD/closed"
+        test -f "$RECORD/writer-closed" && test ! -L "$RECORD/writer-closed"
+        test "$(stat -c '%u:%a' "$RECORD/writer-closed")" = 0:600
+        if test -e "$RECORD/source"; then
+          test -d "$RECORD/source" && test ! -L "$RECORD/source"
+          test "$(stat -c '%u:%a' "$RECORD/source")" = 0:700
+        fi
+        for name in source keys gate; do
+          test ! -L "$RECORD/$name"
+        done
+        rm -rf -- "$RECORD/source" "$RECORD/keys" "$RECORD/gate"
+        for name in source keys gate; do test ! -e "$RECORD/$name"; done
+        OPSCTL_MATERIAL
+      args:
+        executable: /bin/sh
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+        RECORD: "{{ controller_record }}"
+        DEVICE: "{{ controller_record_identity.stat.dev | string }}"
+        INODE: "{{ controller_record_identity.stat.inode | string }}"
+      when: controller_record_owned | default(false)
 
     - name: Observe fresh private-material absence
       ansible.builtin.stat:
@@ -372,7 +439,7 @@
         follow: false
         get_checksum: false
         get_mime: false
-      loop: "{{ ([controller_source_workspace] if controller_source_workspace is defined else []) + ([controller_record + '/keys', controller_record + '/gate'] if controller_record_owned | default(false) else []) }}"
+      loop: "{{ ([controller_record + '/source', controller_record + '/keys', controller_record + '/gate'] if controller_record_owned | default(false) else []) }}"
       register: controller_material_after_remove
 
     - name: Require absence of every owned material allocation
@@ -391,8 +458,69 @@
           {{ controller_original_reason if controller_original_reason is not none else
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: cleanup_failed
-        controller_outcome: failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
+    - controller_writer_closed | default(false)
+    - not (controller_collect_only | default(false))
+    - controller_material_cleanup != 'removed'
+  no_log: true
+
+- name: Persist only observed cleanup facts without replacing original execution
+  block:
+    - name: Retain the original journal generation before settlement
+      ansible.builtin.set_fact:
+        controller_journal_expected: "{{ controller_journal | to_json | hash('sha256') }}"
+
+    - name: Retain original known facts and current independent liabilities
+      ansible.builtin.set_fact:
+        controller_journal: >-
+          {{ controller_journal | combine({'material_cleanup': controller_material_cleanup,
+          'network_cleanup': controller_network_cleanup, 'deadline_cleanup': controller_deadline_cleanup,
+          'phase': 'closed' if controller_material_cleanup == 'removed' else controller_journal.phase}) |
+          combine({'outcome': controller_outcome, 'reason': 'deadline_expired',
+          'exit_code': controller_exit_code, 'timed_out': true} if
+          controller_timed_out and not (controller_execution_known | default(false)) else {}) }}
+
+    - name: Atomically persist settlement only if the original journal is unchanged
+      ansible.builtin.shell: |
+        exec timeout -k 2 15 /bin/sh <<'OPSCTL_JOURNAL'
+        set -eu
+        umask 077
+        test -d "$RECORD" && test ! -L "$RECORD"
+        test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
+        test ! -L "$RECORD/lock"
+        exec 8>"$RECORD/lock"
+        flock -x -w 5 8
+        test -f "$RECORD/journal.json" && test ! -L "$RECORD/journal.json"
+        test "$(stat -c '%u:%a' "$RECORD/journal.json")" = 0:600
+        actual=$(sha256sum "$RECORD/journal.json")
+        test "${actual%% *}" = "$EXPECTED"
+        pending=$(mktemp "$RECORD/journal.XXXXXXXX")
+        trap 'rm -f -- "$pending"' EXIT HUP INT TERM
+        printf '%s' "$JOURNAL" >"$pending"
+        mv -- "$pending" "$RECORD/journal.json"
+        OPSCTL_JOURNAL
+      args:
+        executable: /bin/sh
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+        RECORD: "{{ controller_record }}"
+        DEVICE: "{{ controller_record_identity.stat.dev | string }}"
+        INODE: "{{ controller_record_identity.stat.inode | string }}"
+        EXPECTED: "{{ controller_journal_expected }}"
+        JOURNAL: "{{ controller_journal | to_json }}"
+      diff: false
+  rescue:
+    - name: Report uncertain journal settlement without inventing success
+      ansible.builtin.set_fact:
+        controller_original_reason: "{{ controller_original_reason if controller_original_reason is not none else controller_reason }}"
+        controller_reason: cleanup_failed
+  when:
+    - controller_record_owned | default(false)
+    - controller_journal is defined
+    - not (controller_collect_only | default(false))
+    - not (controller_existing_invocation | default(false))
+    - controller_writer_closed | default(false)
   no_log: true
