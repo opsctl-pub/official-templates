@@ -16,6 +16,8 @@
         compose_files_written: []
         compose_observation_complete: false
         compose_allow_new_instances: false
+        compose_operational_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        compose_auth_identity: null
       no_log: true
 
     - name: Publish preparation progress
@@ -40,6 +42,44 @@
               - compose_directories | default([]) | length <= 32
               - compose_wait_timeout | default(300) is integer
               - compose_wait_timeout | default(300) >= 1 and compose_wait_timeout | default(300) <= 1800
+
+        - name: Require the exact optional operation-mounted interpolation file spelling
+          ansible.builtin.assert:
+            that:
+              - compose_interpolation_source_file is string
+              - compose_interpolation_source_file == compose_source_directory + '/compose-interpolation.env'
+          when: compose_interpolation_source_file | default(none) is not none
+
+        - name: Resolve protected source confinement inside its frozen operation mount
+          ansible.builtin.set_fact:
+            compose_interpolation_resolved_file: "{{ compose_interpolation_source_file | realpath }}"
+            compose_interpolation_resolved_mount: "{{ compose_source_directory | realpath }}"
+          when: compose_interpolation_source_file | default(none) is not none
+
+        - name: Require the resolved protected file to remain inside the exact operation mount
+          ansible.builtin.assert:
+            that:
+              - compose_interpolation_resolved_file.startswith(compose_interpolation_resolved_mount + '/')
+          when: compose_interpolation_source_file | default(none) is not none
+
+        - name: Observe protected source metadata before reading any bytes
+          ansible.builtin.stat:
+            path: "{{ compose_interpolation_resolved_file }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          delegate_to: localhost
+          become: false
+          register: compose_interpolation_source_stat
+          when: compose_interpolation_source_file | default(none) is not none
+
+        - name: Require a bounded frozen regular protected file
+          ansible.builtin.assert:
+            that:
+              - compose_interpolation_source_stat.stat.isreg | default(false)
+              - not compose_interpolation_source_stat.stat.islnk | default(true)
+              - compose_interpolation_source_stat.stat.size <= 262144
+          when: compose_interpolation_source_file | default(none) is not none
 
         - name: Observe existing project membership before any file or workload effect
           ansible.builtin.include_tasks: ../tasks/compose_observe.yml
@@ -233,6 +273,27 @@
             prefix: opsctl-compose-auth-
           register: compose_auth_directory
 
+        - name: Observe the invocation-local directory identity before private material delivery
+          ansible.builtin.stat:
+            path: "{{ compose_auth_directory.path }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: compose_auth_directory_stat
+
+        - name: Retain the exact owned temporary directory identity
+          ansible.builtin.set_fact:
+            compose_auth_identity: "{{ compose_auth_directory_stat.stat }}"
+
+        - name: Require private temporary material outside the captured workspace
+          ansible.builtin.assert:
+            that:
+              - compose_auth_identity.isdir | default(false)
+              - not compose_auth_identity.islnk | default(true)
+              - compose_auth_identity.mode == '0700'
+              - compose_auth_directory.path != compose_workspace
+              - not compose_auth_directory.path.startswith(compose_workspace.rstrip('/') + '/')
+
         - name: Restrict operation-local authentication directory
           ansible.builtin.file:
             path: "{{ compose_auth_directory.path }}"
@@ -265,23 +326,117 @@
             loop_var: registry
             label: selected registry
 
+        - name: Select protected-file delivery failure
+          ansible.builtin.set_fact:
+            compose_reason: compose_file_delivery_failed
+
+        - name: Copy frozen protected bytes privately without parsing or rendering
+          ansible.builtin.copy:
+            src: "{{ compose_interpolation_resolved_file }}"
+            dest: "{{ compose_auth_directory.path }}/compose-interpolation.env"
+            mode: '0600'
+            follow: false
+            local_follow: false
+            backup: false
+          diff: false
+          when: compose_interpolation_source_file | default(none) is not none
+
+        - name: Select authenticated base env files followed by the protected file
+          ansible.builtin.set_fact:
+            compose_effective_env_files: >-
+              {{ (compose_env_files if compose_env_files | default([]) | length > 0 else
+                ['.env'] if compose_default_env_path in (compose_supplied_files | map(attribute='path') | list)
+                else []) + ([compose_auth_directory.path + '/compose-interpolation.env']
+                if compose_interpolation_source_file | default(none) is not none else []) }}
+          vars:
+            compose_default_env_path: "{{ ((compose_project_directory | default('.')) + '/.env') | normpath }}"
+
+        - name: Create a private empty env file only when no authenticated env selection exists
+          ansible.builtin.copy:
+            content: ''
+            dest: "{{ compose_auth_directory.path }}/empty.env"
+            mode: '0600'
+            backup: false
+          diff: false
+          when: compose_effective_env_files | length == 0
+
+        - name: Suppress automatic retained Server env loading with the owned empty file
+          ansible.builtin.set_fact:
+            compose_effective_env_files: "{{ [compose_auth_directory.path + '/empty.env'] }}"
+          when: compose_effective_env_files | length == 0
+
+        - name: Select unavailable operational Docker prerequisite
+          ansible.builtin.set_fact:
+            compose_reason: compose_prerequisite_unavailable
+
+        - name: Locate Docker using only the operational system path
+          ansible.builtin.command:
+            argv: [/bin/sh, -c, command -v docker]
+            expand_argument_vars: false
+          environment:
+            PATH: "{{ compose_operational_path }}"
+          changed_when: false
+          register: compose_docker_location
+
+        - name: Resolve the installed native executable independently of captured contents
+          ansible.builtin.command:
+            argv: [readlink, -f, "{{ compose_docker_location.stdout }}"]
+            expand_argument_vars: false
+          environment:
+            PATH: "{{ compose_operational_path }}"
+          changed_when: false
+          register: compose_docker_resolved
+
+        - name: Observe the resolved real Docker executable
+          ansible.builtin.stat:
+            path: "{{ compose_docker_resolved.stdout }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: compose_docker_stat
+
+        - name: Require an installed executable outside the captured workspace
+          ansible.builtin.assert:
+            that:
+              - compose_docker_resolved.stdout.startswith('/')
+              - compose_docker_stat.stat.isreg | default(false)
+              - not compose_docker_stat.stat.islnk | default(true)
+              - compose_docker_stat.stat.executable | default(false)
+              - not compose_docker_resolved.stdout.startswith(compose_workspace.rstrip('/') + '/')
+
+        - name: Deliver the accepted constant native environment wrapper privately
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../scripts/compose_controlled_environment.sh"
+            dest: "{{ compose_auth_directory.path }}/compose-controlled-environment"
+            mode: '0700'
+            backup: false
+          diff: false
+
+        - name: Bind only operational inputs for the constant native wrapper
+          ansible.builtin.set_fact:
+            compose_controlled_environment:
+              OPSCTL_COMPOSE_OPERATIONAL_PATH: "{{ compose_operational_path }}"
+              OPSCTL_COMPOSE_DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+              OPSCTL_COMPOSE_DOCKER_EXECUTABLE: "{{ compose_docker_resolved.stdout }}"
+
         - name: Select native-configuration failure
           ansible.builtin.set_fact:
             compose_reason: compose_configuration_changed
             compose_config_argv: >-
-              {%- set args = namespace(values=['docker', 'compose', '--project-name', compose_project_name,
+              {%- set args = namespace(values=[compose_auth_directory.path + '/compose-controlled-environment',
+                '--host', 'unix:///var/run/docker.sock', 'compose', '--project-name', compose_project_name,
                 '--project-directory', compose_project_src]) -%}
               {%- for file in compose_files -%}{%- set args.values = args.values + ['--file', file] -%}{%- endfor -%}
-              {%- for file in compose_env_files | default([]) -%}{%- set args.values = args.values + ['--env-file', file] -%}{%- endfor -%}
+              {%- for file in compose_effective_env_files -%}{%- set args.values = args.values + ['--env-file', file] -%}{%- endfor -%}
               {%- for profile in compose_profiles | default([]) -%}{%- set args.values = args.values + ['--profile', profile] -%}{%- endfor -%}
               {{ args.values + ['config', '--format', 'json'] }}
 
         - name: Read native resolved configuration privately after original-file delivery
           ansible.builtin.command:
             argv: "{{ compose_config_argv }}"
+            expand_argument_vars: false
             chdir: "{{ compose_project_src }}"
-          environment:
-            DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+          environment: "{{ compose_controlled_environment }}"
           register: compose_native_config_output
           changed_when: false
 
@@ -378,8 +533,17 @@
             project_src: "{{ compose_project_src }}"
             project_name: "{{ compose_project_name }}"
             files: "{{ compose_files }}"
-            env_files: "{{ compose_env_files | default([]) }}"
+            env_files: "{{ compose_effective_env_files }}"
             profiles: "{{ compose_profiles | default([]) }}"
+            docker_cli: "{{ compose_auth_directory.path }}/compose-controlled-environment"
+            docker_host: unix:///var/run/docker.sock
+            tls: false
+            validate_certs: false
+            tls_hostname: null
+            ca_path: null
+            client_cert: null
+            client_key: null
+            api_version: auto
             state: present
             pull: policy
             build: never
@@ -388,8 +552,7 @@
             assume_yes: false
             wait: false
             remove_orphans: true
-          environment:
-            DOCKER_CONFIG: "{{ compose_auth_directory.path }}"
+          environment: "{{ compose_controlled_environment }}"
           register: compose_native_apply
 
         - name: Preserve native apply effects and begin finite readiness observations
@@ -454,11 +617,50 @@
             compose_outcome: "{{ 'failed' if compose_observation_complete else 'unknown' }}"
             compose_reason: "{{ compose_failure_reason if compose_observation_complete else compose_reason }}"
       always:
-        - name: Remove only this operation-local authentication directory
-          ansible.builtin.file:
-            path: "{{ compose_auth_directory.path }}"
-            state: absent
+        - name: Remove only owned temporary material and verify its absence
           when: compose_auth_directory.path is defined
+          block:
+            - name: Reobserve the temporary directory without following links
+              ansible.builtin.stat:
+                path: "{{ compose_auth_directory.path }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              register: compose_cleanup_before
+
+            - name: Require the same owned native allocation before cleanup
+              ansible.builtin.assert:
+                that:
+                  - compose_auth_identity is mapping
+                  - compose_cleanup_before.stat.isdir | default(false)
+                  - not compose_cleanup_before.stat.islnk | default(true)
+                  - compose_cleanup_before.stat.dev == compose_auth_identity.dev
+                  - compose_cleanup_before.stat.inode == compose_auth_identity.inode
+                  - compose_cleanup_before.stat.uid == compose_auth_identity.uid
+              when: compose_cleanup_before.stat.exists
+
+            - name: Remove only revalidated private config helper and interpolation material
+              ansible.builtin.file:
+                path: "{{ compose_auth_directory.path }}"
+                state: absent
+              when: compose_cleanup_before.stat.exists
+
+            - name: Observe temporary material absence after cleanup
+              ansible.builtin.stat:
+                path: "{{ compose_auth_directory.path }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              register: compose_cleanup_after
+
+            - name: Require actual temporary material removal before reporting success
+              ansible.builtin.assert:
+                that: not compose_cleanup_after.stat.exists
+          rescue:
+            - name: Refuse cleanup uncertainty without replacing an original native failure
+              ansible.builtin.set_fact:
+                compose_outcome: "{{ 'failed' if compose_observation_complete else 'unknown' }}"
+                compose_reason: "{{ compose_reason if compose_reason is not none else 'compose_file_delivery_failed' }}"
       no_log: true
 
     - name: Publish exactly one final native deployment result

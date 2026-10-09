@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+: "${OPSCTL_COMPOSE_OPERATIONAL_PATH:?Missing operational PATH}"
+: "${OPSCTL_COMPOSE_DOCKER_CONFIG:?Missing private Docker config}"
+: "${OPSCTL_COMPOSE_DOCKER_EXECUTABLE:?Missing resolved Docker executable}"
+
+case "$OPSCTL_COMPOSE_DOCKER_CONFIG" in
+    /*) ;;
+    *) exit 64 ;;
+esac
+case "$OPSCTL_COMPOSE_DOCKER_EXECUTABLE" in
+    /*) ;;
+    *) exit 64 ;;
+esac
+test -d "$OPSCTL_COMPOSE_DOCKER_CONFIG"
+test -f "$OPSCTL_COMPOSE_DOCKER_EXECUTABLE"
+test -x "$OPSCTL_COMPOSE_DOCKER_EXECUTABLE"
+
+PATH=$OPSCTL_COMPOSE_OPERATIONAL_PATH
+export PATH
+exec env -i \
+    PATH="$OPSCTL_COMPOSE_OPERATIONAL_PATH" \
+    DOCKER_CONFIG="$OPSCTL_COMPOSE_DOCKER_CONFIG" \
+    "$OPSCTL_COMPOSE_DOCKER_EXECUTABLE" "$@"

@@ -14,9 +14,10 @@ Inventory, SSH access and privilege escalation use the existing Ansible contract
 | `compose_workspace` | required absolute directory | Backend-configured stable Server/project workspace, retained across removal/reuse. |
 | `compose_project_directory` | `.`; relative directory | Original native project base inside workspace. |
 | `compose_files` | required 1-16 ordered strings | Reviewed original Compose selections relative to project base. Parent components may resolve within workspace only. |
-| `compose_env_files` | `[]`; up to 16 ordered strings | Explicit env selections relative to the same base; empty uses native `.env` semantics. |
+| `compose_env_files` | `[]`; up to 16 ordered strings | Explicit ordered env selections replace the automatic default. With none selected, only a supplied authenticated project-base `.env` contributes. |
 | `compose_profiles` | `[]`; up to 32 strings | Reviewed native profile selections, unchanged. |
 | `compose_source_directory` | required absolute controller path | Existing read-only file Secret mount, normally `/var/run/opsctl/file-secret`. |
+| `compose_interpolation_source_file` | null; exact absolute controller path | When supplied, exactly `compose_source_directory + '/compose-interpolation.env'`: the operation-staged protected env file, not a captured original or arbitrary path. |
 | `compose_supplied_files` | required 1-32 objects | `{source,path,mode}`: flat Secret key `source-00`, confined workspace-relative original destination, four-character octal mode. |
 | `compose_directories` | `[]`; up to 32 relative paths | Explicit empty input directories; missing file parents are also created. |
 | `compose_registry_auth_file` | null; absolute controller path | Existing protected registry Secret, normally `/secrets/registry-auth.json`, containing only `{registries:[{host,username,password}]}`. Null selects anonymous access. |
@@ -32,19 +33,66 @@ without following links. Missing directories are created without recursively
 changing existing permissions. Every supplied file overwrites on each deploy
 (`force=true`, `backup=false`, `diff=false`), including supplied database bytes.
 Unsupplied files, retained `.env`, bind data and named/anonymous volumes remain.
+An unsupplied retained `.env` does not contribute project interpolation.
 This is not directory synchronization; omission is not an absence instruction.
 
 ## Procedure
 
 Observe current project membership before effects. Unknown pre-existing IDs refuse
 mutation; labels do not authorize adoption. Copy originals, then create a private
-operation-local Docker config even for anonymous access. Only selected credentials
-are logged in with `docker_login`. Native config and apply share that DOCKER_CONFIG;
-the user's config is never changed. The private directory is removed in `always`.
+operation-local directory outside the captured workspace, at mode `0700`, even for
+anonymous access. Only selected credentials are logged in with `docker_login`.
+Native config and apply share its private Docker config; the user's config is never
+changed. The same owned directory holds the constant environment wrapper and any
+protected or empty env file, never captured inventory.
+
+The caller freezes the operation file Secret read-only. The optional protected file
+must have the exact bound spelling above and resolve to a regular file inside that
+same mount. Confined Kubernetes projection links are allowed; escapes, special
+files and sizes above 262144 bytes refuse before delivery. The procedure copies
+raw bytes at mode `0600`, without parsing, rendering or reserializing them. Track2
+owns serialization and the total Secret/helper budgets. Protected bytes are never
+included in `compose_supplied_files`, `files_written` or public results.
+
+Config and apply use one effective env list: explicit base selections in order,
+or only the authenticated supplied project-base `.env`, followed by the protected
+file last. Explicit selections never augment the automatic default. If neither a
+base nor protected file exists, both receive an explicitly selected owned empty
+mode-0600 file to suppress native automatic `.env` loading. No captured originals
+are rewritten and no interpolation keys are stripped or filtered here. Stack
+review owns its modeled/conflicting control policy separately from ordinary Compose.
+
+The public `../scripts/compose_controlled_environment.sh` is copied from this exact
+official source at mode `0700`. It is only a constant native `env -i` wrapper, not
+an env parser, secret transport or orchestration engine. Its required operational
+inputs are `OPSCTL_COMPOSE_OPERATIONAL_PATH`, `OPSCTL_COMPOSE_DOCKER_CONFIG` and
+`OPSCTL_COMPOSE_DOCKER_EXECUTABLE`. The procedure resolves and observes the installed
+real Docker executable using the operational system PATH, independently of captured
+files, then forwards argv unchanged. The resulting Docker process receives only
+that PATH and private DOCKER_CONFIG, not ambient application, HOME, COMPOSE_* or
+connection variables. File-based application PATH/DOCKER_HOST remain literal values;
+they do not select the process executable, PATH or daemon.
+
+Config passes `--host unix:///var/run/docker.sock`; apply selects the wrapper through
+`docker_cli` and explicitly supplies the same `docker_host`, omitting `cli_context`,
+false `tls`/`validate_certs`, null `tls_hostname`/`ca_path`/`client_cert`/`client_key`,
+and `api_version: auto`. These explicit module parameters prevent its environment
+fallbacks from selecting another connection before the clean wrapper is invoked.
+The context option has no environment fallback; omitting it avoids the module's
+mutually-exclusive host/context key check, which also counts a supplied null key.
+This is the procedure's authorized local daemon, not a remote-connection input.
+Argument-variable expansion is disabled for native argv commands.
+
+Normal terminal paths reobserve the temporary directory's device/inode/owner before
+removing only that allocation, then require observed absence. Cleanup failure or
+uncertainty cannot publish success; an existing native failure reason is preserved,
+otherwise `compose_file_delivery_failed` describes unavailable private-file cleanup.
+No raw native error or private path is added to public results. Interrupted or
+unreachable execution can prevent cleanup/publication and must remain uncertain.
 
 Privately read `docker compose config --format json` from the original project
 base. Compare selected service/count/readiness/completion intent, not full-model
-hashes. Retained Server `.env` or references can cause `compose_configuration_changed`
+hashes. Changed selected references can cause `compose_configuration_changed`
 before apply. Native include/extends/path bases and source platform/image/pull policy
 remain authoritative; no generated overrides or OpsCtl revision labels are injected.
 
