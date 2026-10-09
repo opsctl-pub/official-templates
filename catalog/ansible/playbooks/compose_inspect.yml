@@ -24,6 +24,9 @@
     - name: Observe all native project and recorded resource facts
       ansible.builtin.include_tasks: ../tasks/compose_observe.yml
 
+    - name: Observe exactly admitted nonsecret disk files independently of workloads
+      ansible.builtin.include_tasks: ../tasks/compose_selected_file_observe.yml
+
     - name: Record successful complete read independently of readiness
       ansible.builtin.set_fact:
         compose_outcome: "{{ 'succeeded' if compose_observation_complete else 'unknown' }}"

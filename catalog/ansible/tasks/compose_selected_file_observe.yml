@@ -1,0 +1,112 @@
+---
+- name: Require the bounded original selected-file list before disk access
+  ansible.builtin.assert:
+    that:
+      - nonsecret_files | default([]) | type_debug == 'list'
+      - nonsecret_files | default([]) | length <= 32
+      - nonsecret_files | default([]) | unique(case_sensitive=true) | length == nonsecret_files | default([]) | length
+  no_log: true
+
+- name: Require canonical nonroot selected paths without normalization
+  ansible.builtin.assert:
+    that:
+      - selected_path is string
+      - selected_path | length > 0
+      - not selected_path.startswith('/')
+      - selected_path.split('/') | intersect(['', '.', '..']) | length == 0
+      - "'\\\\' not in selected_path"
+      - selected_path is not search('[\x00-\x1f\x7f-\x9f]')
+      - >-
+        (selected_path | b64encode | length // 4) * 3 -
+        (2 if (selected_path | b64encode).endswith('==') else
+          1 if (selected_path | b64encode).endswith('=') else 0) <= 256
+  loop: "{{ nonsecret_files | default([]) }}"
+  loop_control:
+    loop_var: selected_path
+    label: selected nonsecret file
+  no_log: true
+
+- name: Initialize exact unavailable membership independently of workload readiness
+  ansible.builtin.set_fact:
+    compose_selected_file_observations: >-
+      {%- set rows = namespace(values=[]) -%}
+      {%- for path in nonsecret_files | default([]) -%}
+      {%- set rows.values = rows.values + [{'path': path, 'presence': 'unknown',
+        'size_bytes': none, 'mode': none, 'sha256': none, 'reason': 'read_failed'}] -%}
+      {%- endfor -%}
+      {{ rows.values }}
+    compose_selected_file_observation_complete: false
+  no_log: true
+
+- name: Observe the admitted files without source contents or expected digests
+  when: nonsecret_files | default([]) | length > 0
+  block:
+    - name: Invoke the accepted descriptor-relative file observer
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../scripts/compose_selected_file_observe.py
+          {{ compose_workspace | quote }} {{ nonsecret_files | to_json | quote }}
+        executable: python3
+      changed_when: false
+      register: compose_selected_file_read
+
+    - name: Decode only the helper public metadata envelope
+      ansible.builtin.set_fact:
+        compose_selected_file_helper: "{{ compose_selected_file_read.stdout | from_json }}"
+
+    - name: Require closed result keys and exact ordered membership
+      ansible.builtin.assert:
+        that:
+          - compose_selected_file_helper is mapping
+          - >-
+            compose_selected_file_helper.keys() | sort(case_sensitive=true) ==
+            ['selected_file_observation_complete', 'selected_file_observations']
+          - compose_selected_file_helper.selected_file_observations | type_debug == 'list'
+          - compose_selected_file_helper.selected_file_observations | map(attribute='path') | list == nonsecret_files
+          - compose_selected_file_helper.selected_file_observation_complete | type_debug == 'bool'
+
+    - name: Require every reported row to use only qualified metadata or closed uncertainty
+      ansible.builtin.assert:
+        that:
+          - selected_row is mapping
+          - selected_row.keys() | sort(case_sensitive=true) == ['mode', 'path', 'presence', 'reason', 'sha256', 'size_bytes']
+          - selected_row.presence in ['present', 'absent', 'unknown']
+          - >-
+            (selected_row.presence == 'present' and selected_row.size_bytes | type_debug == 'int'
+              and selected_row.size_bytes >= 0 and selected_row.size_bytes <= 262144
+              and selected_row.mode is string and selected_row.mode | length == 4
+              and selected_row.mode is match('^[0-7]{4}$')
+              and selected_row.sha256 is string and selected_row.sha256 | length == 64
+              and selected_row.sha256 is match('^[a-f0-9]{64}$')
+              and selected_row.reason is none) or
+            (selected_row.presence != 'present' and selected_row.size_bytes is none
+              and selected_row.mode is none and selected_row.sha256 is none and
+              ((selected_row.presence == 'absent' and selected_row.reason == 'missing') or
+               (selected_row.presence == 'unknown' and selected_row.reason in
+                ['unsafe_path', 'not_regular', 'changed_during_collection', 'permission_denied',
+                 'read_failed', 'file_limit_exceeded', 'total_limit_exceeded', 'result_limit_exceeded'])))
+      loop: "{{ compose_selected_file_helper.selected_file_observations }}"
+      loop_control:
+        loop_var: selected_row
+        label: selected file observation
+
+    - name: Require aggregate size and independent coverage agreement
+      ansible.builtin.assert:
+        that:
+          - >-
+            compose_selected_file_helper.selected_file_observations |
+            selectattr('presence', 'equalto', 'present') | map(attribute='size_bytes') | sum <= 1048576
+          - >-
+            compose_selected_file_helper.selected_file_observation_complete ==
+            (compose_selected_file_helper.selected_file_observations |
+             selectattr('presence', 'equalto', 'unknown') | list | length == 0)
+
+    - name: Retain qualified selected facts without changing workload readiness
+      ansible.builtin.set_fact:
+        compose_selected_file_observations: "{{ compose_selected_file_helper.selected_file_observations }}"
+        compose_selected_file_observation_complete: "{{ compose_selected_file_helper.selected_file_observation_complete }}"
+  rescue:
+    - name: Retain initialized exact unknown membership on unavailable or malformed collection
+      ansible.builtin.set_fact:
+        compose_selected_file_observation_complete: false
+  no_log: true

@@ -9,12 +9,25 @@
         'changed': compose_changed | default(false),
         'ready': compose_ready if compose_action != 'remove' and compose_observation_complete | default(false) else none,
         'phase': compose_phase, 'reason': compose_reason | default(none),
-        'files_written': compose_files_written | default([]),
+        'files_written': compose_files_written | default([]) if compose_action == 'deploy' else [],
         'services': compose_observed_services | default([]),
         'unexpected_containers': compose_unexpected_containers | default([]),
         'networks': compose_observed_networks | default([]),
         'volumes': compose_observed_volumes | default([]),
-        'removed_containers': compose_removed_containers | default([])} }}
+        'removed_containers': compose_removed_containers | default([])} |
+        combine({'selected_file_observations': compose_selected_file_observations | default([]),
+          'selected_file_observation_complete': compose_selected_file_observation_complete | default(false)}
+          if compose_action == 'inspect' else {}) }}
+  no_log: true
+
+- name: Serialize the exact public envelope once for its ASCII wire byte bound
+  ansible.builtin.set_fact:
+    compose_serialized_result: "{{ {'compose': compose_result} | to_json(ensure_ascii=true) }}"
+  no_log: true
+
+- name: Retain the actual wire overflow decision
+  ansible.builtin.set_fact:
+    compose_result_overflow: "{{ compose_serialized_result | length > 262144 }}"
   no_log: true
 
 - name: Publish explicit unavailable facts when the complete envelope exceeds its bound
@@ -24,13 +37,34 @@
     compose_result: >-
       {{ compose_result | combine({'outcome': 'unknown', 'observation_complete': false, 'ready': none, 'observed_at': none,
         'reason': 'compose_observation_limit', 'services': [], 'unexpected_containers': [],
-        'networks': [], 'volumes': []}) }}
-  when: "{'compose': compose_result} | to_json | length > 262144"
+        'networks': [], 'volumes': []}) |
+        combine({'selected_file_observations': compose_result_limit_rows,
+          'selected_file_observation_complete': false} if compose_action == 'inspect' else {}) }}
+  vars:
+    compose_result_limit_rows: >-
+      {%- set rows = namespace(values=[]) -%}
+      {%- for row in compose_selected_file_observations | default([]) -%}
+      {%- set rows.values = rows.values + [{'path': row.path, 'presence': 'unknown',
+        'size_bytes': none, 'mode': none, 'sha256': none, 'reason': 'result_limit_exceeded'}] -%}
+      {%- endfor -%}
+      {{ rows.values }}
+  when: compose_result_overflow
+  no_log: true
+
+- name: Serialize the final admitted envelope after any bounded fallback
+  ansible.builtin.set_fact:
+    compose_serialized_result: "{{ {'compose': compose_result} | to_json(ensure_ascii=true) }}"
+  when: compose_result_overflow
+  no_log: true
+
+- name: Require the actual wire representation to fit without dropping membership
+  ansible.builtin.assert:
+    that: compose_serialized_result | length <= 262144
   no_log: true
 
 - name: Publish exactly one final Compose result
   ansible.builtin.debug:
-    msg: "TEMPLATE_OUTPUT_JSON={{ {'compose': compose_result} | to_json }}"
+    msg: "TEMPLATE_OUTPUT_JSON={{ compose_serialized_result }}"
 
 - name: Publish actual final procedure progress
   ansible.builtin.debug:

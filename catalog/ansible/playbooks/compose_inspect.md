@@ -10,7 +10,8 @@ registry credentials, Compose apply, image pull, login, creation or deletion occ
 | Variable | Default | Origin/contract |
 |---|---|---|
 | `compose_project_name` | required | Captured native project name. |
-| `compose_workspace` | required | Backend stable absolute Server/project workspace; not read or removed. |
+| `compose_workspace` | required | Admitted absolute captured-revision workspace; never removed. |
+| `nonsecret_files` | `[]` | At most32 unique canonical nonroot relative paths, each at most256 UTF-8 bytes; admitted nonsecret files only. |
 | `compose_services` | required | Up to 32 captured `{name,replicas,condition,allow_completion:false}`; replicas0-128/total128; condition `running|healthy|completed|scaled_down`. |
 | `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs; missing IDs are observed, not fabricated instances. |
 | `compose_known_networks` | `[]` | Up to 64 `{id,name,origin}`; origin `created|reused|external|unknown`. |
@@ -41,6 +42,32 @@ the detailed neutral instance vocabulary is in [deployment](compose_deploy.md#re
 | `unexpected_containers` | Instances outside captured/selected project membership. |
 | `networks` | `{id,name,origin,presence:present|absent|unknown}`; absent recorded networks retain ID. |
 | `volumes` | `{name,created_at,origin,presence}` including mounted anonymous volumes; timestamp nullable. |
+| `selected_file_observations`, `selected_file_observation_complete` | Ordered selected disk metadata and independent coverage; empty selection is `[]`/false. |
+
+Each selected row is exactly `{path,presence,size_bytes,mode,sha256,reason}`.
+Present rows report nonnegative byte size, four-octal filesystem mode (including
+special bits such as4755), lowercase SHA-256 and null reason. Qualified absence
+reports null metadata and `missing`. Unknown rows retain the path with null
+metadata and one of `unsafe_path`, `not_regular`, `changed_during_collection`,
+`permission_denied`, `read_failed`, `file_limit_exceeded`, `total_limit_exceeded`
+or `result_limit_exceeded`. Only all-qualified nonempty selection grants coverage.
+
+The named public helper traverses held no-follow directory descriptors and hashes
+only the opened regular-file descriptor. Final ancestor/entry/metadata checks
+refuse observed replacement or mutation, not all historical changes. Links never
+escape confinement; permission/read errors never become absence. Per-file reads
+are bounded at262144 bytes, all reads at1048576 bytes. Once that aggregate would
+be exceeded, remaining members stay unknown without more reads. No recursion,
+file contents, expected source digests or writes are involved. Ordinary Ansible
+script staging is not application file delivery.
+
+These facts do not establish loaded configuration, original custody or current
+execution authority. Workload completeness/readiness remains independent.
+Deploy/remove never invoke this collector or report its coverage, even when stale
+internal selected-file facts exist. Final envelopes use the same ASCII-escaped
+JSON for measurement and publication; overflow preserves every selected member
+in order as unknown/result_limit_exceeded while workload facts fall back to the
+existing incomplete result.
 
 All instance fields are `{id,name,replica,image_ref,image_id,image_digest,state,
 health,exit_code,ports,mounts}`. Replica/digest/exit_code may be null; ports contain
@@ -68,7 +95,7 @@ Full result for an exited/nonzero desired service; observation succeeds, readine
 does not. Docker read failure instead returns unknown/null/false:
 
 ```json
-{"compose":{"action":"inspect","project_name":"metrics","project_directory":".","observed_at":"2026-10-06T12:05:00Z","outcome":"succeeded","observation_complete":true,"changed":false,"ready":false,"phase":"compose:complete","reason":null,"files_written":[],"services":[{"name":"prometheus","desired_replicas":1,"condition":"running","state":"failed","instances":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"metrics-prometheus-1","replica":1,"image_ref":"prom/prometheus:v3.5.0","image_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","image_digest":null,"state":"exited","health":"none","exit_code":7,"ports":[],"mounts":[]}]}],"unexpected_containers":[],"networks":[],"volumes":[],"removed_containers":[]}}
+{"compose":{"action":"inspect","project_name":"metrics","project_directory":".","observed_at":"2026-10-06T12:05:00Z","outcome":"succeeded","observation_complete":true,"changed":false,"ready":false,"phase":"compose:complete","reason":null,"files_written":[],"services":[{"name":"prometheus","desired_replicas":1,"condition":"running","state":"failed","instances":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"metrics-prometheus-1","replica":1,"image_ref":"prom/prometheus:v3.5.0","image_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","image_digest":null,"state":"exited","health":"none","exit_code":7,"ports":[],"mounts":[]}]}],"unexpected_containers":[],"networks":[],"volumes":[],"removed_containers":[],"selected_file_observations":[],"selected_file_observation_complete":false}}
 ```
 
 An org override needs only these native inputs/plain facts and normal Ansible
