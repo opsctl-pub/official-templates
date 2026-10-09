@@ -96,7 +96,7 @@
               - item.username is string and item.username is regex('[a-z_][a-z0-9_-]{0,31}', match_type='fullmatch')
               - item.host_public_key is string and item.host_public_key is regex('(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,2}', match_type='fullmatch')
               - item.credential_file is string and item.credential_file is regex('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', match_type='fullmatch')
-              - item.credential_file not in ['inventory.json', 'known_hosts', 'ansible.cfg']
+              - item.credential_file not in ['inventory.json', 'known_hosts', 'ansible.cfg', 'template-inputs.json', 'inputs.json']
           loop: "{{ template_execution.targets }}"
           no_log: true
 

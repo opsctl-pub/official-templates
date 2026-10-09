@@ -38,6 +38,28 @@ platform environment. Public SSH access records are not a private-key selector;
 the organization SSH key is not payload material. The central carrier and this
 selected-target private-key route remain prerequisites, not local substitutes.
 
+The generated `template-inputs.json` is required in `staging_directory`. Its
+canonical UTF-8 JSON envelope is `{"opsctl_inputs": <validated merged application object>}`.
+`input_digest` covers the exact envelope bytes; schemas, defaults and Hook merging
+describe the inner object, and templates read `opsctl_inputs.<name>`. The central
+serializer adds the envelope once. The procedure checks a
+bounded regular file with staged mode `0400` or `0600`, then copies those raw
+bytes to fresh `keys/inputs.json` with admitted UID/GID and mode `0600`.
+Both generated names are reserved against credential collisions. No parameter
+parsing, merging, defaults or plaintext parameter variables occur here.
+The frozen payload argv uses `/usr/bin/ansible-playbook`, the fixed inventory,
+the source entrypoint and `--extra-vars @/run/opsctl-keys/inputs.json`.
+The platform materialization subprocess retains `/usr/local/bin/ansible-playbook`.
+Nesting application connection-like keys does not override inventory bindings;
+it does not prevent authored playbooks changing variables or prove containment.
+
+Available source/key/input material must fit the Operation Secret limits:
+262144 bytes per file, 786432 bytes total and 40 files. Central admission also
+counts its protected-redaction manifest and enforces the admitted SourceBudget;
+the local subtotal is not a complete Secret admission proof. Those central
+delivery/aggregate bindings remain prerequisites. Input copies live under the
+existing owned keys tree and are removed only after observed process closure.
+
 | Admitted limit | Closed range |
 | --- | --- |
 | Runtime deadline | 1..900 seconds |

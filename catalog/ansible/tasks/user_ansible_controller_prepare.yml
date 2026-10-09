@@ -254,8 +254,7 @@
   ansible.builtin.stat:
     path: "{{ template_execution.staging_directory }}/{{ item }}"
     follow: false
-    get_checksum: true
-    checksum_algorithm: sha256
+    get_checksum: false
     get_mime: false
   delegate_to: localhost
   become: false
@@ -273,11 +272,81 @@
   loop: "{{ controller_credentials.results }}"
   no_log: true
 
-- name: Require the existing aggregate private-file budget
+- name: Observe the fixed private input file before hashing
+  ansible.builtin.stat:
+    path: "{{ template_execution.staging_directory }}/template-inputs.json"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  delegate_to: localhost
+  become: false
+  register: controller_input_original
+  no_log: true
+
+- name: Require bounded private regular input material
   ansible.builtin.assert:
     that:
-      - controller_credentials.results | length <= 32
-      - controller_credentials.results | map(attribute='stat.size') | sum <= 1048576
+      - controller_input_original.stat.isreg | default(false)
+      - not controller_input_original.stat.islnk | default(true)
+      - controller_input_original.stat.size > 0 and controller_input_original.stat.size <= 262144
+      - controller_input_original.stat.mode in ['0400', '0600']
+  no_log: true
+
+- name: Require the available combined Operation Secret material budget
+  ansible.builtin.assert:
+    that:
+      - (template_execution.supplied_files | length) + (controller_credentials.results | length) + 1 <= 40
+      - (template_execution.supplied_files | map(attribute='size_bytes') | sum) + (controller_credentials.results | map(attribute='stat.size') | sum) + controller_input_original.stat.size <= 786432
+
+- name: Hash only the bounded frozen private input file
+  ansible.builtin.stat:
+    path: "{{ template_execution.staging_directory }}/template-inputs.json"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  delegate_to: localhost
+  become: false
+  register: controller_input_checksum
+  no_log: true
+
+- name: Require the exact frozen input digest and original identity
+  ansible.builtin.assert:
+    that:
+      - controller_input_checksum.stat.isreg | default(false)
+      - not controller_input_checksum.stat.islnk | default(true)
+      - controller_input_checksum.stat.dev == controller_input_original.stat.dev
+      - controller_input_checksum.stat.inode == controller_input_original.stat.inode
+      - controller_input_checksum.stat.size == controller_input_original.stat.size
+      - controller_input_checksum.stat.mode == controller_input_original.stat.mode
+      - controller_input_checksum.stat.checksum == template_execution.input_digest
+  no_log: true
+
+- name: Hash only bounded frozen credential originals
+  ansible.builtin.stat:
+    path: "{{ template_execution.staging_directory }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  delegate_to: localhost
+  become: false
+  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  register: controller_credential_checksums
+  no_log: true
+
+- name: Require unchanged bounded credential originals before copying
+  ansible.builtin.assert:
+    that:
+      - item.0.item == item.1.item
+      - item.1.stat.isreg | default(false)
+      - not item.1.stat.islnk | default(true)
+      - item.0.stat.dev == item.1.stat.dev
+      - item.0.stat.inode == item.1.stat.inode
+      - item.0.stat.size == item.1.stat.size
+      - item.0.stat.mode == item.1.stat.mode
+  loop: "{{ controller_credentials.results | zip(controller_credential_checksums.results) | list }}"
+  no_log: true
 
 - name: Copy exact centrally selected private bytes into fresh private custody
   ansible.builtin.copy:
@@ -314,7 +383,41 @@
       - item.1.stat.mode == '0600'
       - item.1.stat.uid == template_execution.uid
       - item.1.stat.gid == template_execution.gid
-  loop: "{{ controller_credentials.results | zip(controller_delivered_credentials.results) | list }}"
+  loop: "{{ controller_credential_checksums.results | zip(controller_delivered_credentials.results) | list }}"
+  no_log: true
+
+- name: Copy exact canonical input bytes into fresh private custody
+  ansible.builtin.copy:
+    src: "{{ template_execution.staging_directory }}/template-inputs.json"
+    dest: "{{ controller_record }}/keys/inputs.json"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    mode: '0600'
+    follow: false
+    local_follow: false
+  diff: false
+  no_log: true
+
+- name: Observe delivered inputs without parsing or reconstructing parameters
+  ansible.builtin.stat:
+    path: "{{ controller_record }}/keys/inputs.json"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  register: controller_delivered_input
+  no_log: true
+
+- name: Require exact private input byte mode and ownership parity
+  ansible.builtin.assert:
+    that:
+      - controller_delivered_input.stat.isreg | default(false)
+      - not controller_delivered_input.stat.islnk | default(true)
+      - controller_delivered_input.stat.checksum == template_execution.input_digest
+      - controller_delivered_input.stat.size == controller_input_original.stat.size
+      - controller_delivered_input.stat.mode == '0600'
+      - controller_delivered_input.stat.uid == template_execution.uid
+      - controller_delivered_input.stat.gid == template_execution.gid
   no_log: true
 
 - name: Write immutable inventory using only central target facts
@@ -503,7 +606,7 @@
     security_opts: [no-new-privileges:true]
     healthcheck: {test: [NONE]}
     entrypoint: [/bin/sh, /run/opsctl-gate/start.sh]
-    command: [/run/opsctl-gate, /usr/local/bin/ansible-playbook, --inventory, /run/opsctl-keys/inventory.json, "{{ '/source/' + template_execution.entrypoint }}"]
+    command: [/run/opsctl-gate, /usr/bin/ansible-playbook, --inventory, /run/opsctl-keys/inventory.json, "{{ '/source/' + template_execution.entrypoint }}", --extra-vars, '@/run/opsctl-keys/inputs.json']
     command_handling: correct
     working_dir: /source
     env:
@@ -589,7 +692,7 @@
       - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,size=' + (controller_writable_bytes | string) + ',mode=0755'
       - controller_stopped.container.HostConfig.Tmpfs['/tmp'] == 'rw,nosuid,nodev,size=' + (controller_writable_bytes | string) + ',mode=0700,uid=' + (template_execution.uid | string) + ',gid=' + (template_execution.gid | string)
       - controller_stopped.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
-      - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate', '/usr/local/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json', '/source/' + template_execution.entrypoint]
+      - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate', '/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json', '/source/' + template_execution.entrypoint, '--extra-vars', '@/run/opsctl-keys/inputs.json']
       - controller_stopped.container.Config.WorkingDir == '/source'
       - controller_stopped.container.Config.Healthcheck.Test == ['NONE']
       - controller_stopped.container.HostConfig.LogConfig == {'Type':'json-file', 'Config':{'max-size':'1m', 'max-file':'2'}}

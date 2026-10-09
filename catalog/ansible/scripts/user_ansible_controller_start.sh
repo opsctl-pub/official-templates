@@ -6,11 +6,16 @@ PATH=/usr/bin:/bin
 export PATH
 unset ENV BASH_ENV CDPATH
 
-[ "$#" -ge 3 ] || exit 64
+[ "$#" -eq 7 ] || exit 64
 gate=$1
 shift
 [ "$gate" = /run/opsctl-gate ] || exit 64
-[ "$1" = /usr/local/bin/ansible-playbook ] || exit 64
+[ "$1" = /usr/bin/ansible-playbook ] || exit 64
+[ "$2" = --inventory ] || exit 64
+[ "$3" = /run/opsctl-keys/inventory.json ] || exit 64
+case "$4" in /source/*) ;; *) exit 64 ;; esac
+[ "$5" = --extra-vars ] || exit 64
+[ "$6" = @/run/opsctl-keys/inputs.json ] || exit 64
 [ -d "$gate" ] && [ ! -L "$gate" ] || exit 65
 [ "$(stat -c '%u:%a' "$gate")" = 0:755 ] || exit 65
 

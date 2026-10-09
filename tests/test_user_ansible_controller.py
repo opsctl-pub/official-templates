@@ -5,6 +5,7 @@ modeled, not live enforcement. Tasks/helpers execute; no user payload executes.
 """
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -255,8 +256,9 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'Config': {'Labels': {'opsctl.operation': OPERATION},
                        'User': str(os.getuid()) + ':' + str(os.getgid()),
                        'Entrypoint': ['/bin/sh', '/run/opsctl-gate/start.sh'],
-                       'Cmd': ['/run/opsctl-gate', '/usr/local/bin/ansible-playbook', '--inventory',
-                               '/run/opsctl-keys/inventory.json', '/source/playbook.yml'],
+                       'Cmd': ['/run/opsctl-gate', '/usr/bin/ansible-playbook', '--inventory',
+                               '/run/opsctl-keys/inventory.json', '/source/playbook.yml',
+                               '--extra-vars', '@/run/opsctl-keys/inputs.json'],
                        'WorkingDir': '/source', 'Healthcheck': {'Test': ['NONE']}},
             'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False, 'Memory': 67108864,
                            'MemorySwap': 67108864, 'NanoCpus': 100000000, 'PidsLimit': 8,
@@ -270,7 +272,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'Mounts': [{'Type': 'bind', 'RW': False}] * 3,
             'NetworkSettings': {'Networks': {'selected-network': {}}},
         }
-        for case in ['valid', 'identity-drift', 'policy-failure']:
+        for case in ['valid', 'identity-drift', 'command-drift', 'policy-failure']:
             with self.subTest(case=case):
                 (record / 'gate/release').unlink(missing_ok=True)
                 responses = {'iptables': [{}] * 13, 'systemd-run': [{}],
@@ -285,6 +287,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 container = copy.deepcopy(observed)
                 if case == 'identity-drift':
                     container['Id'] = 'f' * 64
+                if case == 'command-drift':
+                    container['Config']['Cmd'][-1] = '@/arbitrary.json'
                 start = named(self.prepare, 'Start only the trusted gate then install and observe namespace policy under the lock')
                 start['ansible.builtin.shell'] = start['ansible.builtin.shell'].replace(
                     '/proc/', str(self.root / 'proc') + '/').replace('/sys/fs/cgroup', str(self.root / 'cgroup'))
@@ -323,7 +327,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                                  + int(args['shm_size']), 1044480)
                 calls = self.calls()
                 self.assertEqual((record / 'gate/release').exists(), case == 'valid')
-                if case == 'identity-drift':
+                if case in ['identity-drift', 'command-drift']:
                     self.assertFalse(any(call['tool'] in ['systemd-run', 'docker', 'nsenter'] for call in calls))
                     continue
                 timer = next(index for index, call in enumerate(calls) if call['tool'] == 'systemd-run')
@@ -347,7 +351,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                             'PATH=' + str(self.bin) + ':/usr/local/bin:/usr/bin:/bin')
         if name == 'start':
             body = body.replace('/run/opsctl-gate', str(self.root / 'gate'))
-            body = body.replace('/usr/local/bin/ansible-playbook', str(self.bin / 'ansible-playbook'))
+            body = body.replace('/usr/bin/ansible-playbook', str(self.bin / 'ansible-playbook'))
         path = self.root / (name + '.sh')
         path.write_text(body)
         return path
@@ -358,7 +362,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
         self.bind_transport({'ansible-playbook': [{}]})
         helper = self.helper('start')
         command = ['/bin/sh', str(helper), str(gate), str(self.bin / 'ansible-playbook'),
-                   '--inventory', '/run/opsctl-keys/inventory.json', '/source/playbook.yml']
+                   '--inventory', '/run/opsctl-keys/inventory.json', '/source/playbook.yml',
+                   '--extra-vars', '@/run/opsctl-keys/inputs.json']
         for closed in [True, False]:
             with self.subTest(closed=closed):
                 (gate / 'closed').unlink(missing_ok=True)
@@ -378,11 +383,147 @@ class UserAnsibleControllerTests(unittest.TestCase):
                         process.kill()
                         process.communicate()
         payload = [call for call in self.calls() if call['tool'] == 'ansible-playbook']
-        self.assertEqual(payload, [{'tool': 'ansible-playbook', 'argv': command[-3:]}])
-        refused = subprocess.run(command[:3] + ['/bin/sh', 'arbitrary'], env=self.environment(),
-                                 capture_output=True, text=True, timeout=5)
-        self.assertEqual(refused.returncode, 64)
+        self.assertEqual(payload, [{'tool': 'ansible-playbook', 'argv': command[4:]}])
+        for rejected in [command[:3] + ['/bin/sh', 'arbitrary'],
+                         command[:-1] + ['@/arbitrary.json'], command + ['extra']]:
+            with self.subTest(argv=rejected):
+                refused = subprocess.run(rejected, env=self.environment(),
+                                         capture_output=True, text=True, timeout=5)
+                self.assertEqual(refused.returncode, 64)
         self.assertEqual(len([call for call in self.calls() if call['tool'] == 'ansible-playbook']), 1)
+
+    def test_private_input_delivery_refusal_and_owned_cleanup(self):
+        """Raw native file tasks; root observations and terminal daemon facts modeled."""
+        first = next(index for index, task in enumerate(self.prepare)
+                     if task['name'] == 'Observe confined frozen credential files before delivery')
+        last = next(index for index, task in enumerate(self.prepare)
+                    if task['name'] == 'Write immutable inventory using only central target facts')
+        values = {'literal': {'value': '${HOME} {{ literal }} $HOME'},
+                  'unicode': {'value': '\u00e9\u96ea'}, 'empty': {},
+                  'nested': {'values': [None, False, 0, '', {'child': ['x', []]}],
+                             'ansible_host': 'application-host',
+                             'ansible_user': 'application-user',
+                             'ansible_ssh_private_key_file': '/application/key'}}
+        cases = [*values, 'missing', 'digest', 'mode', 'symlink', 'size', 'count', 'total', 'failure']
+        for case in cases:
+            with self.subTest(case=case):
+                root = self.root / case
+                stage = root / 'staged'
+                stage.mkdir(mode=0o700, parents=True)
+                record = root / 'record'
+                (record / 'keys').mkdir(mode=0o700, parents=True)
+                record.chmod(0o700)
+                workspace = root / 'source'
+                workspace.mkdir(mode=0o700)
+                payload = json.dumps({'opsctl_inputs': values.get(case, values['nested'])},
+                                     ensure_ascii=False,
+                                     sort_keys=True, separators=(',', ':')).encode('utf-8')
+                if case == 'size':
+                    payload = b'x' * 262145
+                original = stage / 'template-inputs.json'
+                if case != 'missing':
+                    original.write_bytes(payload)
+                    original.chmod(0o644 if case == 'mode' else 0o600)
+                    if case == 'symlink':
+                        original.rename(stage / 'original')
+                        original.symlink_to('original')
+                originals = {}
+                keys = []
+                for index in range(8 if case == 'count' else 1):
+                    key = stage / ('key-' + str(index))
+                    key.write_bytes(b'private synthetic credential')
+                    key.chmod(0o600)
+                    originals[key] = (key.read_bytes(), 0o600)
+                    keys.append({'credential_file': key.name})
+                sources = []
+                for index in range(32 if case == 'count' else 3 if case == 'total' else 1):
+                    source = stage / ('source-%02d' % index)
+                    source.write_bytes(b'x' * 262144 if case == 'total' else b'synthetic source not executed')
+                    source.chmod(0o600)
+                    originals[source] = (source.read_bytes(), 0o600)
+                    sources.append({'source': source.name, 'path': source.name, 'mode': '0600',
+                                    'size_bytes': source.stat().st_size,
+                                    'sha256': hashlib.sha256(source.read_bytes()).hexdigest()})
+                    (workspace / source.name).write_bytes(source.read_bytes())
+                self.carrier.update(staging_directory=str(stage), supplied_files=sources,
+                                    targets=keys, input_digest='0' * 64 if case == 'digest'
+                                    else hashlib.sha256(payload).hexdigest())
+                result, facts = self.run_tasks(copy.deepcopy(self.prepare[first:last]), {
+                    'controller_record': str(record)}, exports=['controller_delivered_input'])
+                valid = case in values or case == 'failure'
+                self.assertEqual(result.returncode, 0 if valid else 2, result.stdout + result.stderr)
+                delivered = record / 'keys/inputs.json'
+                if valid:
+                    self.assertEqual(delivered.read_bytes(), payload)
+                    self.assertEqual(stat.S_IMODE(delivered.stat().st_mode), 0o600)
+                    self.assertEqual((delivered.stat().st_uid, delivered.stat().st_gid),
+                                     (os.getuid(), os.getgid()))
+                    self.assertEqual(facts['controller_delivered_input']['stat']['checksum'],
+                                     self.carrier['input_digest'])
+                    self.assertNotIn(payload.decode('utf-8'), result.stdout + result.stderr)
+                else:
+                    self.assertFalse(delivered.exists())
+                    self.assertEqual(list((record / 'keys').iterdir()), [])
+                if case == 'failure':
+                    gate = self.root / 'gate'
+                    gate.mkdir(mode=0o755)
+                    (gate / 'release').touch(mode=0o444)
+                    self.bind_transport({'ansible-playbook': [{'rc': 37}]})
+                    helper = self.helper('start')
+                    command = ['/bin/sh', str(helper), str(gate), str(self.bin / 'ansible-playbook'),
+                               '--inventory', '/run/opsctl-keys/inventory.json', '/source/playbook.yml',
+                               '--extra-vars', '@/run/opsctl-keys/inputs.json']
+                    terminal = subprocess.run(command, env=self.environment(),
+                                              capture_output=True, text=True, timeout=5)
+                    self.assertEqual(terminal.returncode, 37, terminal.stdout + terminal.stderr)
+                    (self.bin / 'ansible-playbook').unlink()
+                    closure = self.private_cleanup()
+                    block = closure['block']
+                    observed = next(index for index, task in enumerate(block)
+                                    if task['name'].startswith('Refuse private-record'))
+                    block.insert(observed, {'ansible.builtin.set_fact': {
+                        'controller_record_before_remove':
+                            "{{ {'stat': controller_record_before_remove.stat | combine({'uid': 0})} }}"}})
+                    marker = next(task for task in block
+                                  if task.get('name', '').startswith('Retain a closed'))
+                    marker['ansible.builtin.copy'].update(owner=os.getuid(), group=os.getgid())
+                    result, facts = self.run_tasks([
+                        named(self.play['tasks'][2]['block'], 'Retain actual exit status independently of logs'),
+                        closure], {'controller_record': str(record), 'controller_record_owned': True,
+                                   'controller_record_identity': self.source_identity(record),
+                                   'controller_source_workspace': str(workspace),
+                                   'controller_source_identity': self.source_identity(workspace),
+                                   'controller_terminal': {'container': {'State': {'ExitCode': terminal.returncode}}},
+                                   'controller_original_reason': 'execution_failed'},
+                        exports=['controller_material_cleanup', 'controller_process_closed',
+                                 'controller_reason', 'controller_original_reason', 'controller_exit_code'])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(facts['controller_exit_code'], 37)
+                    self.assertEqual(facts['controller_reason'], 'execution_failed')
+                    self.assertEqual(facts['controller_original_reason'], 'execution_failed')
+                    self.assertTrue(facts['controller_process_closed'])
+                    self.assertEqual(facts['controller_material_cleanup'], 'removed')
+                    self.assertFalse(delivered.exists())
+                    self.assertFalse(workspace.exists())
+                for path, (data, mode) in originals.items():
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                if case != 'missing':
+                    self.assertEqual(original.read_bytes(), payload)
+                self.assertNotIn('private synthetic credential', result.stdout + result.stderr)
+        self.carrier.update(controller_server_id='00000000-0000-4000-8000-000000000002')
+        for reserved in ['template-inputs.json', 'inputs.json']:
+            with self.subTest(credential=reserved):
+                self.carrier['targets'] = [{
+                    'server_id': '00000000-0000-4000-8000-000000000003',
+                    'ssh_access_key_id': '00000000-0000-4000-8000-000000000004',
+                    'credential_secret_id': '00000000-0000-4000-8000-000000000005',
+                    'credential_version': 1, 'port': 22, 'address': '192.0.2.3',
+                    'username': 'opsctl', 'host_public_key': 'ssh-ed25519 AAAA',
+                    'credential_file': reserved}]
+                result, _ = self.run_tasks([
+                    named(self.play['tasks'][2]['block'], 'Require exact safe target facts from central preparation')])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_close_decisions_distinguish_deadline_late_exit_exact_absence_and_uncertainty(self):
         stopped = CONTAINER + ' ' + OPERATION + ' false 0\n'
