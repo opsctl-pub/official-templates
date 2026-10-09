@@ -1,0 +1,426 @@
+---
+- name: Deliver a frozen user Template file set without executing it
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    template_delivery_controls: "[\\x00-\\x1f\\x7f]"
+    template_delivery_backslash: "\\"
+  tasks:
+    - name: Initialize invocation-local delivery facts
+      ansible.builtin.set_fact:
+        template_delivery_outcome: refused
+        template_delivery_reason: invalid_inputs
+        template_delivery_original_reason: null
+        template_delivery_workspace: null
+        template_delivery_owned_identity: null
+        template_delivery_entrypoint: null
+        template_delivery_files: []
+        template_delivery_cleanup: not_allocated
+      no_log: true
+
+    - name: Publish file-delivery progress
+      ansible.builtin.debug:
+        msg: 'OPERATION_STEP={"name":"template:files","status":"running","metadata":{"display_name":"Deliver Template files"}}'
+
+    - name: Validate observe and deliver the exact supplied bytes
+      block:
+        - name: Require the public input shapes before inspecting their values
+          ansible.builtin.assert:
+            that:
+              - template_source_directory is defined
+              - template_source_directory is string
+              - template_supplied_files is defined
+              - template_supplied_files | type_debug == 'list'
+              - template_supplied_files | length >= 1
+              - template_supplied_files | length <= 32
+              - template_entrypoint is defined
+              - template_entrypoint is string
+
+        - name: Require an absolute unambiguous staged directory
+          ansible.builtin.assert:
+            that:
+              - template_source_directory.startswith('/')
+              - template_source_directory == '/' or '' not in template_source_directory.split('/')[1:]
+              - "'.' not in template_source_directory.split('/')"
+              - "'..' not in template_source_directory.split('/')"
+              - template_source_directory is not search(template_delivery_controls)
+              - template_delivery_backslash not in template_source_directory
+
+        - name: Require exactly the documented file record keys
+          ansible.builtin.assert:
+            that:
+              - supplied_file is mapping
+              - supplied_file.keys() | list | sort(case_sensitive=true) == ['mode', 'path', 'sha256', 'size_bytes', 'source']
+              - supplied_file.path is string
+              - supplied_file.source is string
+              - supplied_file.mode is string
+              - supplied_file.size_bytes is integer
+              - supplied_file.size_bytes is not boolean
+              - supplied_file.sha256 is string
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: supplied file
+
+        - name: Require canonical paths strict modes and bounded file metadata
+          ansible.builtin.assert:
+            that:
+              - supplied_file.path | length > 0
+              - (supplied_file.path | b64encode | regex_replace('=+$', '') | length) * 3 // 4 <= 256
+              - not supplied_file.path.startswith('/')
+              - "'' not in supplied_file.path.split('/')"
+              - "'.' not in supplied_file.path.split('/')"
+              - "'..' not in supplied_file.path.split('/')"
+              - supplied_file.path is not search(template_delivery_controls)
+              - template_delivery_backslash not in supplied_file.path
+              - "':' not in supplied_file.path"
+              - supplied_file.source is regex('source-[0-9]{2}', match_type='fullmatch')
+              - supplied_file.mode in ['0600', '0700']
+              - supplied_file.size_bytes >= 0 and supplied_file.size_bytes <= 262144
+              - supplied_file.sha256 is regex('[0-9a-f]{64}', match_type='fullmatch')
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: supplied file
+
+        - name: Require literal unique paths and source keys within the aggregate budget
+          ansible.builtin.assert:
+            that:
+              - template_supplied_files | map(attribute='path') | unique(case_sensitive=true) | length == template_supplied_files | length
+              - template_supplied_files | map(attribute='source') | unique(case_sensitive=true) | length == template_supplied_files | length
+              - template_supplied_files | map(attribute='size_bytes') | sum <= 1048576
+              - template_entrypoint in (template_supplied_files | map(attribute='path') | list)
+
+        - name: Collect only required relative parents and staged directory ancestors
+          ansible.builtin.set_fact:
+            template_delivery_parents: >-
+              {%- set parents = namespace(values=[]) -%}
+              {%- for supplied in template_supplied_files -%}
+              {%- set path = namespace(value='') -%}
+              {%- for part in supplied.path.split('/')[:-1] -%}
+              {%- set path.value = (path.value + '/' if path.value else '') + part -%}
+              {%- set parents.values = parents.values + [path.value] -%}
+              {%- endfor -%}
+              {%- endfor -%}
+              {{ parents.values | unique(case_sensitive=true) | list }}
+            template_delivery_source_ancestors: >-
+              {%- set paths = namespace(values=['/'], path='') -%}
+              {%- for part in template_source_directory.split('/') | reject('equalto', '') -%}
+              {%- set paths.path = paths.path + '/' + part -%}
+              {%- set paths.values = paths.values + [paths.path] -%}
+              {%- endfor -%}
+              {{ paths.values }}
+
+        - name: Refuse file and ancestor conflicts before target changes
+          ansible.builtin.assert:
+            that:
+              - template_delivery_parents | intersect(template_supplied_files | map(attribute='path') | list) | length == 0
+
+        - name: Retain the validated relative entry point and select source refusal
+          ansible.builtin.set_fact:
+            template_delivery_entrypoint: "{{ template_entrypoint }}"
+            template_delivery_reason: source_unavailable
+
+        - name: Observe each staged directory ancestor without following links
+          ansible.builtin.stat:
+            path: "{{ source_ancestor }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          delegate_to: localhost
+          become: false
+          loop: "{{ template_delivery_source_ancestors }}"
+          loop_control:
+            loop_var: source_ancestor
+            label: staged directory
+          register: template_delivery_source_directory_stats
+
+        - name: Require actual controller directories without symlinks
+          ansible.builtin.assert:
+            that:
+              - source_directory.stat.exists
+              - source_directory.stat.isdir | default(false)
+              - not source_directory.stat.islnk | default(true)
+          loop: "{{ template_delivery_source_directory_stats.results }}"
+          loop_control:
+            loop_var: source_directory
+            label: staged directory
+
+        - name: Observe original file metadata without reading unbounded contents
+          ansible.builtin.stat:
+            path: "{{ template_source_directory }}/{{ supplied_file.source }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          delegate_to: localhost
+          become: false
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: staged file
+          register: template_delivery_source_stats
+
+        - name: Refuse missing symlink or nonregular staged files
+          ansible.builtin.assert:
+            that:
+              - source_file.stat.exists
+              - source_file.stat.isreg | default(false)
+              - not source_file.stat.islnk | default(true)
+          loop: "{{ template_delivery_source_stats.results }}"
+          loop_control:
+            loop_var: source_file
+            label: staged file
+
+        - name: Select source-integrity refusal
+          ansible.builtin.set_fact:
+            template_delivery_reason: source_mismatch
+
+        - name: Require the frozen bounded source size before hashing
+          ansible.builtin.assert:
+            that:
+              - source_file.stat.size == source_file.supplied_file.size_bytes
+          loop: "{{ template_delivery_source_stats.results }}"
+          loop_control:
+            loop_var: source_file
+            label: staged file
+
+        - name: Observe SHA256 only for qualified bounded regular sources
+          ansible.builtin.stat:
+            path: "{{ template_source_directory }}/{{ supplied_file.source }}"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+            get_mime: false
+          delegate_to: localhost
+          become: false
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: staged file
+          register: template_delivery_source_checksums
+
+        - name: Require unchanged source type size and SHA256
+          ansible.builtin.assert:
+            that:
+              - source_file.stat.isreg | default(false)
+              - not source_file.stat.islnk | default(true)
+              - source_file.stat.size == source_file.supplied_file.size_bytes
+              - source_file.stat.checksum | default('') == source_file.supplied_file.sha256
+          loop: "{{ template_delivery_source_checksums.results }}"
+          loop_control:
+            loop_var: source_file
+            label: staged file
+
+        - name: Select target delivery failure
+          ansible.builtin.set_fact:
+            template_delivery_reason: delivery_failed
+
+        - name: Allocate a fresh private workspace as the authorized target user
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: opsctl-template-
+          register: template_delivery_allocation
+
+        - name: Observe the allocated workspace identity before any file delivery
+          ansible.builtin.stat:
+            path: "{{ template_delivery_allocation.path }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: template_delivery_allocation_stat
+
+        - name: Require the private native directory allocation
+          ansible.builtin.assert:
+            that:
+              - template_delivery_allocation_stat.stat.isdir | default(false)
+              - not template_delivery_allocation_stat.stat.islnk | default(true)
+              - template_delivery_allocation_stat.stat.mode == '0700'
+
+        - name: Retain invocation-owned workspace identity
+          ansible.builtin.set_fact:
+            template_delivery_owned_identity: "{{ template_delivery_allocation_stat.stat }}"
+            template_delivery_workspace: "{{ template_delivery_allocation.path }}"
+            template_delivery_cleanup: not_required
+
+        - name: Create only confined required parents with private permissions
+          ansible.builtin.file:
+            path: "{{ template_delivery_workspace }}/{{ relative_parent }}"
+            state: directory
+            mode: '0700'
+          loop: "{{ template_delivery_parents }}"
+          loop_control:
+            loop_var: relative_parent
+            label: required parent
+
+        - name: Copy frozen original bytes without template rendering or payload execution
+          ansible.builtin.copy:
+            src: "{{ template_source_directory }}/{{ supplied_file.source }}"
+            dest: "{{ template_delivery_workspace }}/{{ supplied_file.path }}"
+            mode: "{{ supplied_file.mode }}"
+            follow: false
+            local_follow: false
+            force: false
+            backup: false
+          diff: false
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: supplied file
+
+        - name: Select delivered-file verification failure
+          ansible.builtin.set_fact:
+            template_delivery_reason: verification_failed
+
+        - name: Reobserve workspace identity after delivery
+          ansible.builtin.stat:
+            path: "{{ template_delivery_workspace }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: template_delivery_verified_workspace
+
+        - name: Require the same private owned workspace before publishing files
+          ansible.builtin.assert:
+            that:
+              - template_delivery_verified_workspace.stat.isdir | default(false)
+              - not template_delivery_verified_workspace.stat.islnk | default(true)
+              - template_delivery_verified_workspace.stat.mode == '0700'
+              - template_delivery_verified_workspace.stat.dev == template_delivery_owned_identity.dev
+              - template_delivery_verified_workspace.stat.inode == template_delivery_owned_identity.inode
+              - template_delivery_verified_workspace.stat.uid == template_delivery_owned_identity.uid
+
+        - name: Observe every delivered file without following links
+          ansible.builtin.stat:
+            path: "{{ template_delivery_workspace }}/{{ supplied_file.path }}"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+            get_mime: false
+          loop: "{{ template_supplied_files }}"
+          loop_control:
+            loop_var: supplied_file
+            label: delivered file
+          register: template_delivery_target_stats
+
+        - name: Require exact delivered regular-file bytes and modes
+          ansible.builtin.assert:
+            that:
+              - delivered.stat.isreg | default(false)
+              - not delivered.stat.islnk | default(true)
+              - delivered.stat.size == delivered.supplied_file.size_bytes
+              - delivered.stat.mode == delivered.supplied_file.mode
+              - delivered.stat.checksum | default('') == delivered.supplied_file.sha256
+          loop: "{{ template_delivery_target_stats.results }}"
+          loop_control:
+            loop_var: delivered
+            label: delivered file
+
+        - name: Record verified ordered file metadata without staged keys or contents
+          ansible.builtin.set_fact:
+            template_delivery_files: >-
+              {%- set files = namespace(values=[]) -%}
+              {%- for result in template_delivery_target_stats.results -%}
+              {%- set files.values = files.values + [{'path': result.supplied_file.path,
+                'mode': result.stat.mode, 'size_bytes': result.stat.size,
+                'sha256': result.stat.checksum}] -%}
+              {%- endfor -%}
+              {{ files.values }}
+            template_delivery_outcome: delivered
+            template_delivery_reason: delivered
+      rescue:
+        - name: Preserve the original finite failure reason
+          ansible.builtin.set_fact:
+            template_delivery_original_reason: "{{ template_delivery_reason }}"
+            template_delivery_files: []
+
+        - name: Clean only the exact allocated workspace and verify absence
+          when: template_delivery_allocation.path is defined
+          block:
+            - name: Reobserve allocated workspace before removal
+              ansible.builtin.stat:
+                path: "{{ template_delivery_allocation.path }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              register: template_delivery_cleanup_stat
+
+            - name: Refuse cleanup if the directory identity cannot be qualified
+              ansible.builtin.assert:
+                that:
+                  - template_delivery_owned_identity is mapping
+                  - template_delivery_cleanup_stat.stat.isdir | default(false)
+                  - not template_delivery_cleanup_stat.stat.islnk | default(true)
+                  - template_delivery_cleanup_stat.stat.dev == template_delivery_owned_identity.dev
+                  - template_delivery_cleanup_stat.stat.inode == template_delivery_owned_identity.inode
+                  - template_delivery_cleanup_stat.stat.uid == template_delivery_owned_identity.uid
+              when: template_delivery_cleanup_stat.stat.exists
+
+            - name: Remove only the revalidated invocation workspace
+              ansible.builtin.file:
+                path: "{{ template_delivery_allocation.path }}"
+                state: absent
+              when: template_delivery_cleanup_stat.stat.exists
+
+            - name: Observe owned-workspace absence
+              ansible.builtin.stat:
+                path: "{{ template_delivery_allocation.path }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              register: template_delivery_cleanup_after
+
+            - name: Require observed cleanup completion
+              ansible.builtin.assert:
+                that: not template_delivery_cleanup_after.stat.exists
+
+            - name: Record confirmed workspace removal
+              ansible.builtin.set_fact:
+                template_delivery_workspace: null
+                template_delivery_cleanup: removed
+          rescue:
+            - name: Observe retained workspace without assuming a failed cleanup left it present
+              ansible.builtin.stat:
+                path: "{{ template_delivery_allocation.path }}"
+                follow: false
+                get_checksum: false
+                get_mime: false
+              register: template_delivery_retained_workspace
+              failed_when: false
+
+            - name: Report cleanup uncertainty without discarding the original failure
+              ansible.builtin.set_fact:
+                template_delivery_reason: cleanup_failed
+                template_delivery_cleanup: failed
+                template_delivery_workspace: >-
+                  {{ template_delivery_allocation.path if
+                    template_delivery_owned_identity is mapping and
+                    template_delivery_retained_workspace.stat.isdir | default(false) and
+                    not template_delivery_retained_workspace.stat.islnk | default(true) and
+                    template_delivery_retained_workspace.stat.dev | default(none) == template_delivery_owned_identity.dev and
+                    template_delivery_retained_workspace.stat.inode | default(none) == template_delivery_owned_identity.inode and
+                    template_delivery_retained_workspace.stat.uid | default(none) == template_delivery_owned_identity.uid
+                    else none }}
+      no_log: true
+
+    - name: Publish terminal file-delivery progress
+      ansible.builtin.debug:
+        msg: >-
+          OPERATION_STEP={{ {'name': 'template:files',
+            'status': 'completed' if template_delivery_outcome == 'delivered' else 'failed',
+            'metadata': {'display_name': 'Deliver Template files',
+              'reason': template_delivery_reason}} | to_json }}
+
+    - name: Publish exactly one plain file-delivery result
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'template_file_delivery': {
+            'outcome': template_delivery_outcome, 'reason': template_delivery_reason,
+            'original_reason': template_delivery_original_reason,
+            'cleanup': template_delivery_cleanup, 'workspace': template_delivery_workspace,
+            'entrypoint': template_delivery_entrypoint, 'files': template_delivery_files}} | to_json }}
+
+    - name: Fail refused delivery without printing raw module errors or source contents
+      ansible.builtin.fail:
+        msg: "Template file delivery refused: {{ template_delivery_reason }}"
+      when: template_delivery_outcome != 'delivered'
