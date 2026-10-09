@@ -1,0 +1,213 @@
+# User Ansible Controller
+
+Preparation contract only. No executable procedure, admitted user-run route or
+selected-target private-key delivery is implemented by this document. The platform
+Runner may run only the accepted official control procedure; user Ansible,
+controller-side plugins, lookups and local tasks belong inside the container on
+the separately authorized user-owned controller Server.
+
+## Inputs And Authority
+
+`template_execution` names the proposed frozen internal input concept, not a new
+public JSON schema. Its exact typed carrier belongs to central admission. It must
+bind the Operation UUID, controller Server UUID, source/input SHA-256 digests,
+frozen file manifest and member entrypoint to one qualified image digest,
+nonroot numeric UID/GID and fixed `ansible-playbook` interpreter/argv. Source
+bounds and literal byte delivery remain owned by `materialize_template_files`.
+No user shell expression, address, environment, interpreter or executable may
+replace these bindings.
+
+The ordered 1..32 targets require exact Server UUIDs, current backend-resolved
+IPv4/SSH port/login, frozen host public keys and authorized private regular-file
+bindings with exact credential versions. Reject duplicates and controller/self
+targets before start. Content visibility, accepted template publication and an
+exact digest do not grant target access. Central admission rechecks actor, scope,
+controller and every target before delivery/execution.
+
+Private material comes through the same immutable Operation Secret and protected
+file custody, never public arguments, plaintext credential variables or inherited
+platform environment. Public SSH access records are not a private-key selector;
+the organization SSH key is not payload material. The central carrier and this
+selected-target private-key route remain prerequisites, not local substitutes.
+
+| Admitted limit | Closed range |
+| --- | --- |
+| Runtime deadline | 1..900 seconds |
+| CPU | 100..1000 millicores |
+| Memory | 64..512 MiB |
+| Aggregate writable tmpfs, including shared memory | 1..64 MiB |
+| PIDs | 1..128 |
+| Returned logs | 1..65536 UTF-8 bytes |
+
+Reject extra/invalid inputs and unavailable prerequisites rather than silently
+falling back. Existing SSH-access/baseline ordering precedes the procedure; do not
+reprovision an existing controller or install dependencies from user content.
+
+## Native Profile And Mapping
+
+The first profile requires managed Linux, systemd, rootful Docker using its
+iptables backend and functioning CPU/memory/swap/PID cgroup enforcement. A
+responsive daemon or completed Docker baseline alone does not establish this
+profile. Verify the required Engine API/options, controller tools and effective
+configuration before any payload start. Unsupported profiles refuse.
+
+The source mapping below is against Ansible 2.19.3/community.docker 5.3.0. It is
+installed-source evidence, not a remote behavior or containment qualification.
+
+| Phase | Native owner and explicit binding |
+| --- | --- |
+| Input/source checks | `ansible.builtin.assert`, no-follow `stat` and the accepted materialization validation; preserve ordered manifest, byte/mode/checksum and entrypoint equality. |
+| Fresh delivery | Native `tempfile`, `copy` and `file`; chown only newly allocated owned copies to the qualified numeric UID/GID. Retain directories `0700`, ordinary files `0600`, executable files `0700`; originals remain unchanged. |
+| Image inspection | `community.docker.docker_image_info`; require the qualified immutable image already prepared. Refuse nonempty `Config.Volumes`; inspect image environment/interpreter and override entrypoint plus healthcheck. No registry access from the restricted payload. |
+| Network creation | `community.docker.docker_network`: `driver: bridge`, `enable_ipv6: false`, explicit operation labels and qualified `driver_options`/IPAM. Record the full network ID and actual bridge interface. `internal` is not a destination allowlist. |
+| Container creation | `community.docker.docker_container`: `state: present`, `pull: never`, `detach: true`, `auto_remove: false`, `restart_policy: no`, `output_logs: false`, exact image/labels and numeric `user: UID:GID`. Record full container ID before start. |
+| Process binding | Fixed trusted public `user_ansible_controller_start.sh` entrypoint with frozen list argv, `command_handling: correct`, `healthcheck.test: [NONE]` and a root-controlled read-only gate directory. After release, exec only the exact Ansible argv using immutable inventory/known-hosts and exact private files. No inherited platform inventory/plugins, token, service-account, socket or cloud environment. |
+| Filesystem | `read_only: true`; each source/key bind uses `mounts` with explicit `type: bind`, `read_only: true`, `propagation: rprivate`. No volumes, devices or caller-selected host mounts. Fresh bind sources must have no nested mounts or unqualified UID remapping. |
+| Writable storage | Explicit bounded `tmpfs` entries and `shm_size`; sum every writable tmpfs allocation, including `/dev/shm`, within the admitted budget. Do not inherit Docker's default 64 MiB shm or image volumes. Observe daemon-generated special mounts too; no unaccounted writable disk mount is admitted. |
+| Resource/security limits | `cpus = millicores / 1000`; explicit byte strings for `memory` and equal `memory_swap` (no additional swap); positive `pids_limit`; `cap_drop: [ALL]`, no added capabilities, `privileged: false`, `security_opts: [no-new-privileges:true]`. No host PID/IPC/network namespace or published ports. |
+| Attachment | Explicit owned network only, `networks_cli_compatible: true`, `comparisons.networks: strict`, no links/extra hosts/unrelated attachment. Revalidate actual endpoints before start. |
+| Connection | Explicit controller-local Docker socket, API version and TLS choices through the installed module connection options. Ambient `DOCKER_HOST`/TLS/API variables must not select another daemon. These are official control bindings, never payload environment. |
+| Deadline/start/release | Root-controlled identity record and systemd deadline installed/verified before exact-ID trusted-gate start. Revalidate full ID/labels/PID namespace, install/observe namespace policy, then release the owned marker under the same deadline/start lock. Do not reuse `state: started` as redispatch/recreation authority. |
+| Observation | `docker_container_info.name` accepts the full recorded ID. Privately inspect identity/labels/configuration and `State`; publish only allowed facts. Raw inspect includes environment and must not become output. |
+| Termination/removal | Trusted close helper targets only revalidated full ID/labels, bounded stop then kill/readback. Remove only after stopped/PID-zero or exact absence; never use a name collision to adopt, recreate or delete another invocation. |
+
+The installed module's `state: present`, `started` and `stopped` can create or
+recreate containers. Invocation records therefore gate those calls; a missing
+recorded container is observation, not permission to launch again. Native argv
+tasks carrying saved values require `expand_argument_vars: false`.
+
+Existing delivery owns files as its SSH user. Read-only binds do not make `0600`
+files readable by another UID. Qualify effective host/container UID mapping;
+rootful Docker alone does not prove user-namespace remapping is disabled. Never
+weaken private modes or chown an original/Secret projection. The module supports
+`mounts.tmpfs_options` only with API >=1.46; the baseline does not pin that API.
+Use only observed-supported options or refuse, not an implicit version fallback.
+
+## Destination-Only Policy
+
+Before trusted-gate start, install and verify operation-owned rules ahead of permissive
+forwarding rules: exact selected IPv4/TCP-SSH destinations and their response
+flows, then rejection for other traffic on the owned bridge. Do not use a global
+established/related allowance to bypass the exact-target boundary. Reject
+bridge-to-controller traffic separately in INPUT, including every local controller
+address. No public ingress, IPv6 or additional namespace attachment is admitted.
+Remove only exact recorded rules/chains after process closure; preserve unrelated
+rule order, policies, networks and management SSH access.
+
+[Docker's iptables documentation](https://docs.docker.com/engine/network/firewall-iptables/)
+places forwarded policy in DOCKER-USER and notes DNS rules inside the container
+network namespace. Neither `docker_network` nor `docker_container` has a
+destination ACL or an option disabling the embedded resolver. Empty resolv.conf,
+`dns_servers` selection and forwarded UDP/53 denial alone do not prove no DNS.
+The decided mechanism starts only the fixed trusted public startup gate after
+the independent deadline is armed. The gate waits for one owned release marker;
+before release it never imports or reads user source/configuration or reads or
+selects credentials. It cannot run the payload to establish a namespace.
+
+Host preparation revalidates the recorded full container ID, operation labels,
+current PID and its network namespace before native `nsenter`/iptables policy
+installation and observation. Operation-owned namespace OUTPUT rules reject
+embedded DNS TCP/UDP and upstream/IPv6 bypass before marker release; forwarded
+and controller INPUT rules remain separately required. The admitted host profile
+requires these tools and verified enforcement. No network capability is given
+to the gate or payload. Failed or changed identity/policy refuses release.
+
+The root-controlled gate directory is mounted read-only in the container; the
+release marker is not user writable. Release occurs under the same lock as
+deadline/start/cleanup, only after policy verification. The gate then execs only
+the frozen Ansible argv. This is neither another consent/dispatch protocol nor
+a payload-selected namespace owner. Native modules alone still lack these
+controls, but the startup placement decision is resolved; implementation and
+live embedded-resolver/IPv6 containment remain unqualified.
+
+## Independent Deadline And Closure
+
+Create the container stopped, record full ID/operation labels in a root-controlled
+record, then install and verify the operation-owned systemd deadline. It must
+survive Runner/SSH loss. API response timeout, Ansible async expiry and
+`stop_timeout` do not schedule daemon-owned payload termination.
+
+Start only the trusted gate after deadline verification, not direct Ansible.
+Revalidate its exact identity/PID namespace and observe host-installed namespace
+policy before release. Deadline or lost preparation leaves user content
+unstarted and closes the exact container; no re-entry renews the invocation.
+
+The trusted public close helper supplies identity-checked native stop/kill/readback
+only. Gate start/release, normal completion and deadline closure serialize on the same
+root-controlled operation lock/record. A deadline that wins before start marks
+the invocation closed; start then refuses. A started invocation cannot renew its
+deadline, recreate missing payload or dispatch another container on re-entry.
+Record the timeout decision separately from exit status; do not infer timeout
+from a nonzero exit or loss of SSH alone.
+
+Normal completion may disable the exact owned deadline only after observing
+process closure while holding that same serialization boundary. Stop the exact
+timer and settle any already-running deadline service under the lock before
+removing its identity record. Never wait on a service that needs the held lock.
+If process state is unobservable, retain keys/workspace/policy and report unknown
+closure; process death is not inferred from expired central timeouts.
+
+After stopped/PID-zero or exact absence: collect bounded terminal observations,
+remove the exact owned container and observe absence, then remove fresh private
+copies/workspace, the exact network/rules and deadline artifacts. Retain original
+failure plus any closure failure independently. Reboot, daemon loss and concurrent
+cleanup still need connected proof; systemd installation alone is not that proof.
+
+## Logs And Plain Results
+
+Keep exit observation independent of output collection. `detach: false` calls
+the installed module's log reader with `tail: all` and stores raw `Output` even
+when `output_logs: false`. Auto-removal also loses terminal inspection. Both are
+excluded from this profile.
+
+Select an explicit qualified `log_driver` plus finite `log_options.max-size` and
+`max-file` before start to bound daemon retention separately. Driver rotation is
+not an exact aggregate byte quota or the returned-log limit; a hard storage quota
+cannot be claimed from these options. An independently bounded native reader
+must limit input before Ansible registration, preserve observed stdout/stderr
+frame order with TTY disabled, and return valid UTF-8 within the selected budget,
+including any truncation marker. Do not read all output and truncate afterward,
+perform an unbounded slurp or publish raw module errors/inspect.
+
+The pinned modules expose no byte-capped log read. Collection requires a narrow
+native bounded-stream binding within the existing control closure, not another
+executor. Missing bounded collection/retention support refuses before start.
+User output still follows the existing protected-value redactor; truncation and
+redaction do not promise that arbitrary payload output contains no secrets.
+
+`OPERATION_STEP` reports preparation, execution and cleanup progress.
+`TEMPLATE_OUTPUT_JSON` carries the proposed plain `template_execution_result`:
+operation/controller identity, finite outcome/reason, nullable exact container
+identity, observed exit/timeout, process closure, private-material/workspace,
+network/policy and deadline cleanup states, plus bounded logs/truncation. These
+are semantic requirements, not invented field spellings for the pending schema.
+
+Refusal before start, observed zero/nonzero exit, deadline termination and unknown
+execution are distinct outcomes. Closure states distinguish not allocated,
+retained, observed removed and failed/unknown. Cleanup failure never replaces the
+original execution reason or makes resource release successful. A retained ID is
+evidence to settle, not redispatch or unrelated-destruction authority. Existing
+Run/stage owners attach these facts to the actual executing Job; no private
+mirrored API proof protocol is required.
+
+## Delivery Boundary
+
+The finite future native closure is adjacent `user_ansible_controller.yml`,
+`../tasks/user_ansible_controller_prepare.yml`,
+`../tasks/user_ansible_controller_cleanup.yml`,
+`../scripts/user_ansible_controller_close.sh` and
+`../scripts/user_ansible_controller_start.sh`. None is delivered here. Central
+admission/private-key delivery precedes executable consumer wiring. Native
+pre-release DNS enforcement through the decided trusted gate, serialized host deadline, bounded stream collection,
+effective resource/mount enforcement and remote loss/recovery require actual
+demonstration, then proportionate tests and separately authorized live acceptance.
+
+Installed evidence: runner image
+`sha256:1e42eba472994ebd5df283d3b196ba9beac5324324ace59e889928f24a654adb`;
+collection `plugins/modules/docker_container.py`, `docker_container_info.py`,
+`docker_image_info.py`, `docker_network.py`; implementation
+`plugins/module_utils/_module_container/module.py` and `docker_api.py`.
+Detached output behavior is in `module.py` lines1157-1189 and `docker_api.py`
+lines369-385; image-volume merging is in `docker_api.py` lines1692-1715.
+Read-only, nonroot, network-disabled source inspection used no daemon socket.
+No SSH, firewall, systemd deadline, payload execution or containment was tested.
