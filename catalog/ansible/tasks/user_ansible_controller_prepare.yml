@@ -1,0 +1,686 @@
+---
+- name: Select native profile refusal
+  ansible.builtin.set_fact:
+    controller_reason: unsupported_profile
+
+- name: Read the managed native prerequisites without payload execution
+  ansible.builtin.shell: |
+    set -eu
+    test "$(id -u)" = 0
+    test -d /run/systemd/system
+    for tool in docker systemctl systemd-run iptables ip6tables nsenter flock timeout iconv; do
+      command -v "$tool" >/dev/null
+    done
+    test -f /sys/fs/cgroup/cgroup.controllers
+    for limit in cpu memory pids; do
+      grep -qw "$limit" /sys/fs/cgroup/cgroup.controllers
+    done
+    iptables -w 5 -S DOCKER-USER >/dev/null
+    systemctl is-active docker >/dev/null
+    docker --host unix:///var/run/docker.sock info --format '{% raw %}{{.OSType}} {{.SecurityOptions}}{% endraw %}'
+  args:
+    executable: /bin/sh
+  environment:
+    PATH: /usr/sbin:/usr/bin:/sbin:/bin
+    DOCKER_HOST: unix:///var/run/docker.sock
+    DOCKER_CONTEXT: ''
+    DOCKER_TLS_VERIFY: ''
+    DOCKER_CERT_PATH: ''
+    DOCKER_API_VERSION: ''
+  register: controller_profile
+  changed_when: false
+  no_log: true
+
+- name: Require rootful Linux without unqualified user namespace remapping
+  ansible.builtin.assert:
+    that:
+      - controller_profile.stdout.startswith('linux ')
+      - "'name=rootless' not in controller_profile.stdout"
+      - "'name=userns' not in controller_profile.stdout"
+
+- name: Observe the controller's current local IPv4 identities
+  ansible.builtin.setup:
+    gather_subset: [network]
+    filter: ansible_all_ipv4_addresses
+
+- name: Refuse every target address belonging to this controller
+  ansible.builtin.assert:
+    that: item.address not in ansible_all_ipv4_addresses
+  loop: "{{ template_execution.targets }}"
+
+- name: Observe only the already-qualified local image
+  community.docker.docker_image_info:
+    name: "{{ template_execution.image }}"
+  register: controller_image
+  no_log: true
+
+- name: Refuse image volumes and unsafe inherited execution environment
+  ansible.builtin.assert:
+    that:
+      - controller_image.images | length == 1
+      - controller_image.images[0].Os == 'linux'
+      - controller_image.images[0].Config.Volumes | default({}, true) | length == 0
+      - template_execution.image in controller_image.images[0].RepoDigests
+      - controller_image.images[0].Config.Env | default([], true) | reject('match', '^PATH=') | list | length == 0
+  no_log: true
+
+- name: Require safe ancestors and reserve only missing record parents
+  ansible.builtin.shell: |
+    set -eu
+    for path in /var /var/lib /var/lib/opsctl /var/lib/opsctl/user-ansible; do
+      test ! -L "$path"
+      if test ! -e "$path"; then mkdir -m 0700 "$path"; fi
+      test -d "$path"
+      test "$(stat -c %u "$path")" = 0
+      test -z "$(find "$path" -maxdepth 0 -perm /022 -print)"
+    done
+    test "$(stat -c %a /var/lib/opsctl/user-ansible)" = 700
+  args:
+    executable: /bin/sh
+
+- name: Bind finite native names to the exact Operation
+  ansible.builtin.set_fact:
+    controller_record: "/var/lib/opsctl/user-ansible/{{ template_execution.operation_id }}"
+    controller_unit: "opsctl-user-ansible-{{ template_execution.operation_id }}"
+    controller_network_name: "opsctl-user-{{ template_execution.operation_id }}"
+    controller_chain: "OC{{ template_execution.operation_id | replace('-', '') | truncate(20, true, '') }}"
+
+- name: Refuse re-entry instead of renewing or redispatching an invocation
+  ansible.builtin.stat:
+    path: "{{ controller_record }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: controller_existing_record
+
+- name: Retain existing invocation liability without adopting or redispatching it
+  ansible.builtin.set_fact:
+    controller_existing_invocation: true
+    controller_reason: existing_invocation
+    controller_process_closed: false
+    controller_material_cleanup: retained
+    controller_network_cleanup: retained
+    controller_deadline_cleanup: retained
+  when: controller_existing_record.stat.exists
+
+- name: Require an unallocated invocation record
+  ansible.builtin.assert:
+    that: not controller_existing_record.stat.exists
+
+- name: Select source-delivery failure
+  ansible.builtin.set_fact:
+    controller_reason: delivery_failed
+
+- name: Allocate private local variables for the accepted materialization procedure
+  ansible.builtin.tempfile:
+    state: file
+    prefix: opsctl-controller-delivery-
+  delegate_to: localhost
+  become: false
+  register: controller_delivery_variables
+
+- name: Run unchanged accepted materialization with the existing managed inventory
+  block:
+    - name: Freeze only materialization variables in the private file
+      ansible.builtin.copy:
+        dest: "{{ controller_delivery_variables.path }}"
+        mode: '0600'
+        content: >-
+          {{ {'template_source_directory': template_execution.staging_directory,
+          'template_supplied_files': template_execution.supplied_files,
+          'template_entrypoint': template_execution.entrypoint} | to_json }}
+      delegate_to: localhost
+      become: false
+      diff: false
+      no_log: true
+
+    - name: Retain possible delivery liability before the management transport call
+      ansible.builtin.set_fact:
+        controller_material_cleanup: retained
+
+    - name: Invoke accepted byte delivery without importing user code
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/ansible-playbook
+          - "{{ playbook_dir }}/materialize_template_files.yml"
+          - --inventory
+          - "{{ inventory_file }}"
+          - --limit
+          - "{{ inventory_hostname }}"
+          - --extra-vars
+          - "@{{ controller_delivery_variables.path }}"
+        expand_argument_vars: false
+      environment:
+        ANSIBLE_STDOUT_CALLBACK: default
+        ANSIBLE_CALLBACK_RESULT_FORMAT: json
+        ANSIBLE_NOCOLOR: '1'
+      delegate_to: localhost
+      become: false
+      register: controller_delivery
+      failed_when: false
+      no_log: true
+
+    - name: Require one plain terminal delivery result before consuming it
+      ansible.builtin.assert:
+        that: >-
+          controller_delivery.stdout | default('') |
+          regex_findall('"msg": ("TEMPLATE_OUTPUT_JSON=.*")') | length == 1
+
+    - name: Retain the accepted plain delivery result
+      ansible.builtin.set_fact:
+        controller_delivery_result: >-
+          {{ ((controller_delivery.stdout | regex_findall('"msg": ("TEMPLATE_OUTPUT_JSON=.*")') | first
+          | from_json | regex_replace('^TEMPLATE_OUTPUT_JSON=', '') | from_json).template_file_delivery) }}
+      no_log: true
+
+    - name: Retain the child's observed material disposition on refusal
+      ansible.builtin.set_fact:
+        controller_material_cleanup: "{{ controller_delivery_result.cleanup }}"
+      when:
+        - controller_delivery_result.workspace is none
+        - controller_delivery_result.cleanup in ['not_allocated', 'removed']
+
+    - name: Require exact delivered custody before using the fresh workspace
+      ansible.builtin.assert:
+        that:
+          - controller_delivery_result.outcome == 'delivered'
+          - controller_delivery.rc == 0
+          - controller_delivery_result.workspace is string
+          - controller_delivery_result.entrypoint == template_execution.entrypoint
+
+    - name: Record the fresh source workspace for owned cleanup
+      ansible.builtin.set_fact:
+        controller_source_workspace: "{{ controller_delivery_result.workspace }}"
+        controller_material_cleanup: retained
+  always:
+    - name: Remove only the allocated local variables file
+      ansible.builtin.file:
+        path: "{{ controller_delivery_variables.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+- name: Observe the accepted workspace before changing only fresh ownership
+  ansible.builtin.stat:
+    path: "{{ controller_source_workspace }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: controller_source_identity
+
+- name: Require its actual private directory identity
+  ansible.builtin.assert:
+    that:
+      - controller_source_identity.stat.isdir | default(false)
+      - not controller_source_identity.stat.islnk | default(true)
+      - controller_source_identity.stat.mode == '0700'
+
+- name: Give only fresh delivered files the qualified nonroot ownership
+  ansible.builtin.file:
+    path: "{{ controller_source_workspace }}"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    recurse: true
+
+- name: Allocate this exact root-controlled invocation record
+  ansible.builtin.command:
+    argv: [mkdir, -m, '0700', --, "{{ controller_record }}"]
+    expand_argument_vars: false
+
+- name: Record allocation before further changes
+  ansible.builtin.set_fact:
+    controller_record_owned: true
+
+- name: Retain actual newly allocated record identity
+  ansible.builtin.stat:
+    path: "{{ controller_record }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: controller_record_identity
+
+- name: Create private keys and public gate directories with distinct owners
+  ansible.builtin.file:
+    path: "{{ controller_record }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.uid }}"
+    group: "{{ item.gid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: keys, uid: "{{ template_execution.uid }}", gid: "{{ template_execution.gid }}", mode: '0700'}
+    - {path: gate, uid: 0, gid: 0, mode: '0755'}
+
+- name: Observe confined frozen credential files before delivery
+  ansible.builtin.stat:
+    path: "{{ template_execution.staging_directory }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  delegate_to: localhost
+  become: false
+  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  register: controller_credentials
+  no_log: true
+
+- name: Require bounded private regular originals
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not item.stat.islnk | default(true)
+      - item.stat.size > 0 and item.stat.size <= 262144
+      - item.stat.mode in ['0400', '0600']
+  loop: "{{ controller_credentials.results }}"
+  no_log: true
+
+- name: Require the existing aggregate private-file budget
+  ansible.builtin.assert:
+    that:
+      - controller_credentials.results | length <= 32
+      - controller_credentials.results | map(attribute='stat.size') | sum <= 1048576
+
+- name: Copy exact centrally selected private bytes into fresh private custody
+  ansible.builtin.copy:
+    src: "{{ template_execution.staging_directory }}/{{ item }}"
+    dest: "{{ controller_record }}/keys/{{ item }}"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    mode: '0600'
+    follow: false
+    local_follow: false
+  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  diff: false
+  no_log: true
+
+- name: Observe fresh credential bytes and actual nonroot ownership privately
+  ansible.builtin.stat:
+    path: "{{ controller_record }}/keys/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  register: controller_delivered_credentials
+  no_log: true
+
+- name: Require exact ordered credential byte and mode parity before execution
+  ansible.builtin.assert:
+    that:
+      - item.0.item == item.1.item
+      - item.1.stat.isreg | default(false)
+      - not item.1.stat.islnk | default(true)
+      - item.0.stat.checksum == item.1.stat.checksum
+      - item.0.stat.size == item.1.stat.size
+      - item.1.stat.mode == '0600'
+      - item.1.stat.uid == template_execution.uid
+      - item.1.stat.gid == template_execution.gid
+  loop: "{{ controller_credentials.results | zip(controller_delivered_credentials.results) | list }}"
+  no_log: true
+
+- name: Write immutable inventory using only central target facts
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/keys/inventory.json"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    mode: '0600'
+    content: >-
+      {%- set hosts = namespace(values={}) -%}
+      {%- for target in template_execution.targets -%}
+      {%- set hosts.values = hosts.values | combine({target.server_id: {
+      'ansible_host': target.address, 'ansible_port': target.port, 'ansible_user': target.username,
+      'ansible_ssh_private_key_file': '/run/opsctl-keys/' + target.credential_file,
+      'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/run/opsctl-keys/known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes'}}) -%}
+      {%- endfor -%}
+      {{ {'all': {'hosts': hosts.values}} | to_json }}
+  diff: false
+  no_log: true
+
+- name: Write frozen host keys without TOFU or private lookup
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/keys/known_hosts"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    mode: '0600'
+    content: |
+      {% for target in template_execution.targets %}
+      {{ target.address }} {{ target.host_public_key }}
+      {% endfor %}
+  diff: false
+  no_log: true
+
+- name: Write fixed private controller configuration without platform plugins
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/keys/ansible.cfg"
+    owner: "{{ template_execution.uid }}"
+    group: "{{ template_execution.gid }}"
+    mode: '0600'
+    content: |
+      [defaults]
+      host_key_checking = True
+      local_tmp = /tmp/ansible
+      retry_files_enabled = False
+  diff: false
+
+- name: Deliver the two fixed accepted public control helpers
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/{{ item }}"
+    dest: "{{ controller_record }}/{{ 'gate/start.sh' if item.endswith('start.sh') else 'close.sh' }}"
+    owner: root
+    group: root
+    mode: "{{ '0444' if item.endswith('start.sh') else '0700' }}"
+  loop: [user_ansible_controller_start.sh, user_ansible_controller_close.sh]
+
+- name: Select operation policy failure
+  ansible.builtin.set_fact:
+    controller_reason: policy_failed
+
+- name: Refuse an existing network name rather than adopting it
+  community.docker.docker_network_info:
+    name: "{{ controller_network_name }}"
+  register: controller_existing_network
+
+- name: Require an unallocated network
+  ansible.builtin.assert:
+    that: not controller_existing_network.exists
+
+- name: Retain possible network liability before native allocation
+  ansible.builtin.set_fact:
+    controller_network_cleanup: retained
+
+- name: Allocate the exclusively owned IPv4 bridge
+  community.docker.docker_network:
+    name: "{{ controller_network_name }}"
+    driver: bridge
+    enable_ipv6: false
+    labels:
+      opsctl.operation: "{{ template_execution.operation_id }}"
+    driver_options:
+      com.docker.network.bridge.enable_icc: 'false'
+  register: controller_network
+
+- name: Retain exact network identity and bridge interface
+  ansible.builtin.set_fact:
+    controller_network_id: "{{ controller_network.network.Id }}"
+    controller_bridge: "br-{{ controller_network.network.Id[:12] }}"
+    controller_network_cleanup: retained
+
+- name: Create an owned forwarding chain before any container starts
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -N, "{{ controller_chain }}"]
+    expand_argument_vars: false
+
+- name: Retain only the newly created chain's ownership
+  ansible.builtin.set_fact:
+    controller_chain_owned: true
+
+- name: Permit only the exact selected IPv4 SSH destinations
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
+    expand_argument_vars: false
+  loop: "{{ template_execution.targets }}"
+
+- name: Permit only exact selected SSH reply flows
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
+    expand_argument_vars: false
+  loop: "{{ template_execution.targets }}"
+
+- name: Reject every remaining owned bridge direction
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
+    expand_argument_vars: false
+  loop: [-i, -o]
+
+- name: Observe every exact selected outgoing allowance
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
+    expand_argument_vars: false
+  changed_when: false
+  loop: "{{ template_execution.targets }}"
+
+- name: Observe every exact selected reply allowance
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
+    expand_argument_vars: false
+  changed_when: false
+  loop: "{{ template_execution.targets }}"
+
+- name: Observe both default owned bridge rejections
+  ansible.builtin.command:
+    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
+    expand_argument_vars: false
+  changed_when: false
+  loop: [-i, -o]
+
+- name: Insert only exact owned host enforcement rules
+  ansible.builtin.command:
+    argv: "{{ item }}"
+    expand_argument_vars: false
+  loop:
+    - [iptables, -w, '5', -I, DOCKER-USER, '1', -j, "{{ controller_chain }}"]
+    - [iptables, -w, '5', -I, INPUT, '1', -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
+
+- name: Observe the owned forwarding and controller rejection hooks
+  ansible.builtin.command:
+    argv: "{{ item }}"
+    expand_argument_vars: false
+  changed_when: false
+  loop:
+    - [iptables, -w, '5', -C, DOCKER-USER, -j, "{{ controller_chain }}"]
+    - [iptables, -w, '5', -C, INPUT, -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
+
+- name: Refuse an existing container rather than native replacement
+  community.docker.docker_container_info:
+    name: "{{ controller_unit }}"
+  register: controller_existing_container
+  no_log: true
+
+- name: Require an unallocated native container name
+  ansible.builtin.assert:
+    that: not controller_existing_container.exists
+
+- name: Retain creation uncertainty before the daemon call
+  ansible.builtin.set_fact:
+    controller_creation_attempted: true
+    controller_writable_bytes: "{{ template_execution.limits.tmpfs_mib * 1048576 // 12288 * 4096 }}"
+
+- name: Create only the stopped trusted gate with bounded writable mounts
+  community.docker.docker_container:
+    name: "{{ controller_unit }}"
+    image: "{{ template_execution.image }}"
+    pull: never
+    state: present
+    recreate: false
+    detach: true
+    auto_remove: false
+    restart_policy: 'no'
+    output_logs: false
+    user: "{{ template_execution.uid }}:{{ template_execution.gid }}"
+    read_only: true
+    privileged: false
+    cap_drop: [ALL]
+    capabilities: []
+    security_opts: [no-new-privileges:true]
+    healthcheck: {test: [NONE]}
+    entrypoint: [/bin/sh, /run/opsctl-gate/start.sh]
+    command: [/run/opsctl-gate, /usr/local/bin/ansible-playbook, --inventory, /run/opsctl-keys/inventory.json, "{{ '/source/' + template_execution.entrypoint }}"]
+    command_handling: correct
+    working_dir: /source
+    env:
+      HOME: /tmp
+      PATH: /usr/local/bin:/usr/bin:/bin
+      ANSIBLE_LOCAL_TEMP: /tmp/ansible
+      ANSIBLE_HOST_KEY_CHECKING: 'True'
+      ANSIBLE_CONFIG: /run/opsctl-keys/ansible.cfg
+    mounts:
+      - {type: bind, source: "{{ controller_source_workspace }}", target: /source, read_only: true, propagation: rprivate}
+      - {type: bind, source: "{{ controller_record }}/keys", target: /run/opsctl-keys, read_only: true, propagation: rprivate}
+      - {type: bind, source: "{{ controller_record }}/gate", target: /run/opsctl-gate, read_only: true, propagation: rprivate}
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,size={{ controller_writable_bytes }},mode=0700,uid={{ template_execution.uid }},gid={{ template_execution.gid }}"
+      - "/dev:rw,nosuid,noexec,size={{ controller_writable_bytes }},mode=0755"
+    shm_size: "{{ controller_writable_bytes | string }}"
+    cpus: "{{ template_execution.limits.cpu_millicores / 1000 }}"
+    memory: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
+    memory_swap: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
+    pids_limit: "{{ template_execution.limits.pids }}"
+    tty: false
+    publish_all_ports: false
+    networks_cli_compatible: true
+    network_mode: "{{ controller_network_name }}"
+    networks: [{name: "{{ controller_network_name }}"}]
+    comparisons: {networks: strict}
+    log_driver: json-file
+    log_options: {max-size: 1m, max-file: '2'}
+    labels:
+      opsctl.operation: "{{ template_execution.operation_id }}"
+      opsctl.source_digest: "{{ template_execution.source_digest }}"
+      opsctl.input_digest: "{{ template_execution.input_digest }}"
+  register: controller_created
+  no_log: true
+
+- name: Retain the stopped container's exact identity
+  ansible.builtin.set_fact:
+    controller_container_id: "{{ controller_created.container.Id }}"
+    controller_reason: deadline_failed
+
+- name: Record exact container identity privately before configuration verification
+  ansible.builtin.copy:
+    dest: "{{ controller_record }}/container-id"
+    content: "{{ controller_container_id }}\n"
+    mode: '0600'
+    owner: root
+    group: root
+
+- name: Observe configuration before any trusted-gate start
+  community.docker.docker_container_info:
+    name: "{{ controller_container_id }}"
+  register: controller_stopped
+  no_log: true
+
+- name: Refuse changed identity or unsupported effective restrictions
+  ansible.builtin.assert:
+    that:
+      - controller_stopped.exists
+      - controller_stopped.container.Id == controller_container_id
+      - controller_stopped.container.Config.Labels['opsctl.operation'] == template_execution.operation_id
+      - not controller_stopped.container.State.Running and controller_stopped.container.State.Pid == 0
+      - controller_stopped.container.Config.User == (template_execution.uid | string) + ':' + (template_execution.gid | string)
+      - controller_stopped.container.HostConfig.ReadonlyRootfs
+      - not controller_stopped.container.HostConfig.Privileged
+      - controller_stopped.container.HostConfig.Memory == template_execution.limits.memory_mib * 1048576
+      - controller_stopped.container.HostConfig.MemorySwap == controller_stopped.container.HostConfig.Memory
+      - controller_stopped.container.HostConfig.NanoCpus == template_execution.limits.cpu_millicores * 1000000
+      - controller_stopped.container.HostConfig.PidsLimit == template_execution.limits.pids
+      - controller_stopped.container.HostConfig.ShmSize == controller_writable_bytes
+      - controller_stopped.container.HostConfig.CapDrop | default([], true) == ['ALL']
+      - controller_stopped.container.HostConfig.CapAdd | default([], true) | length == 0
+      - controller_stopped.container.HostConfig.SecurityOpt | default([], true) is contains('no-new-privileges:true')
+      - controller_stopped.container.HostConfig.Devices | default([], true) | length == 0
+      - controller_stopped.container.HostConfig.PidMode != 'host'
+      - controller_stopped.container.HostConfig.IpcMode != 'host'
+      - controller_stopped.container.HostConfig.UTSMode != 'host'
+      - controller_stopped.container.HostConfig.PortBindings | default({}, true) | length == 0
+      - controller_stopped.container.NetworkSettings.Networks.keys() | list == [controller_network_name]
+      - controller_stopped.container.Mounts | rejectattr('Type', 'in', ['bind', 'tmpfs']) | list | length == 0
+      - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == 3
+      - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | selectattr('RW', 'equalto', true) | list | length == 0
+      - controller_stopped.container.HostConfig.Tmpfs.keys() | list | sort(case_sensitive=true) == ['/dev', '/tmp']
+      - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,size=' + (controller_writable_bytes | string) + ',mode=0755'
+      - controller_stopped.container.HostConfig.Tmpfs['/tmp'] == 'rw,nosuid,nodev,size=' + (controller_writable_bytes | string) + ',mode=0700,uid=' + (template_execution.uid | string) + ',gid=' + (template_execution.gid | string)
+      - controller_stopped.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
+      - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate', '/usr/local/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json', '/source/' + template_execution.entrypoint]
+      - controller_stopped.container.Config.WorkingDir == '/source'
+      - controller_stopped.container.Config.Healthcheck.Test == ['NONE']
+      - controller_stopped.container.HostConfig.LogConfig == {'Type':'json-file', 'Config':{'max-size':'1m', 'max-file':'2'}}
+  no_log: true
+
+- name: Retain deadline uncertainty before the native allocation call
+  ansible.builtin.set_fact:
+    controller_deadline_cleanup: retained
+
+- name: Install the independent host deadline before trusted-gate start
+  ansible.builtin.command:
+    argv: [timeout, -k, '2', '15', systemd-run, "{{ '--unit=' + controller_unit }}", "{{ '--on-active=' + (template_execution.limits.timeout_seconds | string) + 's' }}", --timer-property=AccuracySec=1s, /bin/sh, "{{ controller_record }}/close.sh", "{{ controller_record }}", "{{ template_execution.operation_id }}", deadline]
+    expand_argument_vars: false
+
+- name: Retain deadline liability before observing readiness
+  ansible.builtin.set_fact:
+    controller_deadline_cleanup: retained
+
+- name: Require the exact deadline timer active
+  ansible.builtin.command:
+    argv: [timeout, -k, '2', '5', systemctl, is-active, "{{ controller_unit }}.timer"]
+    expand_argument_vars: false
+  changed_when: false
+
+- name: Retain possible execution before the trusted-gate transport call
+  ansible.builtin.set_fact:
+    controller_reason: execution_unknown
+
+- name: Start only the trusted gate then install and observe namespace policy under the lock
+  ansible.builtin.shell: |
+    exec timeout -k 2 30 /bin/sh <<'OPSCTL_START'
+    set -eu
+    exec 8>"$RECORD/lock"
+    flock -x -w 5 8
+    test ! -e "$RECORD/closed"
+    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null
+    test "$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value)" = 0
+    timeout 10 docker --host unix:///var/run/docker.sock start "$CONTAINER" >/dev/null
+    facts=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER")
+    set -- $facts
+    test "$#" = 3 && test "$1" = "$CONTAINER" && test "$2" = "$OPERATION" && test "$3" -gt 0
+    pid=$3
+    cgroup=$(awk -F: '$1 == "0" && $2 == "" {print $3}' "/proc/$pid/cgroup")
+    case "$cgroup" in
+      /*) ;;
+      *) exit 65 ;;
+    esac
+    case "$cgroup" in *'/../'*|*'/./'*|*/..|*/.) exit 65 ;; esac
+    test "$(cat "/sys/fs/cgroup$cgroup/memory.max")" = "$MEMORY_BYTES"
+    test "$(cat "/sys/fs/cgroup$cgroup/memory.swap.max")" = 0
+    test "$(cat "/sys/fs/cgroup$cgroup/pids.max")" = "$PID_LIMIT"
+    set -- $(cat "/sys/fs/cgroup$cgroup/cpu.max")
+    test "$#" = 2 && test "$2" -gt 0
+    test "$1" -gt 0 && test "$(( $1 * 1000 ))" = "$(( CPU_MILLICORES * $2 ))"
+    exec 9<"/proc/$pid/ns/net"
+    namespace=$(readlink "/proc/$pid/ns/net")
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -d 127.0.0.11 -j REJECT
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p udp -j REJECT
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p tcp --dport 53 -j REJECT
+    timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -P OUTPUT DROP
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -d 127.0.0.11 -j REJECT
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p udp -j REJECT
+    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p tcp --dport 53 -j REJECT
+    test "$(timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -S OUTPUT)" = '-P OUTPUT DROP'
+    test "$(readlink "/proc/$pid/ns/net")" = "$namespace"
+    test "$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER")" = "$facts"
+    test ! -e "$RECORD/closed"
+    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null
+    test "$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value)" = 0
+    umask 022
+    : >"$RECORD/gate/release.pending"
+    chmod 0444 "$RECORD/gate/release.pending"
+    mv "$RECORD/gate/release.pending" "$RECORD/gate/release"
+    OPSCTL_START
+  args:
+    executable: /bin/sh
+  environment:
+    PATH: /usr/sbin:/usr/bin:/sbin:/bin
+    DOCKER_CONTEXT: ''
+    DOCKER_TLS_VERIFY: ''
+    DOCKER_CERT_PATH: ''
+    DOCKER_API_VERSION: ''
+    RECORD: "{{ controller_record }}"
+    UNIT: "{{ controller_unit }}"
+    CONTAINER: "{{ controller_container_id }}"
+    OPERATION: "{{ template_execution.operation_id }}"
+    MEMORY_BYTES: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
+    PID_LIMIT: "{{ template_execution.limits.pids | string }}"
+    CPU_MILLICORES: "{{ template_execution.limits.cpu_millicores | string }}"
+  no_log: true
+
+- name: Record execution entered only through the released gate
+  ansible.builtin.set_fact:
+    controller_reason: execution_unknown

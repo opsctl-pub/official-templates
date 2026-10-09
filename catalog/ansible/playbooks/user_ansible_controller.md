@@ -1,25 +1,33 @@
 # User Ansible Controller
 
-Preparation contract only. No executable procedure, admitted user-run route or
-selected-target private-key delivery is implemented by this document. The platform
+Authored native procedure and isolated actual-task/helper behavior are accepted
+with labelled external transports substituted. Connected
+containment is not qualified. No admitted user-run route or selected-target private-key delivery
+is implemented here. The platform
 Runner may run only the accepted official control procedure; user Ansible,
 controller-side plugins, lookups and local tasks belong inside the container on
 the separately authorized user-owned controller Server.
 
 ## Inputs And Authority
 
-`template_execution` names the proposed frozen internal input concept, not a new
-public JSON schema. Its exact typed carrier belongs to central admission. It must
-bind the Operation UUID, controller Server UUID, source/input SHA-256 digests,
-frozen file manifest and member entrypoint to one qualified image digest,
-nonroot numeric UID/GID and fixed `ansible-playbook` interpreter/argv. Source
+The closed internal `template_execution` mapping contains exactly `operation_id`,
+`controller_server_id`, `source_digest`, `input_digest`, `staging_directory`,
+`supplied_files`, `entrypoint`, `image`, `uid`, `gid`, `targets` and `limits`.
+It binds the Operation/controller UUIDs and source/input SHA-256 digests to the
+frozen materialization manifest, member entrypoint, immutable image reference
+and nonroot numeric UID/GID. The interpreter/argv is fixed, not another input. Source
 bounds and literal byte delivery remain owned by `materialize_template_files`.
 No user shell expression, address, environment, interpreter or executable may
 replace these bindings.
 
 The ordered 1..32 targets require exact Server UUIDs, current backend-resolved
 IPv4/SSH port/login, frozen host public keys and authorized private regular-file
-bindings with exact credential versions. Reject duplicates and controller/self
+bindings with exact credential versions. Each target contains exactly `server_id`,
+`address`, `port`, `username`, `host_public_key`, `credential_file`,
+`ssh_access_key_id`, `credential_secret_id` and `credential_version`. Require the
+managed port22 profile; private filenames and ordinary Vault bytes come from the
+central owner, while trusted management-channel observation supplies host keys.
+Reject duplicates and controller/self
 targets before start. Content visibility, accepted template publication and an
 exact digest do not grant target access. Central admission rechecks actor, scope,
 controller and every target before delivery/execution.
@@ -42,11 +50,13 @@ selected-target private-key route remain prerequisites, not local substitutes.
 Reject extra/invalid inputs and unavailable prerequisites rather than silently
 falling back. Existing SSH-access/baseline ordering precedes the procedure; do not
 reprovision an existing controller or install dependencies from user content.
+The closed `limits` keys are `timeout_seconds`, `cpu_millicores`, `memory_mib`,
+`tmpfs_mib`, `pids` and `log_bytes`; booleans are not numeric limits.
 
 ## Native Profile And Mapping
 
 The first profile requires managed Linux, systemd, rootful Docker using its
-iptables backend and functioning CPU/memory/swap/PID cgroup enforcement. A
+iptables backend and functioning cgroup-v2 CPU/memory/swap/PID enforcement. A
 responsive daemon or completed Docker baseline alone does not establish this
 profile. Verify the required Engine API/options, controller tools and effective
 configuration before any payload start. Unsupported profiles refuse.
@@ -82,6 +92,9 @@ rootful Docker alone does not prove user-namespace remapping is disabled. Never
 weaken private modes or chown an original/Secret projection. The module supports
 `mounts.tmpfs_options` only with API >=1.46; the baseline does not pin that API.
 Use only observed-supported options or refuse, not an implicit version fallback.
+The candidate divides the writable budget between `/tmp`, `/dev` and `/dev/shm`,
+rounding each allocation down to a 4096-byte boundary. Before marker release,
+observe effective cgroup limits rather than infer enforcement from create options.
 
 ## Destination-Only Policy
 
@@ -139,11 +152,17 @@ the invocation closed; start then refuses. A started invocation cannot renew its
 deadline, recreate missing payload or dispatch another container on re-entry.
 Record the timeout decision separately from exit status; do not infer timeout
 from a nonzero exit or loss of SSH alone.
+Lock acquisition and the complete pre-release critical section are finite. The
+close helper records its actual closure decision under that lock; timer firing
+after an observed ordinary exit does not change it into a timeout. Exact absence
+requires a successful full-ID daemon listing, never interpretation of an error.
 
 Normal completion may disable the exact owned deadline only after observing
 process closure while holding that same serialization boundary. Stop the exact
-timer and settle any already-running deadline service under the lock before
-removing its identity record. Never wait on a service that needs the held lock.
+timer and settle any already-running deadline service after close-helper lock
+release. Never wait on a service that needs a held lock. Retain the nonprivate
+root-owned closed record after deleting its keys/gate and source workspace;
+existing records refuse re-entry, including after successful cleanup.
 If process state is unobservable, retain keys/workspace/policy and report unknown
 closure; process death is not inferred from expired central timeouts.
 
@@ -152,6 +171,8 @@ remove the exact owned container and observe absence, then remove fresh private
 copies/workspace, the exact network/rules and deadline artifacts. Retain original
 failure plus any closure failure independently. Reboot, daemon loss and concurrent
 cleanup still need connected proof; systemd installation alone is not that proof.
+Log collection failure does not prevent independently safe owned cleanup. Existing
+invocations refuse redispatch and retain unknown process/material liability.
 
 ## Logs And Plain Results
 
@@ -176,11 +197,17 @@ User output still follows the existing protected-value redactor; truncation and
 redaction do not promise that arbitrary payload output contains no secrets.
 
 `OPERATION_STEP` reports preparation, execution and cleanup progress.
-`TEMPLATE_OUTPUT_JSON` carries the proposed plain `template_execution_result`:
-operation/controller identity, finite outcome/reason, nullable exact container
-identity, observed exit/timeout, process closure, private-material/workspace,
-network/policy and deadline cleanup states, plus bounded logs/truncation. These
-are semantic requirements, not invented field spellings for the pending schema.
+`TEMPLATE_OUTPUT_JSON` carries plain `template_execution_result` fields:
+`operation_id`, `controller_server_id`, `outcome`, `reason`, `original_reason`,
+`container_id`, `exit_code`, `timed_out`, `process_closed`, `material_cleanup`,
+`network_cleanup`, `deadline_cleanup`, `logs` and `logs_truncated`.
+Outcomes are `refused`, `succeeded`, `failed` or `timed_out`; reasons are
+`invalid_inputs`, `unsupported_profile`, `delivery_failed`, `policy_failed`,
+`deadline_failed`, `execution_unknown`, `exited`, `execution_failed`,
+`deadline_expired`, `existing_invocation`, `log_collection_failed` or `cleanup_failed`. Cleanup states are `not_allocated`,
+`retained` or `removed`. Identity/exit may be null; refusal does not imply an
+observed payload exit. `material_cleanup` refers to private keys/gate/workspace,
+not removal of the nonprivate closed record.
 
 Refusal before start, observed zero/nonzero exit, deadline termination and unknown
 execution are distinct outcomes. Closure states distinguish not allocated,
@@ -192,12 +219,12 @@ mirrored API proof protocol is required.
 
 ## Delivery Boundary
 
-The finite future native closure is adjacent `user_ansible_controller.yml`,
+The finite candidate native closure is adjacent `user_ansible_controller.yml`,
 `../tasks/user_ansible_controller_prepare.yml`,
 `../tasks/user_ansible_controller_cleanup.yml`,
 `../scripts/user_ansible_controller_close.sh` and
-`../scripts/user_ansible_controller_start.sh`. None is delivered here. Central
-admission/private-key delivery precedes executable consumer wiring. Native
+`../scripts/user_ansible_controller_start.sh`. Central
+admission/private-key delivery precedes connected executable consumer wiring. Native
 pre-release DNS enforcement through the decided trusted gate, serialized host deadline, bounded stream collection,
 effective resource/mount enforcement and remote loss/recovery require actual
 demonstration, then proportionate tests and separately authorized live acceptance.
@@ -210,4 +237,8 @@ collection `plugins/modules/docker_container.py`, `docker_container_info.py`,
 Detached output behavior is in `module.py` lines1157-1189 and `docker_api.py`
 lines369-385; image-volume merging is in `docker_api.py` lines1692-1715.
 Read-only, nonroot, network-disabled source inspection used no daemon socket.
-No SSH, firewall, systemd deadline, payload execution or containment was tested.
+The isolated demonstration executes the production tasks and both helpers with
+finite SSH/module, root-identity, daemon, firewall, systemd and timed-flock
+transport substitutions. File byte/mode checks and owned filesystem removal are
+actual; root ownership, daemon restrictions and containment are not. No live SSH,
+firewall, systemd or user payload execution was tested.
