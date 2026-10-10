@@ -935,6 +935,7 @@
   ansible.builtin.shell: |
     exec timeout -k 2 30 /bin/sh <<'OPSCTL_START'
     set -eu
+    umask 077
     exec 8>"$RECORD/lock"
     flock -x -w 5 8
     test ! -e "$RECORD/closed"

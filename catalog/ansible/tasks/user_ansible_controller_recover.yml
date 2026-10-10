@@ -467,7 +467,9 @@
         test ! -L "$RECORD/lock"
         if test -e "$RECORD/lock"; then
           test -f "$RECORD/lock"
-          test "$(stat -c '%u:%a' "$RECORD/lock")" = 0:600
+          case "$(stat -c '%u:%a:%h:%s' "$RECORD/lock")" in
+            0:600:1:0|0:644:1:0) ;; *) exit 65 ;;
+          esac
         fi
         exec 8>"$RECORD/lock"
         flock -x -w 5 8

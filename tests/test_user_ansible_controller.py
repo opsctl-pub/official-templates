@@ -46,7 +46,7 @@ def transport():
             return result.returncode
         fields = result.stdout.strip().split(':')
         if '%u' in args[1] and not any(part in args[-1] for part in ('/keys', '/source/')):
-            fields[0] = '0'
+            fields[0] = '1001' if args[-1] == os.environ.get('CONTROLLER_FOREIGN_LOCK') else '0'
         print(':'.join(fields))
         return 0
     if tool == 'flock':
@@ -1291,6 +1291,78 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 result, _ = self.run_tasks([
                     named(self.execution, 'Require exact safe target facts from central preparation')])
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_private_lock_creation_and_historical_witness_confinement(self):
+        bodies = {
+            'prepare': named(walk(self.prepare), 'Start only the trusted gate then install and observe namespace policy under the lock')['ansible.builtin.shell'],
+            'close': None,
+            'refresh': named(walk(self.recovery), 'Refresh current trusted close code only for qualified original settlement')['ansible.builtin.shell'],
+            'material': named(walk(self.cleanup), 'Release private material only under the exact completed-writer closure lock')['ansible.builtin.shell'],
+            'journal': named(walk(self.cleanup), 'Atomically persist settlement only if the original journal is unchanged')['ansible.builtin.shell'],
+        }
+        identity = ' '.join([CONTAINER, OPERATION, self.carrier['source_digest'],
+                             self.carrier['input_digest']]) + ' false 0\n'
+        sentinel_before = (self.sentinel.read_bytes(), self.sentinel.stat().st_ino,
+                           stat.S_IMODE(self.sentinel.stat().st_mode))
+        for consumer, body in bodies.items():
+            cases = ('new',) if consumer == 'prepare' else (
+                '0600', '0644', 'linked', 'hardlinked', 'writable', 'unowned', 'nonempty')
+            for case in cases:
+                with self.subTest(consumer=consumer, case=case):
+                    self.bind_transport({'docker': [{'stdout': identity}] * 2,
+                                         'systemctl': [{'rc': 19}]})
+                    record = self.root / (consumer + '-' + case)
+                    record.mkdir(mode=0o700)
+                    history = b'{"writer_closed":false,"outcome":"unknown"}'
+                    helper_bytes = (CATALOG / 'scripts/user_ansible_controller_close.sh').read_text()
+                    files = {'container-id': CONTAINER + '\n',
+                             'source-digest': self.carrier['source_digest'] + '\n',
+                             'input-digest': self.carrier['input_digest'] + '\n',
+                             'journal.json': history.decode(), 'writer-closed': '',
+                             'close.sh': helper_bytes}
+                    if consumer != 'prepare':
+                        files['closed'] = ''
+                    for name, content in files.items():
+                        path = record / name
+                        path.write_text(content)
+                        path.chmod(0o700 if name == 'close.sh' else 0o600)
+                    for name in ('source', 'keys', 'gate'):
+                        (record / name).mkdir(mode=0o700)
+                    lock = record / 'lock'
+                    if case == 'linked':
+                        lock.symlink_to(self.sentinel)
+                    elif case == 'hardlinked':
+                        os.link(self.sentinel, lock)
+                    elif case != 'new':
+                        lock.write_text('retained witness' if case == 'nonempty' else '')
+                        lock.chmod(0o644 if case == '0644' else 0o664 if case == 'writable' else 0o600)
+                    before = None if case == 'new' else (lock.lstat().st_ino, lock.lstat().st_mode)
+                    observed = record.stat()
+                    env = {**self.environment(), 'RECORD': str(record),
+                           'DEVICE': str(observed.st_dev), 'INODE': str(observed.st_ino),
+                           'EXPECTED': hashlib.sha256(history).hexdigest(), 'JOURNAL': history.decode(),
+                           'HELPER': helper_bytes, 'EFFECT_FENCED': 'false', 'UNIT': 'owned-fixture'}
+                    if case == 'unowned':
+                        env['CONTROLLER_FOREIGN_LOCK'] = str(lock)
+                    command = ['/bin/sh', str(self.helper('close')), '--bounded', str(record), OPERATION, 'normal'] if consumer == 'close' else [
+                        '/bin/sh', '-c', 'umask 022\n' + body]
+                    result = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=40)
+                    expected = 19 if consumer == 'prepare' else 0 if case in ('0600', '0644') else 1 if case == 'linked' and consumer != 'close' else 65
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual((self.sentinel.read_bytes(), self.sentinel.stat().st_ino,
+                                      stat.S_IMODE(self.sentinel.stat().st_mode)), sentinel_before)
+                    self.assertEqual((record / 'journal.json').read_bytes(), history)
+                    if before is None:
+                        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+                        self.assertEqual(lock.stat().st_size, 0)
+                    else:
+                        self.assertEqual((lock.lstat().st_ino, lock.lstat().st_mode), before)
+                    if consumer == 'material':
+                        for name in ('source', 'keys', 'gate'):
+                            self.assertEqual((record / name).exists(), case not in ('0600', '0644'))
+                    if case not in ('new', '0600', '0644'):
+                        self.assertFalse(any(call['tool'] not in ('stat', 'flock') for call in self.calls()))
 
     def test_close_decisions_distinguish_deadline_late_exit_exact_absence_and_uncertainty(self):
         identity = ' '.join([CONTAINER, OPERATION, self.carrier['source_digest'], self.carrier['input_digest']])

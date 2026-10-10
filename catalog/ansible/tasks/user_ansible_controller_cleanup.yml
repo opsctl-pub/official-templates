@@ -439,7 +439,9 @@
         test ! -L "$RECORD/lock"
         if test -e "$RECORD/lock"; then
           test -f "$RECORD/lock"
-          test "$(stat -c '%u:%a' "$RECORD/lock")" = 0:600
+          case "$(stat -c '%u:%a:%h:%s' "$RECORD/lock")" in
+            0:600:1:0|0:644:1:0) ;; *) exit 65 ;;
+          esac
         fi
         exec 8>"$RECORD/lock"
         flock -x -w 5 8
@@ -589,6 +591,12 @@
         test -d "$RECORD" && test ! -L "$RECORD"
         test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
         test ! -L "$RECORD/lock"
+        if test -e "$RECORD/lock"; then
+          test -f "$RECORD/lock"
+          case "$(stat -c '%u:%a:%h:%s' "$RECORD/lock")" in
+            0:600:1:0|0:644:1:0) ;; *) exit 65 ;;
+          esac
+        fi
         exec 8>"$RECORD/lock"
         flock -x -w 5 8
         test -f "$RECORD/journal.json" && test ! -L "$RECORD/journal.json"

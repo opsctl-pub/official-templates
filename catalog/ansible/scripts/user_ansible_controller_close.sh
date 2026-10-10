@@ -24,7 +24,10 @@ esac
 [ "$(stat -c '%u:%a' "$record")" = 0:700 ] || exit 65
 [ ! -L "$record/lock" ] || exit 65
 if [ -e "$record/lock" ]; then
-    [ -f "$record/lock" ] && [ "$(stat -c '%u:%a' "$record/lock")" = 0:600 ] || exit 65
+    [ -f "$record/lock" ] || exit 65
+    case "$(stat -c '%u:%a:%h:%s' "$record/lock")" in
+        0:600:1:0|0:644:1:0) ;; *) exit 65 ;;
+    esac
 fi
 exec 8>"$record/lock"
 flock -x -w 35 8 || exit 75
