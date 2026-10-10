@@ -283,6 +283,14 @@ outcome/history stay unchanged. Delayed start cannot recreate the absent ID;
 release cannot recreate deleted directories. Earlier phases, other engines,
 ambiguous identity, lock/removal/CAS failure retain unresolved liabilities.
 
+A failed exact deadline stop still requires authoritative readback of both owned
+units; only rc3/4 for each establishes removal. Signed exceptional settle may
+resume a closed/material-removed partial finalizer after unchanged locked journal,
+root tombstone, exact full-ID absence and no-follow absence of every recorded
+source/private allocation. It runs only remaining deadline cleanup and journal CAS,
+without refreshing helpers or recreating material; writer completion and original
+outcome/history remain unchanged. Active or unknown units retain liability.
+
 One `Controller recovery observation: ` message separately reports authenticated
 phase/writer completion, root/gate closed and release presence, exact current
 running/PID-zero/ExitCode/OOM and timer-active/never-triggered facts. Unknowns are

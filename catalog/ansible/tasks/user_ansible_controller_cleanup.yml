@@ -59,7 +59,9 @@
           (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
         controller_reason: "{{ 'existing_invocation' if controller_existing_invocation | default(false) else 'cleanup_failed' }}"
         controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else ('refused' if controller_existing_invocation | default(false) else 'unknown') }}"
-  when: not (controller_collect_only | default(false))
+  when:
+    - not (controller_collect_only | default(false))
+    - not (controller_partial_finalizer | default(false))
   no_log: true
 
 - name: Fence exact allocation-complete Bash effects before releasing other liabilities
@@ -115,6 +117,7 @@
         controller_reason: cleanup_failed
   when:
     - controller_terminal_gate_fence_qualified | default(false)
+    - not (controller_partial_finalizer | default(false))
     - controller_process_closed
     - not (controller_collect_only | default(false))
   no_log: true
@@ -536,6 +539,7 @@
         argv: [timeout, -k, '2', '15', systemctl, stop, "{{ controller_unit }}.timer", "{{ controller_unit }}.service"]
         expand_argument_vars: false
       when: controller_deadline_cleanup == 'retained'
+      failed_when: false
 
     - name: Observe the exact deadline inactive before deleting its record
       ansible.builtin.command:

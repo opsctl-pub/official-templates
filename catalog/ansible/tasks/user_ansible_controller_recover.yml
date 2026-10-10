@@ -14,6 +14,7 @@
       timer_active: null
       timer_never_triggered: null
     controller_terminal_gate_fence_qualified: false
+    controller_partial_finalizer: false
     controller_effect_fenced: false
     controller_recovery_completed: false
     controller_recovery_observation_failed: false
@@ -307,6 +308,83 @@
           - controller_recovery_after_observation.stat.dev == controller_journal_after.stat.dev
           - controller_recovery_after_observation.stat.checksum == controller_journal_after.stat.checksum
 
+    - name: Require only the authenticated closed partial Bash finalizer
+      ansible.builtin.assert:
+        that:
+          - controller_payload_engine == 'bash'
+          - not controller_writer_closed
+          - controller_container_id is string
+          - controller_recovery_container.exists is sameas false
+          - controller_journal.private_identities.keys() | list | sort(case_sensitive=true) == ['gate', 'keys']
+          - controller_journal.source_workspace is string
+          - controller_material_cleanup == 'removed'
+          - controller_network_cleanup == 'not_allocated'
+          - controller_deadline_cleanup == 'retained'
+      when:
+        - template_execution_recovery.terminal_bash_gate_fence is defined
+        - controller_journal.phase == 'closed'
+
+    - name: Authenticate unchanged closed record and absent allocations without creating anything
+      ansible.builtin.shell: |
+        exec timeout -k 2 15 /bin/sh <<'OPSCTL_FINALIZER'
+        set -eu
+        test -d "$RECORD"
+        test ! -L "$RECORD"
+        test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
+        test -f "$RECORD/lock"
+        test ! -L "$RECORD/lock"
+        case "$(stat -c '%u:%a:%h:%s' "$RECORD/lock")" in
+          0:600:1:0|0:644:1:0) ;; *) exit 65 ;;
+        esac
+        exec 8<"$RECORD/lock"
+        flock -x -w 5 8
+        test -f "$RECORD/journal.json"
+        test ! -L "$RECORD/journal.json"
+        test "$(stat -c '%u:%a' "$RECORD/journal.json")" = 0:600
+        actual=$(sha256sum "$RECORD/journal.json")
+        test "${actual%% *}" = "$EXPECTED"
+        test -f "$RECORD/closed"
+        test ! -L "$RECORD/closed"
+        test "$(stat -c '%u:%a:%h:%s' "$RECORD/closed")" = 0:600:1:7
+        test "$(cat "$RECORD/closed"; printf '.')" = "$(printf 'closed\n.')"
+        for identity in container-id source-digest input-digest; do
+          test -f "$RECORD/$identity"
+          test ! -L "$RECORD/$identity"
+          test "$(stat -c '%u:%a:%h:%s' "$RECORD/$identity")" = 0:600:1:65
+        done
+        test "$(cat "$RECORD/container-id")" = "$CONTAINER"
+        test "$(cat "$RECORD/source-digest")" = "$SOURCE"
+        test "$(cat "$RECORD/input-digest")" = "$INPUT"
+        for allocation in "$RECORD/source" "$RECORD/keys" "$RECORD/gate" "$WORKSPACE"; do
+          test ! -e "$allocation"
+          test ! -L "$allocation"
+        done
+        OPSCTL_FINALIZER
+      args:
+        executable: /bin/sh
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+        RECORD: "{{ controller_record }}"
+        DEVICE: "{{ controller_record_identity.stat.dev | string }}"
+        INODE: "{{ controller_record_identity.stat.inode | string }}"
+        EXPECTED: "{{ controller_journal_after.stat.checksum }}"
+        CONTAINER: "{{ controller_container_id }}"
+        SOURCE: "{{ controller_journal.source_digest }}"
+        INPUT: "{{ controller_journal.input_digest }}"
+        WORKSPACE: "{{ controller_journal.source_workspace }}"
+      changed_when: false
+      when:
+        - template_execution_recovery.terminal_bash_gate_fence is defined
+        - controller_journal.phase == 'closed'
+
+    - name: Resume only the remaining deadline without upgrading historical writer completion
+      ansible.builtin.set_fact:
+        controller_partial_finalizer: true
+        controller_effect_fenced: true
+      when:
+        - template_execution_recovery.terminal_bash_gate_fence is defined
+        - controller_journal.phase == 'closed'
+
     - name: Qualify only the allocation-complete unreleased Bash effect fence
       ansible.builtin.assert:
         that:
@@ -333,7 +411,9 @@
           - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_journal.source_workspace) | selectattr('Destination', 'equalto', '/workspace/user') | list | length == 1
           - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_record + '/gate') | selectattr('Destination', 'equalto', '/run/opsctl-gate') | list | length == 1
           - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_record + '/keys') | selectattr('Destination', 'equalto', '/run/opsctl-keys') | list | length == 1
-      when: template_execution_recovery.terminal_bash_gate_fence is defined
+      when:
+        - template_execution_recovery.terminal_bash_gate_fence is defined
+        - not controller_partial_finalizer
 
     - name: Retain the qualified exception without declaring preparer completion
       ansible.builtin.set_fact:
@@ -376,7 +456,9 @@
               - controller_fence_source.stat.inode == controller_journal.source_identity.inode
               - controller_fence_source.stat.uid == controller_journal.uid
               - controller_fence_source.stat.mode == '0700'
-      when: controller_terminal_gate_fence_qualified
+      when:
+        - controller_terminal_gate_fence_qualified
+        - not controller_partial_finalizer
 
     - name: Collect only current safe native and marker observations
       block:
@@ -497,6 +579,7 @@
       when:
         - template_execution_recovery.mode == 'settle'
         - controller_writer_closed or controller_terminal_gate_fence_qualified
+        - not controller_partial_finalizer
 
     - name: Read bounded positive official-only logs without invoking closure
       ansible.builtin.include_tasks: user_ansible_controller_cleanup.yml

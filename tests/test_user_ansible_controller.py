@@ -475,6 +475,95 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertFalse(any('start' in call['argv'] or 'logs' in call['argv']
                                      for call in self.calls() if call['tool'] == 'docker'))
 
+    def test_partial_finalizer_replay_preserves_history_without_material_recreation(self):
+        for case in ('closed', 'linked-material', 'missing-tombstone'):
+            with self.subTest(case=case):
+                record, journal, _native = self.gate_pending_fixture(self.root / case, 'failed')
+                producer = named(self.private_cleanup()['block'],
+                    'Retain a closed nonprivate record so re-entry cannot redispatch')
+                produced, facts = self.run_tasks([producer], {
+                    'controller_record': str(record), 'controller_record_owned': True})
+                self.assertEqual(produced.returncode, 0, produced.stdout + produced.stderr)
+                self.assertFalse(facts['failed'])
+                self.assertEqual((record / 'closed').read_bytes(), b'closed\n')
+                self.assertEqual(stat.S_IMODE((record / 'closed').stat().st_mode), 0o600)
+                for name in ('source', 'keys', 'gate'):
+                    shutil.rmtree(record / name)
+                (record.parent / 'container-present').unlink()
+                (record / 'lock').write_bytes(b'')
+                (record / 'lock').chmod(0o600)
+                journal.update(phase='closed', material_cleanup='removed')
+                self.persist_fixture(record, journal)
+                if case == 'linked-material':
+                    (record / 'keys').symlink_to(self.sentinel)
+                elif case == 'missing-tombstone':
+                    (record / 'closed').unlink()
+                before = self.record_snapshot(record)
+                self.bind_transport({'systemctl': [
+                    {'stdout': 'ActiveState=inactive\nLastTriggerUSecMonotonic=0\n'},
+                    {'rc': 1, 'stdout': 'PRIVATE_STOP_MARKER'}, {'rc': 3}, {'rc': 4}]})
+                result, report, _progress, terminal = self.run_recovery_play(
+                    record, {'exists': False}, self.fence_carrier())
+                success = case == 'closed'
+                self.assertEqual(result.returncode, 0 if success else 2,
+                                 result.stdout + result.stderr)
+                self.assertEqual(terminal['status'], 'completed' if success else 'failed')
+                self.assertEqual(report['outcome'], 'failed')
+                self.assertEqual(report['exit_code'], 37 if success else None)
+                self.assertEqual(report['process_closed'], success)
+                self.assertEqual(report['material_cleanup'], 'removed')
+                self.assertEqual(report['network_cleanup'], 'not_allocated')
+                self.assertEqual(report['deadline_cleanup'], 'removed' if success else 'retained')
+                after = self.record_snapshot(record)
+                self.assertEqual({key: value for key, value in after.items() if key != 'journal.json'},
+                                 {key: value for key, value in before.items() if key != 'journal.json'})
+                persisted = json.loads((record / 'journal.json').read_text())
+                for field in ('outcome', 'reason', 'original_reason', 'exit_code', 'writer_closed'):
+                    self.assertEqual(persisted[field], journal[field])
+                self.assertFalse(persisted['writer_closed'])
+                self.assertFalse((record / 'writer-closed').exists())
+                self.assertNotIn('PRIVATE_STOP_MARKER', result.stdout + result.stderr)
+                self.assertFalse(any(call['tool'] == 'docker' for call in self.calls()))
+                calls = [call['argv'] for call in self.calls() if call['tool'] == 'systemctl']
+                if success:
+                    self.assertEqual([call[0] for call in calls],
+                                     ['show', 'stop', 'is-active', 'is-active'])
+                    self.assertEqual(persisted['deadline_cleanup'], 'removed')
+                else:
+                    self.assertEqual(calls, [])
+                    self.assertEqual(after, before)
+
+    def test_deadline_stop_failure_requires_both_authoritative_unit_readbacks(self):
+        task = named(self.cleanup, 'Settle the independent deadline after process and private closure')
+        unit = 'opsctl-user-ansible-' + OPERATION
+        for case, states in (
+                ('inactive', [{'rc': 3}, {'rc': 4}]),
+                ('active', [{'rc': 0, 'stdout': 'active'}, {'rc': 3}]),
+                ('unknown', [{'rc': 3}, {'rc': 1, 'stdout': 'PRIVATE_READ_MARKER'}])):
+            with self.subTest(case=case):
+                self.bind_transport({'systemctl': [{'rc': 1, 'stdout': 'PRIVATE_STOP_MARKER'},
+                                                  *states]})
+                result, facts = self.run_tasks([task], {
+                    'controller_unit': unit, 'controller_process_closed': True,
+                    'controller_writer_closed': True, 'controller_material_cleanup': 'removed',
+                    'controller_deadline_cleanup': 'retained', 'controller_outcome': 'failed',
+                    'controller_reason': 'execution_failed', 'controller_original_reason': 'delivery_failed',
+                    'controller_execution_known': True}, exports=[
+                        'controller_deadline_cleanup', 'controller_outcome',
+                        'controller_reason', 'controller_original_reason'])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(facts['controller_deadline_cleanup'],
+                                 'removed' if case == 'inactive' else 'retained')
+                self.assertEqual(facts['controller_outcome'], 'failed')
+                self.assertEqual(facts['controller_original_reason'], 'delivery_failed')
+                self.assertEqual(facts['controller_reason'],
+                                 'execution_failed' if case == 'inactive' else 'cleanup_failed')
+                self.assertEqual([call['argv'] for call in self.calls() if call['tool'] == 'systemctl'], [
+                    ['stop', unit + '.timer', unit + '.service'],
+                    ['is-active', unit + '.timer'], ['is-active', unit + '.service']])
+                self.assertNotIn('PRIVATE_STOP_MARKER', result.stdout + result.stderr)
+                self.assertNotIn('PRIVATE_READ_MARKER', result.stdout + result.stderr)
+
     def test_current_fence_tombstones_block_waiting_start_and_late_release(self):
         record, journal, native = self.gate_pending_fixture(self.root / 'delayed')
         self.fence_transports()
