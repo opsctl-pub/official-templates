@@ -1,0 +1,396 @@
+---
+- name: Prepare or verify the fixed managed Template runtime
+  hosts: all
+  gather_facts: false
+  become: false
+  module_defaults:
+    group/community.docker.docker:
+      docker_host: unix:///var/run/docker.sock
+      api_version: auto
+      tls: false
+      validate_certs: false
+      timeout: 10
+  environment:
+    PATH: /usr/sbin:/usr/bin:/sbin:/bin
+    DOCKER_HOST: unix:///var/run/docker.sock
+    DOCKER_CONTEXT: ''
+    DOCKER_TLS_VERIFY: ''
+    DOCKER_CERT_PATH: ''
+    DOCKER_API_VERSION: ''
+  vars:
+    runtime_image: alpine/ansible@sha256:8942d1bbd23d13ad2af40ae84241f52a796c7c6e24177587bcdcc26e1e07f91e
+    runtime_profile: managed-linux-systemd-docker-iptables-v1
+    runtime_uuid: '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  tasks:
+    - name: Initialize only safe unobserved public facts
+      ansible.builtin.set_fact:
+        runtime_operation_id: null
+        runtime_server_id: null
+        runtime_action: null
+        runtime_outcome: unsupported
+        runtime_reason: invalid_inputs
+        runtime_checks:
+          management_root: null
+          linux: null
+          systemd: null
+          rootful_docker: null
+          iptables_backend: null
+          cgroup_v2: null
+          required_tools: null
+          image_present: null
+          image_compatible: null
+
+    - name: Qualify the closed carrier before any management observation
+      block:
+        - name: Require exactly the pinned setup alternative
+          ansible.builtin.assert:
+            that:
+              - ansible_play_hosts_all | length == 1
+              - template_execution is not defined
+              - template_execution_recovery is not defined
+              - template_runtime_setup is mapping
+              - template_runtime_setup.keys() | list | sort(case_sensitive=true) == ['action', 'image', 'operation_id', 'profile', 'server_id']
+              - template_runtime_setup.operation_id is string
+              - template_runtime_setup.operation_id is regex(runtime_uuid, match_type='fullmatch')
+              - template_runtime_setup.server_id is string
+              - template_runtime_setup.server_id is regex(runtime_uuid, match_type='fullmatch')
+              - template_runtime_setup.action in ['prepare', 'verify']
+              - template_runtime_setup.image == runtime_image
+              - template_runtime_setup.profile == runtime_profile
+          no_log: true
+
+        - name: Freeze only qualified public correlation
+          ansible.builtin.set_fact:
+            runtime_operation_id: "{{ template_runtime_setup.operation_id }}"
+            runtime_server_id: "{{ template_runtime_setup.server_id }}"
+            runtime_action: "{{ template_runtime_setup.action }}"
+
+        - name: Select unavailable management until native observation succeeds
+          ansible.builtin.set_fact:
+            runtime_reason: management_unavailable
+
+        - name: Inspect the fixed trusted deadline executable
+          ansible.builtin.stat:
+            path: /usr/bin/timeout
+            follow: true
+          register: runtime_timeout
+          failed_when: false
+          no_log: true
+
+        - name: Require the existing native deadline dependency
+          ansible.builtin.assert:
+            that:
+              - runtime_timeout.stat.exists
+              - runtime_timeout.stat.isreg
+              - runtime_timeout.stat.executable
+          no_log: true
+
+        - name: Qualify GNU timeout options inside the native deadline
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', /usr/bin/timeout, --help]
+            expand_argument_vars: false
+            stdin: ''
+          register: runtime_timeout_help
+          changed_when: false
+          failed_when: false
+          async: 30
+          poll: 1
+          no_log: true
+
+        - name: Require the declared native deadline implementation
+          ansible.builtin.assert:
+            that:
+              - runtime_timeout_help.rc == 0
+              - "'GNU coreutils' in runtime_timeout_help.stdout"
+              - "'--signal' in runtime_timeout_help.stdout"
+              - "'--foreground' in runtime_timeout_help.stdout"
+          no_log: true
+
+        - name: Read actual management UID without escalation
+          ansible.builtin.command:
+            argv: [/usr/bin/timeout, --signal=KILL, '10', id, -u]
+            expand_argument_vars: false
+            stdin: ''
+          register: runtime_uid
+          changed_when: false
+          failed_when: false
+          async: 30
+          poll: 1
+          no_log: true
+
+        - name: Retain only the observed management context
+          ansible.builtin.set_fact:
+            runtime_checks: "{{ runtime_checks | combine({'management_root': (runtime_uid.stdout == '0') if runtime_uid.rc == 0 else none}) }}"
+
+        - name: Require already-authorized native root
+          ansible.builtin.assert:
+            that: runtime_checks.management_root is sameas true
+          no_log: true
+
+        - name: Select unsupported host profile until every fact is observed
+          ansible.builtin.set_fact:
+            runtime_reason: unsupported_profile
+
+        - name: Read only fixed bounded host prerequisites
+          ansible.builtin.command:
+            argv: "{{ ['/usr/bin/timeout', '--signal=KILL', '10'] + item.argv }}"
+            expand_argument_vars: false
+            stdin: ''
+          loop:
+            - {key: linux, argv: [uname, -s]}
+            - {key: pid1, argv: [readlink, -f, /proc/1/exe]}
+            - {key: systemd, argv: [systemctl, is-active, docker]}
+            - {key: controllers, argv: [cat, /sys/fs/cgroup/cgroup.controllers]}
+            - {key: flock, argv: [flock, --help]}
+            - {key: systemd_run, argv: [systemd-run, --help]}
+            - {key: iconv, argv: [iconv, --help]}
+            - {key: iptables, argv: [iptables, --help]}
+            - {key: ip6tables, argv: [ip6tables, --help]}
+            - {key: nsenter, argv: [nsenter, --help]}
+            - {key: docker, argv: [docker, --help]}
+            - {key: docker_user, argv: [iptables, -w, '5', -S, DOCKER-USER]}
+          register: runtime_native
+          changed_when: false
+          failed_when: false
+          async: 30
+          poll: 1
+          no_log: true
+
+        - name: Index only this fixed private observation set
+          ansible.builtin.set_fact:
+            runtime_reads: "{{ dict(runtime_native.results | map(attribute='item.key') | zip(runtime_native.results)) }}"
+          no_log: true
+
+        - name: Retain independently observed native profile facts
+          ansible.builtin.set_fact:
+            runtime_checks: >-
+              {{ runtime_checks | combine({
+                'linux': (runtime_reads.linux.stdout == 'Linux') if runtime_reads.linux.rc == 0 else none,
+                'systemd': ((runtime_reads.pid1.stdout is regex('/.*/systemd', match_type='fullmatch')) and runtime_reads.systemd.stdout == 'active') if runtime_reads.pid1.rc == 0 and runtime_reads.systemd.rc == 0 else none,
+                'required_tools': (runtime_reads.flock.rc == 0 and '--exclusive' in runtime_reads.flock.stdout and '--timeout' in runtime_reads.flock.stdout and runtime_reads.systemd_run.rc == 0 and '--on-active' in runtime_reads.systemd_run.stdout and '--timer-property' in runtime_reads.systemd_run.stdout and runtime_reads.iconv.rc == 0 and '-c' in runtime_reads.iconv.stdout and runtime_reads.iptables.rc == 0 and '--wait' in runtime_reads.iptables.stdout and runtime_reads.ip6tables.rc == 0 and '--wait' in runtime_reads.ip6tables.stdout and runtime_reads.nsenter.rc == 0 and '--net' in runtime_reads.nsenter.stdout and runtime_reads.docker.rc == 0)
+              }) }}
+          no_log: true
+
+        - name: Select unavailable management before daemon reads
+          ansible.builtin.set_fact:
+            runtime_reason: management_unavailable
+
+        - name: Observe this local daemon without unrelated object enumeration
+          community.docker.docker_host_info:
+            containers: false
+            images: false
+            networks: false
+            volumes: false
+            disk_usage: false
+          register: runtime_daemon
+          failed_when: false
+          no_log: true
+
+        - name: Require a complete private daemon observation without exposing failure detail
+          ansible.builtin.assert:
+            that: runtime_daemon.host_info is defined and runtime_daemon.host_info is mapping
+            fail_msg: Local daemon observation unavailable.
+          no_log: true
+
+        - name: Retain private local daemon facts
+          ansible.builtin.set_fact:
+            runtime_info: "{{ runtime_daemon.host_info }}"
+          no_log: true
+
+        - name: Qualify only versioned direct effective backend evidence
+          ansible.builtin.set_fact:
+            runtime_checks: >-
+              {{ runtime_checks | combine({
+                'linux': runtime_checks.linux and runtime_info.OSType == 'linux',
+                'rootful_docker': ('name=rootless' not in runtime_info.SecurityOptions and 'name=userns' not in runtime_info.SecurityOptions) if runtime_info.SecurityOptions is defined and runtime_info.SecurityOptions is sequence and runtime_info.SecurityOptions is not string else none,
+                'iptables_backend': (runtime_info.FirewallBackend.Driver == 'iptables' and runtime_reads.docker_user.rc == 0) if runtime_info.ID | default('') | length > 0 and runtime_info.ServerVersion in ['29.0.0', '29.8.0'] and runtime_info.FirewallBackend is defined and runtime_info.FirewallBackend is mapping and runtime_info.FirewallBackend.Driver | default('') in ['iptables', 'nftables'] else none,
+                'cgroup_v2': (runtime_info.CgroupVersion == '2' and runtime_info.CgroupDriver == 'systemd' and ['cpu', 'memory', 'pids'] | difference(runtime_reads.controllers.stdout.split()) | length == 0 and runtime_info.MemoryLimit is sameas true and runtime_info.SwapLimit is sameas true and runtime_info.CpuCfsQuota is sameas true and runtime_info.CpuCfsPeriod is sameas true and runtime_info.PidsLimit is sameas true) if runtime_reads.controllers.rc == 0 else none
+              }) }}
+          no_log: true
+
+        - name: Refuse unsupported or unavailable profile before any image pull
+          ansible.builtin.set_fact:
+            runtime_reason: unsupported_profile
+
+        - name: Require all host eligibility checks
+          ansible.builtin.assert:
+            that: runtime_checks.values() | list | reject('none') | list | reject('sameas', true) | list | length == 0 and runtime_checks.values() | list | select('none') | list | length == 2
+          no_log: true
+
+        - name: Select unavailable image observation
+          ansible.builtin.set_fact:
+            runtime_reason: image_unavailable
+
+        - name: Inspect only the fixed local image
+          community.docker.docker_image_info:
+            name: "{{ runtime_image }}"
+          register: runtime_inspection
+          failed_when: false
+          no_log: true
+
+        - name: Require complete private image observation
+          ansible.builtin.assert:
+            that: runtime_inspection.images is defined and runtime_inspection.images | type_debug == 'list'
+            fail_msg: Image observation unavailable.
+          no_log: true
+
+        - name: Retain image presence even if later preparation fails
+          ansible.builtin.set_fact:
+            runtime_checks: "{{ runtime_checks | combine({'image_present': runtime_inspection.images | length > 0}) }}"
+          no_log: true
+
+        - name: Select setup failure only for authorized preparation
+          ansible.builtin.set_fact:
+            runtime_reason: setup_failed
+            runtime_outcome: failed
+          when: runtime_action == 'prepare'
+
+        - name: Prepare only the fixed digest and platform when needed
+          community.docker.docker_image_pull:
+            name: "{{ runtime_image }}"
+            platform: linux/amd64
+            pull: not_present
+          when: runtime_action == 'prepare'
+          register: runtime_pull
+          failed_when: false
+          no_log: true
+
+        - name: Require a successful private pull observation before reinspection
+          ansible.builtin.assert:
+            that: runtime_pull.image is defined and runtime_pull.image is mapping
+            fail_msg: Runtime image preparation failed.
+          when: runtime_action == 'prepare'
+          no_log: true
+
+        - name: Reinspect the exact prepared image
+          community.docker.docker_image_info:
+            name: "{{ runtime_image }}"
+          register: runtime_prepared
+          failed_when: false
+          when: runtime_action == 'prepare'
+          no_log: true
+
+        - name: Require complete prepared image observation
+          ansible.builtin.assert:
+            that: runtime_prepared.images is defined and runtime_prepared.images | type_debug == 'list'
+            fail_msg: Prepared image observation unavailable.
+          when: runtime_action == 'prepare'
+          no_log: true
+
+        - name: Select the actual final local image observation
+          ansible.builtin.set_fact:
+            runtime_images: "{{ runtime_prepared.images if runtime_action == 'prepare' else runtime_inspection.images }}"
+            runtime_outcome: unsupported
+            runtime_reason: image_unavailable
+          no_log: true
+
+        - name: Retain observed image presence
+          ansible.builtin.set_fact:
+            runtime_checks: "{{ runtime_checks | combine({'image_present': runtime_images | length > 0}) }}"
+          no_log: true
+
+        - name: Require one observed image
+          ansible.builtin.assert:
+            that: runtime_images | length == 1
+          no_log: true
+
+        - name: Retain exact metadata compatibility without interpreter execution
+          ansible.builtin.set_fact:
+            runtime_reason: image_incompatible
+            runtime_checks: >-
+              {{ runtime_checks | combine({'image_compatible':
+                runtime_images[0].Id is regex('sha256:[a-f0-9]{64}', match_type='fullmatch') and
+                runtime_image in runtime_images[0].RepoDigests | default([], true) and
+                runtime_images[0].Os == 'linux' and runtime_images[0].Architecture == 'amd64' and
+                runtime_images[0].Config.Volumes | default({}, true) | length == 0}) }}
+          no_log: true
+
+        - name: Require exact compatible metadata
+          ansible.builtin.assert:
+            that: runtime_checks.image_compatible is sameas true
+          no_log: true
+
+        - name: Select management uncertainty until daemon identity is requalified
+          ansible.builtin.set_fact:
+            runtime_reason: management_unavailable
+            runtime_checks: "{{ runtime_checks | combine({'rootful_docker': none, 'iptables_backend': none, 'cgroup_v2': none}) }}"
+          no_log: true
+
+        - name: Reobserve the same local daemon before eligibility
+          community.docker.docker_host_info:
+            containers: false
+            images: false
+            networks: false
+            volumes: false
+            disk_usage: false
+          register: runtime_final_daemon
+          failed_when: false
+          no_log: true
+
+        - name: Require complete private final daemon observation
+          ansible.builtin.assert:
+            that: runtime_final_daemon.host_info is defined and runtime_final_daemon.host_info is mapping
+            fail_msg: Final daemon observation unavailable.
+          no_log: true
+
+        - name: Refuse changed daemon or effective profile evidence
+          ansible.builtin.assert:
+            that:
+              - runtime_final_daemon.host_info.ID == runtime_info.ID
+              - runtime_final_daemon.host_info.ServerVersion == runtime_info.ServerVersion
+              - runtime_final_daemon.host_info.FirewallBackend == runtime_info.FirewallBackend
+              - runtime_final_daemon.host_info.SecurityOptions == runtime_info.SecurityOptions
+              - runtime_final_daemon.host_info.CgroupVersion == runtime_info.CgroupVersion
+              - runtime_final_daemon.host_info.CgroupDriver == runtime_info.CgroupDriver
+              - runtime_final_daemon.host_info.MemoryLimit == runtime_info.MemoryLimit
+              - runtime_final_daemon.host_info.SwapLimit == runtime_info.SwapLimit
+              - runtime_final_daemon.host_info.CpuCfsQuota == runtime_info.CpuCfsQuota
+              - runtime_final_daemon.host_info.CpuCfsPeriod == runtime_info.CpuCfsPeriod
+              - runtime_final_daemon.host_info.PidsLimit == runtime_info.PidsLimit
+          no_log: true
+
+        - name: Report eligible metadata and prerequisite observations only
+          ansible.builtin.set_fact:
+            runtime_outcome: eligible
+            runtime_reason: ready
+            runtime_checks: "{{ runtime_checks | combine({'rootful_docker': true, 'iptables_backend': true, 'cgroup_v2': true}) }}"
+      rescue:
+        - name: Retain truthful otherwise observed facts without native error detail
+          ansible.builtin.debug:
+            msg: Runtime eligibility was not established.
+
+    - name: Publish only a complete bounded safe result
+      block:
+        - name: Serialize the one plain public result
+          ansible.builtin.set_fact:
+            runtime_wire: >-
+              {{ {'template_runtime_setup_result': {
+                'operation_id': runtime_operation_id, 'server_id': runtime_server_id,
+                'action': runtime_action, 'profile': runtime_profile, 'image': runtime_image,
+                'outcome': runtime_outcome, 'reason': runtime_reason,
+                'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+                'checks': runtime_checks} } | to_json(ensure_ascii=true) }}
+          no_log: true
+
+        - name: Bound the exact public envelope including prefix and newline
+          ansible.builtin.assert:
+            that: runtime_wire | length + 22 <= 16384
+          no_log: true
+      rescue:
+        - name: Serialize only closed unavailable fallback facts
+          ansible.builtin.set_fact:
+            runtime_wire: >-
+              {{ {'template_runtime_setup_result': {
+                'operation_id': none, 'server_id': none, 'action': none,
+                'profile': runtime_profile, 'image': runtime_image,
+                'outcome': 'unsupported', 'reason': 'management_unavailable',
+                'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+                'checks': {'management_root': none, 'linux': none, 'systemd': none,
+                  'rootful_docker': none, 'iptables_backend': none, 'cgroup_v2': none,
+                  'required_tools': none, 'image_present': none, 'image_compatible': none}}
+                } | to_json(ensure_ascii=true) }}
+          no_log: true
+
+    - name: Emit one safe public runtime eligibility result
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ runtime_wire }}"
