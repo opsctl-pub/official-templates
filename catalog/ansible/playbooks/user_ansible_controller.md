@@ -143,7 +143,13 @@ relax those private permissions.
 The candidate divides the writable budget between `/tmp`, `/dev` and `/dev/shm`,
 rounding each allocation down to a 4096-byte boundary. Only `/dev` explicitly
 uses `dev` for runtime device nodes, retaining nosuid/noexec/size/mode; `/tmp`
-remains nodev. Before marker release,
+remains nodev. Private IPC and an explicit nodev/nosuid/noexec `/dev/shm` tmpfs
+with mode `1777` preserve nonroot semaphore/shared-memory access; `shm_size`
+alone does not restore a child hidden by custom `/dev`. Count this allocation
+once within the three-mount total, not again from `shm_size`. The non-TTY profile
+does not provide or claim `/dev/pts` or `/dev/mqueue`. Effective mounts/caps still
+require observation; configured options alone are not containment proof.
+Before marker release,
 observe effective cgroup limits rather than infer enforcement from create options.
 
 ## Destination-Only Policy

@@ -1236,13 +1236,15 @@ class UserAnsibleControllerTests(unittest.TestCase):
                            'SecurityOpt': ['no-new-privileges:true'], 'Devices': [],
                            'PidMode': '', 'IpcMode': 'private', 'UTSMode': '', 'PortBindings': {},
                            'Tmpfs': {'/dev': 'rw,nosuid,noexec,dev,size=348160,mode=0755',
+                                     '/dev/shm': 'rw,nosuid,nodev,noexec,size=348160,mode=1777',
                                      '/tmp': 'rw,nosuid,nodev,size=348160,mode=0700,uid='
                                      + str(os.getuid()) + ',gid=' + str(os.getgid())},
                            'LogConfig': {'Type': 'json-file', 'Config': {'max-size': '1m', 'max-file': '2'}}},
             'Mounts': [{'Type': 'bind', 'RW': False}] * 3,
             'NetworkSettings': {'Networks': {'selected-network': {}}},
         }
-        for case in ['valid', 'identity-drift', 'command-drift', 'missing-dev-drift', 'policy-failure',
+        for case in ['valid', 'identity-drift', 'command-drift', 'missing-dev-drift',
+                     'missing-shm-drift', 'malformed-shm-drift', 'shared-ipc-drift', 'policy-failure',
                      'bash-valid', 'bash-network-drift', 'bash-command-drift', 'bash-expired']:
             with self.subTest(case=case):
                 bash = case.startswith('bash-')
@@ -1276,6 +1278,12 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     container['Id'] = 'f' * 64
                 if case == 'missing-dev-drift':
                     container['HostConfig']['Tmpfs']['/dev'] = 'rw,nosuid,noexec,size=348160,mode=0755'
+                if case == 'missing-shm-drift':
+                    del container['HostConfig']['Tmpfs']['/dev/shm']
+                if case == 'malformed-shm-drift':
+                    container['HostConfig']['Tmpfs']['/dev/shm'] = 'rw,nosuid,nodev,noexec,size=348160,mode=0755'
+                if case == 'shared-ipc-drift':
+                    container['HostConfig']['IpcMode'] = 'shareable'
                 if case in ('command-drift', 'bash-command-drift'):
                     container['Config']['Cmd'][-1] = '@/arbitrary.json'
                 start = named(self.prepare, 'Start only the trusted gate then install and observe namespace policy under the lock')
@@ -1311,6 +1319,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(args['cap_drop'], ['ALL'])
                 self.assertEqual(args['capabilities'], [])
                 self.assertEqual(args['security_opts'], ['no-new-privileges:true'])
+                self.assertEqual(args['ipc_mode'], 'private')
                 self.assertEqual(args['memory_swap'], args['memory'])
                 self.assertEqual(args['command'], ['/run/opsctl-gate'] + self.payload_argv())
                 self.assertEqual(args['entrypoint'], observed['Config']['Entrypoint'])
@@ -1319,10 +1328,10 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(args['tmpfs'], [
                     '/tmp:' + observed['HostConfig']['Tmpfs']['/tmp'],
                     '/dev:' + observed['HostConfig']['Tmpfs']['/dev'],
+                    '/dev/shm:' + observed['HostConfig']['Tmpfs']['/dev/shm'],
                 ])
                 self.assertEqual(int(args['shm_size']), observed['HostConfig']['ShmSize'])
-                self.assertEqual(sum(int(item.split('size=')[1].split(',')[0]) for item in args['tmpfs'])
-                                 + int(args['shm_size']), 1044480)
+                self.assertEqual(sum(int(item.split('size=')[1].split(',')[0]) for item in args['tmpfs']), 1044480)
                 self.assertLessEqual(1044480, self.carrier['limits']['tmpfs_mib'] * 1048576)
                 calls = self.calls()
                 self.assertEqual((record / 'gate/release').exists(), valid)
@@ -1333,6 +1342,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(args['env'], {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin'})
                     self.assertFalse(any(call['tool'] in ('iptables', 'nsenter', 'ip6tables') for call in calls))
                 if case in ['identity-drift', 'command-drift', 'missing-dev-drift',
+                            'missing-shm-drift', 'malformed-shm-drift', 'shared-ipc-drift',
                             'bash-network-drift', 'bash-command-drift']:
                     self.assertFalse(any(call['tool'] in ['systemd-run', 'docker', 'nsenter'] for call in calls))
                     continue

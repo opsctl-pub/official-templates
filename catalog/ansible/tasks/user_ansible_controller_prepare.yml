@@ -796,7 +796,9 @@
     tmpfs:
       - "/tmp:rw,nosuid,nodev,size={{ controller_writable_bytes }},mode=0700,uid={{ template_execution.uid }},gid={{ template_execution.gid }}"
       - "/dev:rw,nosuid,noexec,dev,size={{ controller_writable_bytes }},mode=0755"
+      - "/dev/shm:rw,nosuid,nodev,noexec,size={{ controller_writable_bytes }},mode=1777"
     shm_size: "{{ controller_writable_bytes | string }}"
+    ipc_mode: private
     cpus: "{{ template_execution.limits.cpu_millicores / 1000 }}"
     memory: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
     memory_swap: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
@@ -880,7 +882,7 @@
       - controller_stopped.container.HostConfig.SecurityOpt | default([], true) is contains('no-new-privileges:true')
       - controller_stopped.container.HostConfig.Devices | default([], true) | length == 0
       - controller_stopped.container.HostConfig.PidMode != 'host'
-      - controller_stopped.container.HostConfig.IpcMode != 'host'
+      - controller_stopped.container.HostConfig.IpcMode == 'private'
       - controller_stopped.container.HostConfig.UTSMode != 'host'
       - controller_stopped.container.HostConfig.PortBindings | default({}, true) | length == 0
       - controller_stopped.container.HostConfig.NetworkMode == ('none' if controller_payload_engine == 'bash' else controller_network_name)
@@ -888,8 +890,9 @@
       - controller_stopped.container.Mounts | rejectattr('Type', 'in', ['bind', 'tmpfs']) | list | length == 0
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == 3
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | selectattr('RW', 'equalto', true) | list | length == 0
-      - controller_stopped.container.HostConfig.Tmpfs.keys() | list | sort(case_sensitive=true) == ['/dev', '/tmp']
+      - controller_stopped.container.HostConfig.Tmpfs.keys() | list | sort(case_sensitive=true) == ['/dev', '/dev/shm', '/tmp']
       - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,dev,size=' + (controller_writable_bytes | string) + ',mode=0755'
+      - controller_stopped.container.HostConfig.Tmpfs['/dev/shm'] == 'rw,nosuid,nodev,noexec,size=' + (controller_writable_bytes | string) + ',mode=1777'
       - controller_stopped.container.HostConfig.Tmpfs['/tmp'] == 'rw,nosuid,nodev,size=' + (controller_writable_bytes | string) + ',mode=0700,uid=' + (template_execution.uid | string) + ',gid=' + (template_execution.gid | string)
       - controller_stopped.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
       - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate'] + controller_payload_argv
