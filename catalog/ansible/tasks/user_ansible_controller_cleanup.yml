@@ -176,6 +176,7 @@
           - controller_before_remove.container.Config.Labels['opsctl.operation'] == controller_cleanup_operation
           - controller_before_remove.container.Config.Labels['opsctl.source_digest'] == controller_journal.source_digest
           - controller_before_remove.container.Config.Labels['opsctl.input_digest'] == controller_journal.input_digest
+          - controller_before_remove.container.Config.Labels['opsctl.payload_engine'] == controller_journal.payload_engine
           - not controller_before_remove.container.State.Running
           - controller_before_remove.container.State.Pid == 0
       when:
@@ -323,7 +324,7 @@
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
     - not (controller_collect_only | default(false))
-    - controller_network_cleanup != 'removed'
+    - controller_network_cleanup == 'retained'
     - controller_writer_closed | default(false)
   no_log: true
 

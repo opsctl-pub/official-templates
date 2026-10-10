@@ -118,7 +118,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'controller_server_id': '00000000-0000-4000-8000-000000000002',
             'image': 'qualified.invalid/ansible@sha256:' + 'c' * 64,
             'uid': os.getuid(), 'gid': os.getgid(), 'entrypoint': 'playbook.yml',
-            'targets': [{'address': '192.0.2.3'}],
+            'payload_engine': 'ansible',
+            'targets': [{'address': '192.0.2.3', 'credential_file': 'synthetic-key'}],
             'limits': {'cpu_millicores': 100, 'memory_mib': 64, 'tmpfs_mib': 1,
                        'pids': 8, 'timeout_seconds': 20, 'log_bytes': 128},
         }
@@ -197,6 +198,9 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'original_reason': None, 'exit_code': 0 if outcome == 'succeeded' else None,
             'timed_out': False, 'material_cleanup': 'retained',
             'network_cleanup': 'not_allocated', 'deadline_cleanup': 'not_allocated',
+            'payload_engine': self.carrier['payload_engine'],
+            'source_mount': '/workspace/user' if self.carrier['payload_engine'] == 'bash' else '/source',
+            'payload_argv': self.payload_argv(),
         }
         for name, value in [('container-id', CONTAINER), ('source-digest', self.carrier['source_digest']),
                             ('input-digest', self.carrier['input_digest'])]:
@@ -297,13 +301,28 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'Id': CONTAINER, 'Config': {'Labels': {
                 'opsctl.operation': OPERATION,
                 'opsctl.source_digest': self.carrier['source_digest'],
-                'opsctl.input_digest': self.carrier['input_digest']}},
+                'opsctl.input_digest': self.carrier['input_digest'],
+                'opsctl.payload_engine': self.carrier['payload_engine']},
+                'Cmd': ['/run/opsctl-gate'] + self.payload_argv()},
+            'HostConfig': {'NetworkMode': 'none' if self.carrier['payload_engine'] == 'bash'
+                           else 'opsctl-user-' + OPERATION},
+            'NetworkSettings': {'Networks': {'none' if self.carrier['payload_engine'] == 'bash'
+                                            else 'opsctl-user-' + OPERATION: {}}},
             'State': {'Running': running, 'Pid': 123 if running else 0, 'ExitCode': 0}}}
+
+    def payload_argv(self):
+        if self.carrier['payload_engine'] == 'bash':
+            return ['/bin/bash', '--noprofile', '--norc',
+                    '/workspace/user/' + self.carrier['entrypoint'], '/run/opsctl-keys/inputs.json']
+        return ['/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json',
+                '/source/' + self.carrier['entrypoint'], '--extra-vars', '@/run/opsctl-keys/inputs.json']
 
     def test_zero_log_observe_preserves_original_resources_and_unknown_liability(self):
         self.bind_transport({})
-        for case in ('running', 'stopped', 'absent', 'unavailable', 'foreign', 'missing', 'conflict'):
+        for case in ('running', 'stopped', 'absent', 'unavailable', 'foreign', 'missing', 'conflict',
+                     'bash-running', 'bash-stopped', 'bash-unavailable', 'missing-engine', 'bash-network'):
             with self.subTest(case=case):
+                self.carrier['payload_engine'] = 'bash' if case.startswith('bash-') else 'ansible'
                 directory = self.root / case
                 record, journal = self.record_fixture(directory, outcome='succeeded')
                 if case == 'conflict':
@@ -311,12 +330,17 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.persist_fixture(record, journal)
                 if case == 'missing':
                     (record / 'journal.json').unlink()
-                native = self.native_observation(running=case == 'running')
+                if case == 'missing-engine':
+                    del journal['payload_engine']
+                    self.persist_fixture(record, journal)
+                native = self.native_observation(running=case in ('running', 'bash-running'))
+                if case == 'bash-network':
+                    native['container']['HostConfig']['NetworkMode'] = 'bridge'
                 if case == 'foreign':
                     native['container']['Config']['Labels']['opsctl.operation'] = 'foreign'
                 if case == 'absent':
                     native = {'exists': False}
-                if case == 'unavailable':
+                if case in ('unavailable', 'bash-unavailable'):
                     native = 'unavailable'
                 before = self.record_snapshot(record)
                 result, facts = self.run_tasks(self.recovery_tasks(record, native), {
@@ -329,8 +353,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(facts['controller_logs'], '')
                 self.assertFalse(facts['controller_logs_truncated'])
                 self.assertEqual(facts['controller_outcome'],
-                                 'unknown' if case in ('missing', 'conflict') else 'succeeded')
-                closed = case in ('stopped', 'absent')
+                                 'unknown' if case in ('missing', 'conflict', 'missing-engine') else 'succeeded')
+                closed = case in ('stopped', 'absent', 'bash-stopped')
                 self.assertEqual(facts['controller_process_closed'], closed)
                 self.assertEqual(facts['controller_exit_code'], 0 if closed else None)
                 self.assertEqual(facts['controller_material_cleanup'], 'retained')
@@ -345,8 +369,9 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(self.calls(), [])
 
     def test_zero_log_settle_replay_and_pending_writer_keep_original_outcome(self):
-        for case in ('settle', 'pending-writer', 'unavailable'):
+        for case in ('settle', 'pending-writer', 'unavailable', 'bash-settle', 'bash-unavailable'):
             with self.subTest(case=case):
+                self.carrier['payload_engine'] = 'bash' if case.startswith('bash-') else 'ansible'
                 record, journal = self.record_fixture(
                     self.root / case, outcome='succeeded', writer_closed=case != 'pending-writer')
                 workspace = record / 'source/opsctl-template-fixture'
@@ -364,7 +389,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                                      self.carrier['input_digest']]) + ' false 0\n'
                 self.bind_transport({'docker': [{'stdout': identity}] * 4})
                 result, facts = self.run_tasks(self.recovery_tasks(
-                    record, 'unavailable' if case == 'unavailable' else self.native_observation()), {
+                    record, 'unavailable' if case.endswith('unavailable') else self.native_observation()), {
                     'template_execution_recovery': self.recovery_carrier('settle')},
                     exports=['controller_outcome', 'controller_process_closed', 'controller_exit_code',
                              'controller_logs', 'controller_logs_truncated', 'controller_material_cleanup'])
@@ -378,7 +403,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(persisted['outcome'], 'succeeded')
                 self.assertEqual(persisted['exit_code'], 0)
                 self.assertEqual(persisted['reason'], 'exited')
-                if case == 'settle':
+                if case.endswith('settle'):
                     self.assertEqual(facts['controller_material_cleanup'], 'removed')
                     self.assertFalse((record / 'source').exists())
                     self.assertTrue((record / 'closed').exists())
@@ -394,7 +419,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(facts['controller_material_cleanup'], 'retained')
                     self.assertEqual(payload.read_bytes(), b'synthetic source never executed')
                     self.assertEqual(stat.S_IMODE(payload.stat().st_mode), 0o644)
-                    if case == 'unavailable':
+                    if case.endswith('unavailable'):
                         self.assertFalse(facts['controller_process_closed'])
                         self.assertIsNone(facts['controller_exit_code'])
                         self.assertEqual(self.calls(), [])
@@ -560,8 +585,9 @@ class UserAnsibleControllerTests(unittest.TestCase):
                      if task['name'] == 'Bind finite native names to the exact Operation')
         last = next(index for index, task in enumerate(self.prepare)
                     if task['name'] == 'Observe the accepted workspace before changing only fresh ownership')
-        for case in ('fresh', 'lost-reply', 'reentry', 'reservation-race'):
+        for case in ('fresh', 'lost-reply', 'reentry', 'reservation-race', 'bash-fresh'):
             with self.subTest(case=case):
+                self.carrier['payload_engine'] = 'bash' if case == 'bash-fresh' else 'ansible'
                 directory = self.root / case
                 directory.mkdir(mode=0o700)
                 record = directory / OPERATION
@@ -572,7 +598,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 source.write_bytes(payload)
                 source.chmod(0o400)
                 self.carrier.update(staging_directory=str(stage), supplied_files=[{
-                    'source': source.name, 'path': 'playbook.yml', 'mode': '0600',
+                    'source': source.name, 'path': 'playbook.yml', 'mode': '0755' if case == 'bash-fresh' else '0600',
                     'size_bytes': len(payload), 'sha256': hashlib.sha256(payload).hexdigest()}])
                 inventory = directory / 'inventory'
                 inventory.write_text('127.0.0.1 ansible_connection=local\n')
@@ -593,11 +619,13 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 delivery['ansible.builtin.command']['argv'] = [
                     sys.executable, str(Path(__file__).resolve()), '--delivery', str(record),
                     '{{ controller_delivery_variables.path }}', '{{ inventory_file }}', case]
-                result, facts = self.run_tasks(tasks, {'inventory_file': str(inventory)},
+                result, facts = self.run_tasks([
+                    named(self.execution, "Freeze only the validated engine's native execution bindings"),
+                    *tasks], {'inventory_file': str(inventory)},
                     cleanup=[self.cleanup[0], self.private_cleanup()],
                     exports=['controller_process_closed', 'controller_material_cleanup',
                              'controller_writer_closed', 'controller_delivery_variables'])
-                self.assertEqual(result.returncode, 0 if case == 'fresh' else 2, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, 0 if case in ('fresh', 'bash-fresh') else 2, result.stdout + result.stderr)
                 self.assertFalse(facts['controller_writer_closed'])
                 self.assertEqual(facts['controller_material_cleanup'], 'retained')
                 self.assertEqual(source.read_bytes(), payload)
@@ -642,14 +670,14 @@ class UserAnsibleControllerTests(unittest.TestCase):
         create['ansible.builtin.set_fact'] = {'regression_create_arguments': options}
         observed = {
             'Id': CONTAINER, 'State': {'Running': False, 'Pid': 0},
-            'Config': {'Labels': {'opsctl.operation': OPERATION},
+            'Config': {'Labels': {'opsctl.operation': OPERATION, 'opsctl.payload_engine': 'ansible'},
                        'User': str(os.getuid()) + ':' + str(os.getgid()),
                        'Entrypoint': ['/bin/sh', '/run/opsctl-gate/start.sh'],
                        'Cmd': ['/run/opsctl-gate', '/usr/bin/ansible-playbook', '--inventory',
                                '/run/opsctl-keys/inventory.json', '/source/playbook.yml',
                                '--extra-vars', '@/run/opsctl-keys/inputs.json'],
                        'WorkingDir': '/source', 'Healthcheck': {'Test': ['NONE']}},
-            'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False, 'Memory': 67108864,
+            'HostConfig': {'NetworkMode': 'selected-network', 'ReadonlyRootfs': True, 'Privileged': False, 'Memory': 67108864,
                            'MemorySwap': 67108864, 'NanoCpus': 100000000, 'PidsLimit': 8,
                            'ShmSize': 348160, 'CapDrop': ['ALL'], 'CapAdd': [],
                            'SecurityOpt': ['no-new-privileges:true'], 'Devices': [],
@@ -661,8 +689,13 @@ class UserAnsibleControllerTests(unittest.TestCase):
             'Mounts': [{'Type': 'bind', 'RW': False}] * 3,
             'NetworkSettings': {'Networks': {'selected-network': {}}},
         }
-        for case in ['valid', 'identity-drift', 'command-drift', 'policy-failure']:
+        for case in ['valid', 'identity-drift', 'command-drift', 'policy-failure',
+                     'bash-valid', 'bash-network-drift', 'bash-command-drift', 'bash-expired']:
             with self.subTest(case=case):
+                bash = case.startswith('bash-')
+                self.carrier['payload_engine'] = 'bash' if bash else 'ansible'
+                self.carrier['targets'] = [] if bash else [{'address': '192.0.2.3',
+                                                          'credential_file': 'synthetic-key'}]
                 (record / 'gate/release').unlink(missing_ok=True)
                 responses = {'iptables': [{}] * 13, 'systemd-run': [{}],
                              'systemctl': [{'stdout': 'active\n'}, {'stdout': 'active\n'},
@@ -672,21 +705,34 @@ class UserAnsibleControllerTests(unittest.TestCase):
                              'nsenter': [{}] * 7 + [{'stdout': '-P OUTPUT DROP\n'}]}
                 if case == 'policy-failure':
                     responses['nsenter'][2] = {'rc': 37}
+                if bash:
+                    responses['docker'].insert(2, {'stdout': 'none|none,'})
+                if case == 'bash-expired':
+                    responses['systemctl'][2] = {'stdout': '1\n'}
                 self.bind_transport(responses)
                 container = copy.deepcopy(observed)
+                if bash:
+                    container['Config'].update(Labels={'opsctl.operation': OPERATION,
+                        'opsctl.payload_engine': 'bash'}, Cmd=['/run/opsctl-gate'] + self.payload_argv(),
+                        WorkingDir='/workspace/user')
+                    container['HostConfig']['NetworkMode'] = 'none'
+                    container['NetworkSettings']['Networks'] = {'none': {}}
+                if case == 'bash-network-drift':
+                    container['HostConfig']['NetworkMode'] = 'bridge'
                 if case == 'identity-drift':
                     container['Id'] = 'f' * 64
-                if case == 'command-drift':
+                if case in ('command-drift', 'bash-command-drift'):
                     container['Config']['Cmd'][-1] = '@/arbitrary.json'
                 start = named(self.prepare, 'Start only the trusted gate then install and observe namespace policy under the lock')
                 start['ansible.builtin.shell'] = start['ansible.builtin.shell'].replace(
                     '/proc/', str(self.root / 'proc') + '/').replace('/sys/fs/cgroup', str(self.root / 'cgroup'))
                 start['environment']['PATH'] = str(self.bin) + ':/usr/sbin:/usr/bin:/sbin:/bin'
-                first = next(index for index, task in enumerate(self.prepare)
+                policy = named(self.prepare, 'Install destination policy only for the explicit Ansible engine')
+                first = next(index for index, task in enumerate(policy['block'])
                              if task['name'] == 'Create an owned forwarding chain before any container starts')
-                last = next(index for index, task in enumerate(self.prepare)
-                            if task['name'] == 'Refuse an existing container rather than native replacement')
-                tasks = copy.deepcopy(self.prepare[first:last]) + [
+                policy['block'] = policy['block'][first:]
+                tasks = [named(self.execution, "Freeze only the validated engine's native execution bindings"),
+                    policy,
                     named(self.prepare, 'Retain creation uncertainty before the daemon call'), create,
                     {'ansible.builtin.set_fact': {'controller_created': {'container': {'Id': CONTAINER}},
                                                 'controller_stopped': {'exists': True, 'container': container}}},
@@ -701,7 +747,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     'controller_source_workspace': str(self.root / 'source'),
                     'controller_network_name': 'selected-network', 'controller_bridge': 'br-selected',
                     'controller_chain': 'OCselected'}, exports=['regression_create_arguments'])
-                self.assertEqual(result.returncode, 0 if case == 'valid' else 2, result.stdout + result.stderr)
+                valid = case in ('valid', 'bash-valid')
+                self.assertEqual(result.returncode, 0 if valid else 2, result.stdout + result.stderr)
                 args = facts['regression_create_arguments']
                 self.assertEqual((args['state'], args['detach'], args['pull']), ('present', True, 'never'))
                 self.assertFalse(args['privileged'])
@@ -709,26 +756,35 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(args['cap_drop'], ['ALL'])
                 self.assertEqual(args['capabilities'], [])
                 self.assertEqual(args['memory_swap'], args['memory'])
-                self.assertEqual(args['command'], observed['Config']['Cmd'])
+                self.assertEqual(args['command'], ['/run/opsctl-gate'] + self.payload_argv())
                 self.assertEqual(args['entrypoint'], observed['Config']['Entrypoint'])
                 self.assertEqual(args['healthcheck'], {'test': ['NONE']})
                 self.assertTrue(all(mount['read_only'] for mount in args['mounts']))
                 self.assertEqual(sum(int(item.split('size=')[1].split(',')[0]) for item in args['tmpfs'])
                                  + int(args['shm_size']), 1044480)
                 calls = self.calls()
-                self.assertEqual((record / 'gate/release').exists(), case == 'valid')
-                if case in ['identity-drift', 'command-drift']:
+                self.assertEqual((record / 'gate/release').exists(), valid)
+                if bash:
+                    self.assertEqual(args['network_mode'], 'none')
+                    self.assertNotIn('networks', args)
+                    self.assertEqual(args['mounts'][0]['target'], '/workspace/user')
+                    self.assertEqual(args['env'], {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin'})
+                    self.assertFalse(any(call['tool'] in ('iptables', 'nsenter', 'ip6tables') for call in calls))
+                if case in ['identity-drift', 'command-drift', 'bash-network-drift', 'bash-command-drift']:
                     self.assertFalse(any(call['tool'] in ['systemd-run', 'docker', 'nsenter'] for call in calls))
                     continue
                 timer = next(index for index, call in enumerate(calls) if call['tool'] == 'systemd-run')
+                self.assertIn('deadline', calls[timer]['argv'])
+                if case == 'bash-expired':
+                    self.assertFalse(any(call['tool'] == 'docker' for call in calls))
+                    continue
                 start_index = next(index for index, call in enumerate(calls) if call['tool'] == 'docker')
                 self.assertLess(timer, start_index)
-                self.assertIn('deadline', calls[timer]['argv'])
                 self.assertEqual(calls[start_index]['argv'], ['--host', 'unix:///var/run/docker.sock', 'start', CONTAINER])
-                if case == 'valid':
+                if valid:
                     self.assertEqual(stat.S_IMODE((record / 'gate/release').stat().st_mode), 0o444)
                     namespace_calls = [call['argv'] for call in calls if call['tool'] == 'nsenter']
-                    self.assertEqual(len(namespace_calls), 8)
+                    self.assertEqual(len(namespace_calls), 0 if bash else 8)
                     self.assertTrue(all('OUTPUT' in args for args in namespace_calls))
 
     def helper(self, name):
@@ -742,6 +798,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
         if name == 'start':
             body = body.replace('/run/opsctl-gate', str(self.root / 'gate'))
             body = body.replace('/usr/bin/ansible-playbook', str(self.bin / 'ansible-playbook'))
+            body = body.replace('/bin/bash', str(self.bin / 'bash'))
         path = self.root / (name + '.sh')
         path.write_text(body)
         return path
@@ -782,6 +839,71 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertEqual(refused.returncode, 64)
         self.assertEqual(len([call for call in self.calls() if call['tool'] == 'ansible-playbook']), 1)
 
+    def test_explicit_engine_refusals_do_not_enter_preallocation_cleanup(self):
+        first_include = next(index for index, task in enumerate(self.execution)
+                             if 'ansible.builtin.include_tasks' in task)
+        validation = self.execution[:first_include]
+        accepted = {**self.carrier, 'payload_engine': 'bash', 'targets': [],
+                    'staging_directory': str(self.root),
+                    'supplied_files': [{'path': 'playbook.yml', 'mode': '0755'}]}
+        cleanup = named(self.play['tasks'], 'Prepare run and observe the frozen invocation')['always'][0]
+        cleanup.pop('ansible.builtin.include_tasks')
+        cleanup['ansible.builtin.set_fact'] = {'regression_cleanup_entered': True}
+        for case in ('valid', 'missing', 'unsupported', 'targets', 'mode'):
+            with self.subTest(case=case):
+                self.carrier = copy.deepcopy(accepted)
+                if case == 'missing':
+                    del self.carrier['payload_engine']
+                elif case == 'unsupported':
+                    self.carrier['payload_engine'] = 'python'
+                elif case == 'targets':
+                    self.carrier['targets'] = [{'address': '192.0.2.3'}]
+                elif case == 'mode':
+                    self.carrier['supplied_files'][0]['mode'] = '0644'
+                result, facts = self.run_tasks(validation, cleanup=[cleanup],
+                    exports=['regression_cleanup_entered', 'controller_payload_argv', 'controller_reason'])
+                self.assertEqual(result.returncode, 0 if case == 'valid' else 2, result.stdout + result.stderr)
+                self.assertIsNone(facts['regression_cleanup_entered'])
+                self.assertEqual(facts['controller_reason'], 'invalid_inputs')
+                self.assertFalse(list(self.root.glob(OPERATION)))
+                if case == 'valid':
+                    self.assertEqual(facts['controller_payload_argv'], self.payload_argv())
+
+    def test_bash_gate_withholds_closes_and_preserves_exact_file_argv(self):
+        gate = self.root / 'gate'
+        gate.mkdir(mode=0o755)
+        self.bind_transport({'bash': [{'rc': 37}]})
+        helper = self.helper('start')
+        command = ['/bin/sh', str(helper), str(gate), str(self.bin / 'bash'),
+                   '--noprofile', '--norc', '/workspace/user/main.sh', '/run/opsctl-keys/inputs.json']
+        for closed in (True, False):
+            with self.subTest(closed=closed):
+                (gate / 'closed').unlink(missing_ok=True)
+                (gate / 'release').unlink(missing_ok=True)
+                process = subprocess.Popen(command, env=self.environment(), stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    time.sleep(0.2)
+                    self.assertIsNone(process.poll())
+                    self.assertFalse(any(call['tool'] == 'bash' for call in self.calls()))
+                    (gate / ('closed' if closed else 'release')).touch(mode=0o444)
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 75 if closed else 37, stdout + stderr)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+        self.assertEqual([call for call in self.calls() if call['tool'] == 'bash'],
+                         [{'tool': 'bash', 'argv': command[4:]}])
+        for rejected in (command + ['extra'], command[:-1] + ['/wrong.json'],
+                         command[:4] + ['--login', *command[5:]],
+                         command[:6] + ['/workspace/user/../main.sh', command[-1]]):
+            with self.subTest(argv=rejected):
+                result = subprocess.run(rejected, env=self.environment(), capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(result.returncode, 64)
+        self.assertEqual(len([call for call in self.calls() if call['tool'] == 'bash']), 1)
+
     def test_private_input_delivery_refusal_and_owned_cleanup(self):
         """Raw native file tasks; root observations and terminal daemon facts modeled."""
         first = next(index for index, task in enumerate(self.prepare)
@@ -794,9 +916,10 @@ class UserAnsibleControllerTests(unittest.TestCase):
                              'ansible_host': 'application-host',
                              'ansible_user': 'application-user',
                              'ansible_ssh_private_key_file': '/application/key'}}
-        cases = [*values, 'missing', 'digest', 'mode', 'symlink', 'size', 'count', 'total', 'failure']
+        cases = [*values, 'missing', 'digest', 'mode', 'symlink', 'size', 'count', 'total', 'failure', 'bash-input']
         for case in cases:
             with self.subTest(case=case):
+                self.carrier['payload_engine'] = 'bash' if case == 'bash-input' else 'ansible'
                 root = self.root / case
                 stage = root / 'staged'
                 stage.mkdir(mode=0o700, parents=True)
@@ -822,7 +945,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                         original.symlink_to('original')
                 originals = {}
                 keys = []
-                for index in range(8 if case == 'count' else 1):
+                for index in range(0 if case == 'bash-input' else 8 if case == 'count' else 1):
                     key = stage / ('key-' + str(index))
                     key.write_bytes(b'private synthetic credential')
                     key.chmod(0o600)
@@ -841,9 +964,11 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.carrier.update(staging_directory=str(stage), supplied_files=sources,
                                     targets=keys, input_digest='0' * 64 if case == 'digest'
                                     else hashlib.sha256(payload).hexdigest())
-                result, facts = self.run_tasks(copy.deepcopy(self.prepare[first:last]), {
+                result, facts = self.run_tasks([
+                    named(self.execution, "Freeze only the validated engine's native execution bindings"),
+                    *copy.deepcopy(self.prepare[first:last])], {
                     'controller_record': str(record)}, exports=['controller_delivered_input'])
-                valid = case in values or case == 'failure'
+                valid = case in values or case in ('failure', 'bash-input')
                 self.assertEqual(result.returncode, 0 if valid else 2, result.stdout + result.stderr)
                 delivered = record / 'keys/inputs.json'
                 if valid:
@@ -854,6 +979,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(facts['controller_delivered_input']['stat']['checksum'],
                                      self.carrier['input_digest'])
                     self.assertNotIn(payload.decode('utf-8'), result.stdout + result.stderr)
+                    if case == 'bash-input':
+                        self.assertEqual([path.name for path in (record / 'keys').iterdir()], ['inputs.json'])
                 else:
                     self.assertFalse(delivered.exists())
                     self.assertEqual(list((record / 'keys').iterdir()), [])
@@ -900,6 +1027,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(original.read_bytes(), payload)
                 self.assertNotIn('private synthetic credential', result.stdout + result.stderr)
         self.carrier.update(controller_server_id='00000000-0000-4000-8000-000000000002')
+        self.carrier['payload_engine'] = 'ansible'
         for reserved in ['template-inputs.json', 'inputs.json']:
             with self.subTest(credential=reserved):
                 self.carrier['targets'] = [{

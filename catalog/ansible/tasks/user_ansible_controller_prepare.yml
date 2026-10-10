@@ -8,19 +8,23 @@
     set -eu
     test "$(id -u)" = 0
     test -d /run/systemd/system
-    for tool in docker systemctl systemd-run iptables ip6tables nsenter flock timeout iconv; do
+    for tool in docker systemctl systemd-run flock timeout iconv; do
       command -v "$tool" >/dev/null
     done
     test -f /sys/fs/cgroup/cgroup.controllers
     for limit in cpu memory pids; do
       grep -qw "$limit" /sys/fs/cgroup/cgroup.controllers
     done
-    iptables -w 5 -S DOCKER-USER >/dev/null
+    if test "$ENGINE" = ansible; then
+      for tool in iptables ip6tables nsenter; do command -v "$tool" >/dev/null; done
+      iptables -w 5 -S DOCKER-USER >/dev/null
+    fi
     systemctl is-active docker >/dev/null
     docker --host unix:///var/run/docker.sock info --format '{% raw %}{{.OSType}} {{.SecurityOptions}}{% endraw %}'
   args:
     executable: /bin/sh
   environment:
+    ENGINE: "{{ controller_payload_engine }}"
     PATH: /usr/sbin:/usr/bin:/sbin:/bin
     DOCKER_HOST: unix:///var/run/docker.sock
     DOCKER_CONTEXT: ''
@@ -42,6 +46,7 @@
   ansible.builtin.setup:
     gather_subset: [network]
     filter: ansible_all_ipv4_addresses
+  when: controller_payload_engine == 'ansible'
 
 - name: Refuse every target address belonging to this controller
   ansible.builtin.assert:
@@ -145,6 +150,9 @@
           controller_server_id: "{{ template_execution.controller_server_id }}"
           source_digest: "{{ template_execution.source_digest }}"
           input_digest: "{{ template_execution.input_digest }}"
+          payload_engine: "{{ controller_payload_engine }}"
+          source_mount: "{{ controller_source_mount }}"
+          payload_argv: "{{ controller_payload_argv }}"
           record_dev: "{{ controller_record_identity.stat.dev }}"
           record_inode: "{{ controller_record_identity.stat.inode }}"
           uid: "{{ template_execution.uid }}"
@@ -381,7 +389,7 @@
     get_mime: false
   delegate_to: localhost
   become: false
-  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  loop: "{{ controller_credential_files }}"
   register: controller_credentials
   no_log: true
 
@@ -454,7 +462,7 @@
     get_mime: false
   delegate_to: localhost
   become: false
-  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  loop: "{{ controller_credential_files }}"
   register: controller_credential_checksums
   no_log: true
 
@@ -480,7 +488,7 @@
     mode: '0600'
     follow: false
     local_follow: false
-  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  loop: "{{ controller_credential_files }}"
   diff: false
   no_log: true
 
@@ -491,7 +499,7 @@
     get_checksum: true
     checksum_algorithm: sha256
     get_mime: false
-  loop: "{{ template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}"
+  loop: "{{ controller_credential_files }}"
   register: controller_delivered_credentials
   no_log: true
 
@@ -544,6 +552,7 @@
   no_log: true
 
 - name: Write immutable inventory using only central target facts
+  when: controller_payload_engine == 'ansible'
   ansible.builtin.copy:
     dest: "{{ controller_record }}/keys/inventory.json"
     owner: "{{ template_execution.uid }}"
@@ -562,6 +571,7 @@
   no_log: true
 
 - name: Write frozen host keys without TOFU or private lookup
+  when: controller_payload_engine == 'ansible'
   ansible.builtin.copy:
     dest: "{{ controller_record }}/keys/known_hosts"
     owner: "{{ template_execution.uid }}"
@@ -575,6 +585,7 @@
   no_log: true
 
 - name: Write fixed private controller configuration without platform plugins
+  when: controller_payload_engine == 'ansible'
   ansible.builtin.copy:
     dest: "{{ controller_record }}/keys/ansible.cfg"
     owner: "{{ template_execution.uid }}"
@@ -596,136 +607,139 @@
     mode: "{{ '0444' if item.endswith('start.sh') else '0700' }}"
   loop: [user_ansible_controller_start.sh, user_ansible_controller_close.sh]
 
-- name: Select operation policy failure
-  ansible.builtin.set_fact:
-    controller_reason: policy_failed
+- name: Install destination policy only for the explicit Ansible engine
+  when: controller_payload_engine == 'ansible'
+  block:
+    - name: Select operation policy failure
+      ansible.builtin.set_fact:
+        controller_reason: policy_failed
 
-- name: Refuse an existing network name rather than adopting it
-  community.docker.docker_network_info:
-    name: "{{ controller_network_name }}"
-  register: controller_existing_network
+    - name: Refuse an existing network name rather than adopting it
+      community.docker.docker_network_info:
+        name: "{{ controller_network_name }}"
+      register: controller_existing_network
 
-- name: Require an unallocated network
-  ansible.builtin.assert:
-    that: not controller_existing_network.exists
+    - name: Require an unallocated network
+      ansible.builtin.assert:
+        that: not controller_existing_network.exists
 
-- name: Retain possible network liability before native allocation
-  ansible.builtin.set_fact:
-    controller_network_cleanup: retained
-    controller_journal: "{{ controller_journal | combine({'phase': 'network_pending', 'network_cleanup': 'retained'}) }}"
+    - name: Retain possible network liability before native allocation
+      ansible.builtin.set_fact:
+        controller_network_cleanup: retained
+        controller_journal: "{{ controller_journal | combine({'phase': 'network_pending', 'network_cleanup': 'retained'}) }}"
 
-- name: Persist possible network allocation before entering the daemon
-  ansible.builtin.copy:
-    dest: "{{ controller_record }}/journal.json"
-    content: "{{ controller_journal | to_json }}"
-    owner: root
-    group: root
-    mode: '0600'
-  diff: false
+    - name: Persist possible network allocation before entering the daemon
+      ansible.builtin.copy:
+        dest: "{{ controller_record }}/journal.json"
+        content: "{{ controller_journal | to_json }}"
+        owner: root
+        group: root
+        mode: '0600'
+      diff: false
 
-- name: Allocate the exclusively owned IPv4 bridge
-  community.docker.docker_network:
-    name: "{{ controller_network_name }}"
-    driver: bridge
-    enable_ipv6: false
-    labels:
-      opsctl.operation: "{{ template_execution.operation_id }}"
-    driver_options:
-      com.docker.network.bridge.enable_icc: 'false'
-  register: controller_network
+    - name: Allocate the exclusively owned IPv4 bridge
+      community.docker.docker_network:
+        name: "{{ controller_network_name }}"
+        driver: bridge
+        enable_ipv6: false
+        labels:
+          opsctl.operation: "{{ template_execution.operation_id }}"
+        driver_options:
+          com.docker.network.bridge.enable_icc: 'false'
+      register: controller_network
 
-- name: Retain exact network identity and bridge interface
-  ansible.builtin.set_fact:
-    controller_network_id: "{{ controller_network.network.Id }}"
-    controller_bridge: "br-{{ controller_network.network.Id[:12] }}"
-    controller_network_cleanup: retained
-    controller_journal: >-
-      {{ controller_journal | combine({'network_id': controller_network.network.Id,
-      'bridge': 'br-' + controller_network.network.Id[:12], 'phase': 'policy_pending'}) }}
+    - name: Retain exact network identity and bridge interface
+      ansible.builtin.set_fact:
+        controller_network_id: "{{ controller_network.network.Id }}"
+        controller_bridge: "br-{{ controller_network.network.Id[:12] }}"
+        controller_network_cleanup: retained
+        controller_journal: >-
+          {{ controller_journal | combine({'network_id': controller_network.network.Id,
+          'bridge': 'br-' + controller_network.network.Id[:12], 'phase': 'policy_pending'}) }}
 
-- name: Persist full network identity before policy installation
-  ansible.builtin.copy:
-    dest: "{{ controller_record }}/journal.json"
-    content: "{{ controller_journal | to_json }}"
-    owner: root
-    group: root
-    mode: '0600'
-  diff: false
+    - name: Persist full network identity before policy installation
+      ansible.builtin.copy:
+        dest: "{{ controller_record }}/journal.json"
+        content: "{{ controller_journal | to_json }}"
+        owner: root
+        group: root
+        mode: '0600'
+      diff: false
 
-- name: Create an owned forwarding chain before any container starts
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -N, "{{ controller_chain }}"]
-    expand_argument_vars: false
+    - name: Create an owned forwarding chain before any container starts
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -N, "{{ controller_chain }}"]
+        expand_argument_vars: false
 
-- name: Retain only the newly created chain's ownership
-  ansible.builtin.set_fact:
-    controller_chain_owned: true
-    controller_journal: "{{ controller_journal | combine({'chain_owned': true}) }}"
+    - name: Retain only the newly created chain's ownership
+      ansible.builtin.set_fact:
+        controller_chain_owned: true
+        controller_journal: "{{ controller_journal | combine({'chain_owned': true}) }}"
 
-- name: Persist exact chain ownership before rule installation
-  ansible.builtin.copy:
-    dest: "{{ controller_record }}/journal.json"
-    content: "{{ controller_journal | to_json }}"
-    owner: root
-    group: root
-    mode: '0600'
-  diff: false
+    - name: Persist exact chain ownership before rule installation
+      ansible.builtin.copy:
+        dest: "{{ controller_record }}/journal.json"
+        content: "{{ controller_journal | to_json }}"
+        owner: root
+        group: root
+        mode: '0600'
+      diff: false
 
-- name: Permit only the exact selected IPv4 SSH destinations
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
-    expand_argument_vars: false
-  loop: "{{ template_execution.targets }}"
+    - name: Permit only the exact selected IPv4 SSH destinations
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
+        expand_argument_vars: false
+      loop: "{{ template_execution.targets }}"
 
-- name: Permit only exact selected SSH reply flows
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
-    expand_argument_vars: false
-  loop: "{{ template_execution.targets }}"
+    - name: Permit only exact selected SSH reply flows
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -A, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
+        expand_argument_vars: false
+      loop: "{{ template_execution.targets }}"
 
-- name: Reject every remaining owned bridge direction
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -A, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
-    expand_argument_vars: false
-  loop: [-i, -o]
+    - name: Reject every remaining owned bridge direction
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -A, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
+        expand_argument_vars: false
+      loop: [-i, -o]
 
-- name: Observe every exact selected outgoing allowance
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
-    expand_argument_vars: false
-  changed_when: false
-  loop: "{{ template_execution.targets }}"
+    - name: Observe every exact selected outgoing allowance
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -i, "{{ controller_bridge }}", -p, tcp, -d, "{{ item.address }}", --dport, '22', -j, ACCEPT]
+        expand_argument_vars: false
+      changed_when: false
+      loop: "{{ template_execution.targets }}"
 
-- name: Observe every exact selected reply allowance
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
-    expand_argument_vars: false
-  changed_when: false
-  loop: "{{ template_execution.targets }}"
+    - name: Observe every exact selected reply allowance
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -C, "{{ controller_chain }}", -o, "{{ controller_bridge }}", -p, tcp, -s, "{{ item.address }}", --sport, '22', -m, conntrack, --ctstate, ESTABLISHED, -j, ACCEPT]
+        expand_argument_vars: false
+      changed_when: false
+      loop: "{{ template_execution.targets }}"
 
-- name: Observe both default owned bridge rejections
-  ansible.builtin.command:
-    argv: [iptables, -w, '5', -C, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
-    expand_argument_vars: false
-  changed_when: false
-  loop: [-i, -o]
+    - name: Observe both default owned bridge rejections
+      ansible.builtin.command:
+        argv: [iptables, -w, '5', -C, "{{ controller_chain }}", "{{ item }}", "{{ controller_bridge }}", -j, REJECT]
+        expand_argument_vars: false
+      changed_when: false
+      loop: [-i, -o]
 
-- name: Insert only exact owned host enforcement rules
-  ansible.builtin.command:
-    argv: "{{ item }}"
-    expand_argument_vars: false
-  loop:
-    - [iptables, -w, '5', -I, DOCKER-USER, '1', -j, "{{ controller_chain }}"]
-    - [iptables, -w, '5', -I, INPUT, '1', -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
+    - name: Insert only exact owned host enforcement rules
+      ansible.builtin.command:
+        argv: "{{ item }}"
+        expand_argument_vars: false
+      loop:
+        - [iptables, -w, '5', -I, DOCKER-USER, '1', -j, "{{ controller_chain }}"]
+        - [iptables, -w, '5', -I, INPUT, '1', -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
 
-- name: Observe the owned forwarding and controller rejection hooks
-  ansible.builtin.command:
-    argv: "{{ item }}"
-    expand_argument_vars: false
-  changed_when: false
-  loop:
-    - [iptables, -w, '5', -C, DOCKER-USER, -j, "{{ controller_chain }}"]
-    - [iptables, -w, '5', -C, INPUT, -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
+    - name: Observe the owned forwarding and controller rejection hooks
+      ansible.builtin.command:
+        argv: "{{ item }}"
+        expand_argument_vars: false
+      changed_when: false
+      loop:
+        - [iptables, -w, '5', -C, DOCKER-USER, -j, "{{ controller_chain }}"]
+        - [iptables, -w, '5', -C, INPUT, -i, "{{ controller_bridge }}", -m, comment, --comment, "{{ template_execution.operation_id }}", -j, REJECT]
 
 - name: Refuse an existing container rather than native replacement
   community.docker.docker_container_info:
@@ -771,17 +785,12 @@
     security_opts: [no-new-privileges:true]
     healthcheck: {test: [NONE]}
     entrypoint: [/bin/sh, /run/opsctl-gate/start.sh]
-    command: [/run/opsctl-gate, /usr/bin/ansible-playbook, --inventory, /run/opsctl-keys/inventory.json, "{{ '/source/' + template_execution.entrypoint }}", --extra-vars, '@/run/opsctl-keys/inputs.json']
+    command: "{{ ['/run/opsctl-gate'] + controller_payload_argv }}"
     command_handling: correct
-    working_dir: /source
-    env:
-      HOME: /tmp
-      PATH: /usr/local/bin:/usr/bin:/bin
-      ANSIBLE_LOCAL_TEMP: /tmp/ansible
-      ANSIBLE_HOST_KEY_CHECKING: 'True'
-      ANSIBLE_CONFIG: /run/opsctl-keys/ansible.cfg
+    working_dir: "{{ controller_source_mount }}"
+    env: "{{ controller_payload_environment }}"
     mounts:
-      - {type: bind, source: "{{ controller_source_workspace }}", target: /source, read_only: true, propagation: rprivate}
+      - {type: bind, source: "{{ controller_source_workspace }}", target: "{{ controller_source_mount }}", read_only: true, propagation: rprivate}
       - {type: bind, source: "{{ controller_record }}/keys", target: /run/opsctl-keys, read_only: true, propagation: rprivate}
       - {type: bind, source: "{{ controller_record }}/gate", target: /run/opsctl-gate, read_only: true, propagation: rprivate}
     tmpfs:
@@ -795,8 +804,8 @@
     tty: false
     publish_all_ports: false
     networks_cli_compatible: true
-    network_mode: "{{ controller_network_name }}"
-    networks: [{name: "{{ controller_network_name }}"}]
+    network_mode: "{{ 'none' if controller_payload_engine == 'bash' else controller_network_name }}"
+    networks: "{{ omit if controller_payload_engine == 'bash' else [{'name': controller_network_name}] }}"
     comparisons: {networks: strict}
     log_driver: json-file
     log_options: {max-size: 1m, max-file: '2'}
@@ -804,6 +813,7 @@
       opsctl.operation: "{{ template_execution.operation_id }}"
       opsctl.source_digest: "{{ template_execution.source_digest }}"
       opsctl.input_digest: "{{ template_execution.input_digest }}"
+      opsctl.payload_engine: "{{ controller_payload_engine }}"
   register: controller_created
   no_log: true
 
@@ -855,6 +865,7 @@
       - controller_stopped.exists
       - controller_stopped.container.Id == controller_container_id
       - controller_stopped.container.Config.Labels['opsctl.operation'] == template_execution.operation_id
+      - controller_stopped.container.Config.Labels['opsctl.payload_engine'] == controller_payload_engine
       - not controller_stopped.container.State.Running and controller_stopped.container.State.Pid == 0
       - controller_stopped.container.Config.User == (template_execution.uid | string) + ':' + (template_execution.gid | string)
       - controller_stopped.container.HostConfig.ReadonlyRootfs
@@ -872,7 +883,8 @@
       - controller_stopped.container.HostConfig.IpcMode != 'host'
       - controller_stopped.container.HostConfig.UTSMode != 'host'
       - controller_stopped.container.HostConfig.PortBindings | default({}, true) | length == 0
-      - controller_stopped.container.NetworkSettings.Networks.keys() | list == [controller_network_name]
+      - controller_stopped.container.HostConfig.NetworkMode == ('none' if controller_payload_engine == 'bash' else controller_network_name)
+      - (controller_stopped.container.NetworkSettings.Networks.keys() | list | difference(['none']) | length == 0) if controller_payload_engine == 'bash' else (controller_stopped.container.NetworkSettings.Networks.keys() | list == [controller_network_name])
       - controller_stopped.container.Mounts | rejectattr('Type', 'in', ['bind', 'tmpfs']) | list | length == 0
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == 3
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | selectattr('RW', 'equalto', true) | list | length == 0
@@ -880,8 +892,8 @@
       - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,size=' + (controller_writable_bytes | string) + ',mode=0755'
       - controller_stopped.container.HostConfig.Tmpfs['/tmp'] == 'rw,nosuid,nodev,size=' + (controller_writable_bytes | string) + ',mode=0700,uid=' + (template_execution.uid | string) + ',gid=' + (template_execution.gid | string)
       - controller_stopped.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
-      - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate', '/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json', '/source/' + template_execution.entrypoint, '--extra-vars', '@/run/opsctl-keys/inputs.json']
-      - controller_stopped.container.Config.WorkingDir == '/source'
+      - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate'] + controller_payload_argv
+      - controller_stopped.container.Config.WorkingDir == controller_source_mount
       - controller_stopped.container.Config.Healthcheck.Test == ['NONE']
       - controller_stopped.container.HostConfig.LogConfig == {'Type':'json-file', 'Config':{'max-size':'1m', 'max-file':'2'}}
   no_log: true
@@ -945,17 +957,26 @@
     set -- $(cat "/sys/fs/cgroup$cgroup/cpu.max")
     test "$#" = 2 && test "$2" -gt 0
     test "$1" -gt 0 && test "$(( $1 * 1000 ))" = "$(( CPU_MILLICORES * $2 ))"
-    exec 9<"/proc/$pid/ns/net"
-    namespace=$(readlink "/proc/$pid/ns/net")
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -d 127.0.0.11 -j REJECT
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p udp -j REJECT
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p tcp --dport 53 -j REJECT
-    timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -P OUTPUT DROP
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -d 127.0.0.11 -j REJECT
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p udp -j REJECT
-    timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p tcp --dport 53 -j REJECT
-    test "$(timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -S OUTPUT)" = '-P OUTPUT DROP'
-    test "$(readlink "/proc/$pid/ns/net")" = "$namespace"
+    case "$ENGINE" in
+      ansible)
+        exec 9<"/proc/$pid/ns/net"
+        namespace=$(readlink "/proc/$pid/ns/net")
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -d 127.0.0.11 -j REJECT
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p udp -j REJECT
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p tcp --dport 53 -j REJECT
+        timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -P OUTPUT DROP
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -d 127.0.0.11 -j REJECT
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p udp -j REJECT
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p tcp --dport 53 -j REJECT
+        test "$(timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -S OUTPUT)" = '-P OUTPUT DROP'
+        test "$(readlink "/proc/$pid/ns/net")" = "$namespace"
+        ;;
+      bash)
+        network=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.HostConfig.NetworkMode}}|{{range $name, $network := .NetworkSettings.Networks}}{{$name}},{{end}}{% endraw %}' "$CONTAINER")
+        case "$network" in 'none|'|'none|none,') ;; *) exit 65 ;; esac
+        ;;
+      *) exit 65 ;;
+    esac
     test "$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER")" = "$facts"
     test ! -e "$RECORD/closed"
     timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null
@@ -977,6 +998,7 @@
     UNIT: "{{ controller_unit }}"
     CONTAINER: "{{ controller_container_id }}"
     OPERATION: "{{ template_execution.operation_id }}"
+    ENGINE: "{{ controller_payload_engine }}"
     MEMORY_BYTES: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
     PID_LIMIT: "{{ template_execution.limits.pids | string }}"
     CPU_MILLICORES: "{{ template_execution.limits.cpu_millicores | string }}"

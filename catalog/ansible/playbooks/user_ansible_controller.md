@@ -14,7 +14,9 @@ result-consumer qualification remain separate acceptance boundaries.
 
 The closed internal `template_execution` mapping contains exactly `operation_id`,
 `controller_server_id`, `source_digest`, `input_digest`, `staging_directory`,
-`supplied_files`, `entrypoint`, `image`, `uid`, `gid`, `targets` and `limits`.
+`supplied_files`, `entrypoint`, `image`, `uid`, `gid`, `payload_engine`, `targets`
+and `limits`. Required `payload_engine` is exactly `ansible` or `bash`, derived
+centrally from the exact published revision, never inferred from targets.
 It binds the Operation/controller UUIDs and source/input SHA-256 digests to the
 frozen materialization manifest, member entrypoint, immutable image reference
 and nonroot numeric UID/GID. The interpreter/argv is fixed, not another input. Source
@@ -22,7 +24,7 @@ bounds and literal byte delivery remain owned by `materialize_template_files`.
 No user shell expression, address, environment, interpreter or executable may
 replace these bindings.
 
-The ordered 1..32 targets require exact Server UUIDs, current backend-resolved
+For Ansible, the ordered 1..32 targets require exact Server UUIDs, current backend-resolved
 IPv4/SSH port/login, frozen host public keys and authorized private regular-file
 bindings with exact credential versions. Each target contains exactly `server_id`,
 `address`, `port`, `username`, `host_public_key`, `credential_file`,
@@ -33,6 +35,12 @@ Reject duplicates and controller/self
 targets before start. Content visibility, accepted template publication and an
 exact digest do not grant target access. Central admission rechecks actor, scope,
 controller and every target before delivery/execution.
+
+Bash has exactly `targets: []`; `controller_server_id` identifies its one
+backend-authorized execution Server. It delivers no SSH credentials, inventory,
+known_hosts or Ansible configuration. The same private keys directory contains
+only `inputs.json`; ordered source bytes/modes remain unchanged. Its executable
+entrypoint must retain mode `0700` or `0755`.
 
 Private material comes through the same immutable Operation Secret and protected
 file custody, never public arguments, plaintext credential variables or inherited
@@ -52,6 +60,9 @@ parsing, merging, defaults or plaintext parameter variables occur here.
 The frozen payload argv uses `/usr/bin/ansible-playbook`, the fixed inventory,
 the source entrypoint and `--extra-vars @/run/opsctl-keys/inputs.json`.
 The platform materialization subprocess retains `/usr/local/bin/ansible-playbook`.
+Bash instead uses exactly `[/bin/bash, --noprofile, --norc,
+/workspace/user/<entrypoint>, /run/opsctl-keys/inputs.json]`. The sole input is
+the unchanged envelope file argument, not environment injection or interpolation.
 Nesting application connection-like keys does not override inventory bindings;
 it does not prevent authored playbooks changing variables or prove containment.
 
@@ -84,6 +95,16 @@ iptables backend and functioning cgroup-v2 CPU/memory/swap/PID enforcement. A
 responsive daemon or completed Docker baseline alone does not establish this
 profile. Verify the required Engine API/options, controller tools and effective
 configuration before any payload start. Unsupported profiles refuse.
+
+The explicit Bash profile is `managed-linux-systemd-docker-none-v1`. Common
+rootful Docker/systemd/cgroup prerequisites remain; SSH, bridge, firewall and
+namespace-policy prerequisites apply only to Ansible. Bash requires effective
+`network_mode: none`, no additional attachments or ports, read-only source at
+`/workspace/user` and the existing read-only root/private/gate mounts. It
+allocates no bridge or policy and keeps `network_cleanup: not_allocated`, never
+claims network removal. The same stopped-container readback, independent deadline,
+finite lock, effective cgroup observation and root-controlled gate precede exec.
+Ansible retains its `/source` binding and destination-only policy unchanged.
 
 The source mapping below is against Ansible 2.19.3/community.docker 5.3.0. It is
 installed-source evidence, not a remote behavior or containment qualification.
@@ -171,6 +192,10 @@ reservation reply never authorizes adoption. The journal retains frozen identity
 full native IDs, filesystem identities, allocation intentions, writer completion,
 original outcome and independent liabilities. Lost delivery replies retain the
 owned source parent; they establish neither removal nor writer completion.
+The journal additionally freezes the explicit engine, source mount and closed
+payload argv before delivery. Recovery derives these only from that exact root
+record. Missing or contradictory branch facts retain uncertainty; Bash requires
+no network ID, bridge or owned chain and `not_allocated` network liability.
 
 Create the container stopped, record full ID/operation labels in a root-controlled
 record, then install and verify the operation-owned systemd deadline. It must
@@ -306,3 +331,9 @@ finite SSH/module, root-identity, daemon, firewall, systemd and timed-flock
 transport substitutions. File byte/mode checks and owned filesystem removal are
 actual; root ownership, daemon restrictions and containment are not. No live SSH,
 firewall, systemd or user payload execution was tested.
+
+The target-local Bash isolated behavior is accepted with labelled external
+transports substituted; affected regression evidence awaits checkpoint review.
+Qualified immutable image startup is not live containment acceptance;
+effective special mounts, resources, network isolation and independent deadline
+still require separately authorized host proof.

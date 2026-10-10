@@ -73,12 +73,17 @@
 
     - name: Prepare run and observe the frozen invocation
       block:
+        - name: Select input refusal before validating the frozen carrier
+          ansible.builtin.set_fact:
+            controller_reason: invalid_inputs
+
         - name: Require exactly the frozen internal carrier fields
           ansible.builtin.assert:
             that:
               - ansible_play_hosts_all | length == 1
               - template_execution is mapping
-              - template_execution.keys() | list | sort(case_sensitive=true) == ['controller_server_id', 'entrypoint', 'gid', 'image', 'input_digest', 'limits', 'operation_id', 'source_digest', 'staging_directory', 'supplied_files', 'targets', 'uid']
+              - template_execution.keys() | list | sort(case_sensitive=true) == ['controller_server_id', 'entrypoint', 'gid', 'image', 'input_digest', 'limits', 'operation_id', 'payload_engine', 'source_digest', 'staging_directory', 'supplied_files', 'targets', 'uid']
+              - template_execution.payload_engine in ['ansible', 'bash']
               - template_execution.operation_id is string
               - template_execution.operation_id is regex(controller_uuid_pattern, match_type='fullmatch')
               - template_execution.controller_server_id is string
@@ -96,7 +101,15 @@
               - template_execution.limits is mapping
               - template_execution.limits.keys() | list | sort(case_sensitive=true) == ['cpu_millicores', 'log_bytes', 'memory_mib', 'pids', 'timeout_seconds', 'tmpfs_mib']
               - template_execution.targets | type_debug == 'list'
-              - template_execution.targets | length >= 1 and template_execution.targets | length <= 32
+              - (template_execution.targets | length == 0) if template_execution.payload_engine == 'bash' else (template_execution.targets | length >= 1 and template_execution.targets | length <= 32)
+
+        - name: Require one preserved executable Bash entrypoint
+          ansible.builtin.assert:
+            that:
+              - template_execution.supplied_files | type_debug == 'list'
+              - template_execution.supplied_files | selectattr('path', 'equalto', template_execution.entrypoint) | list | length == 1
+              - (template_execution.supplied_files | selectattr('path', 'equalto', template_execution.entrypoint) | first).mode in ['0700', '0755']
+          when: template_execution.payload_engine == 'bash'
 
         - name: Require strict bounded numeric limits
           ansible.builtin.assert:
@@ -146,6 +159,24 @@
           ansible.builtin.set_fact:
             controller_safe_operation_id: "{{ template_execution.operation_id }}"
             controller_safe_server_id: "{{ template_execution.controller_server_id }}"
+
+        - name: Freeze only the validated engine's native execution bindings
+          ansible.builtin.set_fact:
+            controller_payload_engine: "{{ template_execution.payload_engine }}"
+            controller_source_mount: "{{ '/workspace/user' if template_execution.payload_engine == 'bash' else '/source' }}"
+            controller_payload_argv: >-
+              {{ ['/bin/bash', '--noprofile', '--norc', '/workspace/user/' + template_execution.entrypoint,
+              '/run/opsctl-keys/inputs.json'] if template_execution.payload_engine == 'bash' else
+              ['/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json',
+              '/source/' + template_execution.entrypoint, '--extra-vars', '@/run/opsctl-keys/inputs.json'] }}
+            controller_payload_environment: >-
+              {{ {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin'} if
+              template_execution.payload_engine == 'bash' else {'HOME': '/tmp',
+              'PATH': '/usr/local/bin:/usr/bin:/bin', 'ANSIBLE_LOCAL_TEMP': '/tmp/ansible',
+              'ANSIBLE_HOST_KEY_CHECKING': 'True', 'ANSIBLE_CONFIG': '/run/opsctl-keys/ansible.cfg'} }}
+            controller_credential_files: >-
+              {{ [] if template_execution.payload_engine == 'bash' else
+              template_execution.targets | map(attribute='credential_file') | unique(case_sensitive=true) | list }}
 
         - name: Prepare the native controller and frozen material
           ansible.builtin.include_tasks: ../tasks/user_ansible_controller_prepare.yml
@@ -239,6 +270,10 @@
       always:
         - name: Settle only this invocation's native liabilities
           ansible.builtin.include_tasks: ../tasks/user_ansible_controller_cleanup.yml
+          when: >-
+            controller_record_owned | default(false) or
+            controller_creation_attempted | default(false) or
+            controller_existing_invocation | default(false)
       no_log: true
       when:
         - controller_route_qualified

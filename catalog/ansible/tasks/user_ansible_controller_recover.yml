@@ -119,6 +119,9 @@
           - controller_journal.controller_server_id == template_execution_recovery.controller_server_id
           - controller_journal.source_digest == template_execution_recovery.source_digest
           - controller_journal.input_digest == template_execution_recovery.input_digest
+          - controller_journal.payload_engine in ['ansible', 'bash']
+          - controller_journal.source_mount == ('/workspace/user' if controller_journal.payload_engine == 'bash' else '/source')
+          - controller_journal.payload_argv is sequence and controller_journal.payload_argv is not string
           - controller_journal.record_dev == controller_record_identity.stat.dev
           - controller_journal.record_inode == controller_record_identity.stat.inode
           - controller_journal.source_parent == controller_record + '/source'
@@ -148,6 +151,20 @@
           - controller_journal.original_reason is none or controller_journal.original_reason in ['invalid_inputs', 'unsupported_profile', 'delivery_failed', 'policy_failed', 'deadline_failed', 'execution_unknown', 'exited', 'execution_failed', 'deadline_expired', 'existing_invocation', 'log_collection_failed', 'cleanup_failed']
           - controller_journal.exit_code is none or (controller_journal.exit_code is integer and controller_journal.exit_code is not boolean and controller_journal.exit_code >= 0 and controller_journal.exit_code <= 255)
 
+    - name: Require the frozen closed argv and network branch without inferred compatibility
+      ansible.builtin.assert:
+        that:
+          - controller_journal.payload_argv | length == (5 if controller_journal.payload_engine == 'bash' else 6)
+          - controller_journal.payload_argv[:3] == (['/bin/bash', '--noprofile', '--norc'] if controller_journal.payload_engine == 'bash' else ['/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json'])
+          - controller_journal.payload_argv[3] is string and controller_journal.payload_argv[3].startswith(controller_journal.source_mount + '/')
+          - controller_journal.payload_argv[3][(controller_journal.source_mount | length) + 1:] | length >= 1
+          - controller_journal.payload_argv[3][(controller_journal.source_mount | length) + 1:].encode('utf-8') | length <= 256
+          - controller_journal.payload_argv[3][(controller_journal.source_mount | length) + 1:].split('/') | intersect(['', '.', '..']) | length == 0
+          - "'\\\\' not in controller_journal.payload_argv[3] and ':' not in controller_journal.payload_argv[3]"
+          - controller_journal.payload_argv[3] is not regex(controller_control_characters)
+          - controller_journal.payload_argv[4:] == (['/run/opsctl-keys/inputs.json'] if controller_journal.payload_engine == 'bash' else ['--extra-vars', '@/run/opsctl-keys/inputs.json'])
+          - controller_journal.payload_engine != 'bash' or (controller_journal.network_id is none and controller_journal.bridge is none and not controller_journal.chain_owned and controller_journal.network_cleanup == 'not_allocated')
+
     - name: Require exact recorded source filesystem identity when allocated
       ansible.builtin.assert:
         that:
@@ -160,6 +177,7 @@
     - name: Rejoin only validated original safe facts
       ansible.builtin.set_fact:
         controller_cleanup_uid: "{{ controller_journal.uid }}"
+        controller_payload_engine: "{{ controller_journal.payload_engine }}"
         controller_container_id: "{{ controller_journal.container_id }}"
         controller_unit: "{{ controller_journal.unit }}"
         controller_network_name: "{{ controller_journal.network_name }}"
@@ -212,6 +230,10 @@
           - controller_recovery_container.container.Config.Labels['opsctl.operation'] == template_execution_recovery.operation_id
           - controller_recovery_container.container.Config.Labels['opsctl.source_digest'] == template_execution_recovery.source_digest
           - controller_recovery_container.container.Config.Labels['opsctl.input_digest'] == template_execution_recovery.input_digest
+          - controller_recovery_container.container.Config.Labels['opsctl.payload_engine'] == controller_payload_engine
+          - controller_recovery_container.container.Config.Cmd == ['/run/opsctl-gate'] + controller_journal.payload_argv
+          - controller_payload_engine != 'bash' or controller_recovery_container.container.HostConfig.NetworkMode == 'none'
+          - controller_payload_engine != 'bash' or controller_recovery_container.container.NetworkSettings.Networks.keys() | list | difference(['none']) | length == 0
       when:
         - controller_container_id is not none
         - controller_recovery_container.exists
