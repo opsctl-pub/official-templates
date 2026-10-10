@@ -262,6 +262,44 @@ safe owned cleanup. The central admitted consumer owns management-success and
 original Job/UID qualification; later settlement never rewrites original failed
 Operation/Run history or upgrades liability to successful management execution.
 
+Only signed settle may additionally carry backend-only `terminal_bash_gate_fence`:
+exact `controller_source_digest`, `job_name`, `job_uid`, `condition: failed`.
+Central authority freezes/rechecks the original official source/engine, exact
+original Job/UID terminal and current manager. The application `source_digest`
+is not that procedure digest; the host does not authenticate Kubernetes itself.
+Normal observe, Ansible and completed-terminal recovery retain the six-field carrier.
+
+The exception requires an authentic Bash `gate_pending` journal with
+`writer_closed: false`, fixed argv, exact full-ID labels and network-none. Accepted
+preparation persists this phase only after allocations, stopped restrictions and
+active deadline; its remaining locked shell cannot allocate another container or
+workspace. Qualified settle refreshes the original record's copied close helper
+from current trusted source under its no-follow identity/generation lock; observe
+never changes it. The helper places permanent root and mounted-gate closed
+tombstones under that lock, then stops only the exact ID. Native full-ID removal
+and positively observed absence precede deadline/private release. This fences
+effects, not preparer descendants: `writer_closed` stays false and original
+outcome/history stay unchanged. Delayed start cannot recreate the absent ID;
+release cannot recreate deleted directories. Earlier phases, other engines,
+ambiguous identity, lock/removal/CAS failure retain unresolved liabilities.
+
+One `Controller recovery observation: ` message separately reports authenticated
+phase/writer completion, root/gate closed and release presence, exact current
+running/PID-zero/ExitCode/OOM and timer-active/never-triggered facts. Unknowns are
+null, never inferred absence or original payload outcome. Stored ASCII JSON plus
+the fixed prefix/newline is bounded to2048 bytes with same-membership unknown
+fallback; no paths, logs, raw errors, cgroups or historical attribution are emitted.
+This correction requires isolated production behavior review and later coupled
+publication/native qualification; terminal management alone is not writer death.
+
+Final management progress and play exit share one internal classification. Fresh
+execution retains its payload-success/cleanup requirements. Recovery must finish
+the entire qualified read/cleanup include without a later refusal or collection
+failure. Qualified observe can retain original outcome and current uncertainty;
+settle additionally requires observed process closure and no retained cleanup
+state or cleanup/log failure. Original unknown, failed or timed-out execution
+does not itself fail management, and remains unchanged in result/journal/history.
+
 ## Logs And Plain Results
 
 Keep exit observation independent of output collection. `detach: false` calls

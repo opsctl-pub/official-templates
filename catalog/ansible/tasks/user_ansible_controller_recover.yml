@@ -1,11 +1,36 @@
 ---
+- name: Initialize one closed unknown recovery observation
+  ansible.builtin.set_fact:
+    controller_recovery_progress_empty:
+      phase: null
+      writer_closed: null
+      root_closed: null
+      gate_closed: null
+      release_present: null
+      running: null
+      pid_zero: null
+      exit_code: null
+      oom_killed: null
+      timer_active: null
+      timer_never_triggered: null
+    controller_terminal_gate_fence_qualified: false
+    controller_effect_fenced: false
+    controller_recovery_completed: false
+    controller_recovery_observation_failed: false
+  no_log: true
+
+- name: Retain the unknown projection until exact identity is observed
+  ansible.builtin.set_fact:
+    controller_recovery_progress: "{{ controller_recovery_progress_empty }}"
+  no_log: true
+
 - name: Rejoin only the frozen nonprivate original record
   block:
     - name: Require the closed recovery carrier without execution inputs
       ansible.builtin.assert:
         that:
           - template_execution_recovery is mapping
-          - template_execution_recovery.keys() | list | sort(case_sensitive=true) == ['controller_server_id', 'input_digest', 'log_bytes', 'mode', 'operation_id', 'source_digest']
+          - template_execution_recovery.keys() | list | sort(case_sensitive=true) == (['controller_server_id', 'input_digest', 'log_bytes', 'mode', 'operation_id', 'source_digest'] + (['terminal_bash_gate_fence'] if 'terminal_bash_gate_fence' in template_execution_recovery else []))
           - template_execution_recovery.operation_id is string
           - template_execution_recovery.operation_id is regex(controller_uuid_pattern, match_type='fullmatch')
           - template_execution_recovery.controller_server_id is string
@@ -34,6 +59,20 @@
         controller_recovery_qualified: false
         controller_logs: ''
         controller_logs_truncated: false
+
+    - name: Require only the backend-qualified failed original Bash management fact
+      ansible.builtin.assert:
+        that:
+          - template_execution_recovery.mode == 'settle'
+          - template_execution_recovery.terminal_bash_gate_fence is mapping
+          - template_execution_recovery.terminal_bash_gate_fence.keys() | list | sort(case_sensitive=true) == ['condition', 'controller_source_digest', 'job_name', 'job_uid']
+          - template_execution_recovery.terminal_bash_gate_fence.controller_source_digest is string
+          - template_execution_recovery.terminal_bash_gate_fence.controller_source_digest is regex('[0-9a-f]{64}', match_type='fullmatch')
+          - template_execution_recovery.terminal_bash_gate_fence.job_name == 'op-' + (template_execution_recovery.operation_id | replace('-', ''))
+          - template_execution_recovery.terminal_bash_gate_fence.job_uid is string
+          - template_execution_recovery.terminal_bash_gate_fence.job_uid is regex(controller_uuid_pattern, match_type='fullmatch')
+          - template_execution_recovery.terminal_bash_gate_fence.condition == 'failed'
+      when: template_execution_recovery.terminal_bash_gate_fence is defined
 
     - name: Observe existing original ancestors without allocating or adopting them
       ansible.builtin.stat:
@@ -268,6 +307,195 @@
           - controller_recovery_after_observation.stat.dev == controller_journal_after.stat.dev
           - controller_recovery_after_observation.stat.checksum == controller_journal_after.stat.checksum
 
+    - name: Qualify only the allocation-complete unreleased Bash effect fence
+      ansible.builtin.assert:
+        that:
+          - controller_payload_engine == 'bash'
+          - controller_journal.phase == 'gate_pending'
+          - not controller_writer_closed
+          - controller_container_id is string
+          - controller_recovery_container.exists
+          - controller_journal.private_identities.gate is mapping
+          - controller_journal.private_identities.keys() | list | sort(case_sensitive=true) == ['gate', 'keys']
+          - controller_journal.network_cleanup == 'not_allocated'
+          - controller_journal.deadline_cleanup == 'retained'
+          - controller_recovery_container.container.State.Running is boolean
+          - controller_recovery_container.container.State.Pid is integer
+          - controller_recovery_container.container.State.Pid is not boolean
+          - controller_recovery_container.container.State.Pid >= 0
+          - controller_recovery_container.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
+          - controller_recovery_container.container.Config.WorkingDir == '/workspace/user'
+          - controller_recovery_container.container.Config.User == (controller_journal.uid | string) + ':' + (controller_journal.gid | string)
+          - controller_recovery_container.container.HostConfig.ReadonlyRootfs is sameas true
+          - controller_recovery_container.container.HostConfig.Privileged is sameas false
+          - controller_recovery_container.container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == 3
+          - controller_recovery_container.container.Mounts | selectattr('Type', 'equalto', 'bind') | selectattr('RW', 'equalto', true) | list | length == 0
+          - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_journal.source_workspace) | selectattr('Destination', 'equalto', '/workspace/user') | list | length == 1
+          - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_record + '/gate') | selectattr('Destination', 'equalto', '/run/opsctl-gate') | list | length == 1
+          - controller_recovery_container.container.Mounts | selectattr('Source', 'equalto', controller_record + '/keys') | selectattr('Destination', 'equalto', '/run/opsctl-keys') | list | length == 1
+      when: template_execution_recovery.terminal_bash_gate_fence is defined
+
+    - name: Retain the qualified exception without declaring preparer completion
+      ansible.builtin.set_fact:
+        controller_terminal_gate_fence_qualified: true
+      when: template_execution_recovery.terminal_bash_gate_fence is defined
+
+    - name: Qualify original private allocations before any exceptional release
+      block:
+        - name: Reobserve recorded private directory identities without following links
+          ansible.builtin.stat:
+            path: "{{ controller_record }}/{{ item.key }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          loop: "{{ controller_journal.private_identities | dict2items }}"
+          register: controller_fence_private
+        - name: Require exact original private directories
+          ansible.builtin.assert:
+            that:
+              - item.stat.isdir | default(false)
+              - not item.stat.islnk | default(true)
+              - item.stat.dev == item.item.value.dev
+              - item.stat.inode == item.item.value.inode
+              - item.stat.uid == item.item.value.uid
+              - item.stat.mode == item.item.value.mode
+          loop: "{{ controller_fence_private.results }}"
+        - name: Reobserve recorded source identity without following links
+          ansible.builtin.stat:
+            path: "{{ controller_journal.source_workspace }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: controller_fence_source
+        - name: Require the exact originally delivered source workspace
+          ansible.builtin.assert:
+            that:
+              - controller_fence_source.stat.isdir | default(false)
+              - not controller_fence_source.stat.islnk | default(true)
+              - controller_fence_source.stat.dev == controller_journal.source_identity.dev
+              - controller_fence_source.stat.inode == controller_journal.source_identity.inode
+              - controller_fence_source.stat.uid == controller_journal.uid
+              - controller_fence_source.stat.mode == '0700'
+      when: controller_terminal_gate_fence_qualified
+
+    - name: Collect only current safe native and marker observations
+      block:
+        - name: Retain authenticated phase and exact current container scalars
+          ansible.builtin.set_fact:
+            controller_recovery_progress: >-
+              {{ controller_recovery_progress | combine({'phase': controller_journal.phase,
+              'writer_closed': controller_writer_closed}) | combine({
+              'running': controller_recovery_container.container.State.Running,
+              'pid_zero': controller_recovery_container.container.State.Pid == 0,
+              'exit_code': controller_recovery_container.container.State.ExitCode,
+              'oom_killed': controller_recovery_container.container.State.OOMKilled}
+              if controller_recovery_container.exists else {}) }}
+          when:
+            - controller_container_id is not none
+            - not controller_recovery_container.exists or (controller_recovery_container.container.State.Running is boolean and controller_recovery_container.container.State.Pid is integer and controller_recovery_container.container.State.Pid is not boolean and controller_recovery_container.container.State.Pid >= 0 and controller_recovery_container.container.State.ExitCode is integer and controller_recovery_container.container.State.ExitCode is not boolean and controller_recovery_container.container.State.ExitCode >= 0 and controller_recovery_container.container.State.ExitCode <= 255 and controller_recovery_container.container.State.OOMKilled is boolean)
+
+        - name: Observe root and mounted gate markers without writing them
+          ansible.builtin.stat:
+            path: "{{ controller_record }}/{{ item }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          loop: [closed, gate, gate/closed, gate/release]
+          register: controller_recovery_markers
+
+        - name: Require exact recorded gate identity when it is present
+          ansible.builtin.assert:
+            that:
+              - controller_recovery_markers.results[1].stat.isdir | default(false)
+              - not controller_recovery_markers.results[1].stat.islnk | default(true)
+              - controller_recovery_markers.results[1].stat.uid == 0
+              - controller_recovery_markers.results[1].stat.mode == '0755'
+              - controller_recovery_markers.results[1].stat.dev == controller_journal.private_identities.gate.dev
+              - controller_recovery_markers.results[1].stat.inode == controller_journal.private_identities.gate.inode
+          when: controller_recovery_markers.results[1].stat.exists
+
+        - name: Refuse linked or unowned markers instead of projecting absence
+          ansible.builtin.assert:
+            that:
+              - item.stat.isreg | default(false)
+              - not item.stat.islnk | default(true)
+              - item.stat.uid == 0
+              - item.stat.mode == ('0600' if item.item == 'closed' else '0444')
+          loop: "{{ [controller_recovery_markers.results[0], controller_recovery_markers.results[2], controller_recovery_markers.results[3]] }}"
+          when: item.stat.exists
+
+        - name: Retain only observed marker presence
+          ansible.builtin.set_fact:
+            controller_recovery_progress: >-
+              {{ controller_recovery_progress | combine({
+              'root_closed': controller_recovery_markers.results[0].stat.exists,
+              'gate_closed': controller_recovery_markers.results[2].stat.exists,
+              'release_present': controller_recovery_markers.results[3].stat.exists}) }}
+
+        - name: Read bounded current timer state without stopping or renewing it
+          ansible.builtin.command:
+            argv: [timeout, -k, '2', '5', systemctl, show, "{{ controller_unit }}.timer", --property=ActiveState, --property=LastTriggerUSecMonotonic]
+            expand_argument_vars: false
+          changed_when: false
+          failed_when: false
+          register: controller_recovery_timer
+
+        - name: Retain only closed current timer facts
+          ansible.builtin.set_fact:
+            controller_recovery_progress: >-
+              {{ controller_recovery_progress | combine({
+              'timer_active': 'ActiveState=active' in controller_recovery_timer.stdout_lines,
+              'timer_never_triggered': 'LastTriggerUSecMonotonic=0' in controller_recovery_timer.stdout_lines}) }}
+          when:
+            - controller_recovery_timer.rc == 0
+            - controller_recovery_timer.stdout_lines | length == 2
+            - controller_recovery_timer.stdout_lines | select('match', '^ActiveState=(active|inactive|failed|activating|deactivating|reloading)$') | list | length == 1
+            - controller_recovery_timer.stdout_lines | select('match', '^LastTriggerUSecMonotonic=[0-9]+$') | list | length == 1
+      rescue:
+        - name: Retain unavailable projection fields without native diagnostics
+          ansible.builtin.set_fact:
+            controller_recovery_progress: "{{ controller_recovery_progress_empty }}"
+            controller_recovery_observation_failed: true
+
+    - name: Refresh current trusted close code only for qualified original settlement
+      ansible.builtin.shell: |
+        exec timeout -k 2 15 /bin/sh <<'OPSCTL_HELPER'
+        set -eu
+        umask 077
+        test -d "$RECORD" && test ! -L "$RECORD"
+        test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
+        test ! -L "$RECORD/lock"
+        if test -e "$RECORD/lock"; then
+          test -f "$RECORD/lock"
+          test "$(stat -c '%u:%a' "$RECORD/lock")" = 0:600
+        fi
+        exec 8>"$RECORD/lock"
+        flock -x -w 5 8
+        test -f "$RECORD/journal.json" && test ! -L "$RECORD/journal.json"
+        test "$(stat -c '%u:%a' "$RECORD/journal.json")" = 0:600
+        actual=$(sha256sum "$RECORD/journal.json")
+        test "${actual%% *}" = "$EXPECTED"
+        test -f "$RECORD/close.sh" && test ! -L "$RECORD/close.sh"
+        test "$(stat -c '%u:%a' "$RECORD/close.sh")" = 0:700
+        pending=$(mktemp "$RECORD/close.XXXXXXXX")
+        trap 'rm -f -- "$pending"' EXIT HUP INT TERM
+        printf '%s' "$HELPER" >"$pending"
+        chmod 0700 "$pending"
+        mv -- "$pending" "$RECORD/close.sh"
+        OPSCTL_HELPER
+      args:
+        executable: /bin/sh
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+        RECORD: "{{ controller_record }}"
+        DEVICE: "{{ controller_record_identity.stat.dev | string }}"
+        INODE: "{{ controller_record_identity.stat.inode | string }}"
+        EXPECTED: "{{ controller_journal_after.stat.checksum }}"
+        HELPER: "{{ lookup('ansible.builtin.file', playbook_dir + '/../scripts/user_ansible_controller_close.sh', rstrip=false) }}"
+      when:
+        - template_execution_recovery.mode == 'settle'
+        - controller_writer_closed or controller_terminal_gate_fence_qualified
+
     - name: Read bounded positive official-only logs without invoking closure
       ansible.builtin.include_tasks: user_ansible_controller_cleanup.yml
       vars:
@@ -282,6 +510,10 @@
       vars:
         controller_record_owned: true
       when: template_execution_recovery.mode == 'settle'
+
+    - name: Retain qualification only after the entire recovery procedure returns
+      ansible.builtin.set_fact:
+        controller_recovery_completed: "{{ not controller_recovery_observation_failed }}"
   rescue:
     - name: Preserve original execution while reporting uncertain current closure
       ansible.builtin.set_fact:
@@ -292,4 +524,24 @@
         controller_timed_out: false
         controller_logs: ''
         controller_logs_truncated: false
+        controller_recovery_completed: false
   no_log: true
+
+- name: Store only one bounded ASCII recovery progress message
+  block:
+    - name: Serialize the safe projection once
+      ansible.builtin.set_fact:
+        controller_recovery_progress_wire: "{{ controller_recovery_progress | to_json(ensure_ascii=true) }}"
+    - name: Bound the complete fixed-prefix message including newline
+      ansible.builtin.assert:
+        that: "controller_recovery_progress_wire | length + ('Controller recovery observation: ' | length) + 1 <= 2048"
+  rescue:
+    - name: Store only the same-membership unknown fallback
+      ansible.builtin.set_fact:
+        controller_recovery_progress_wire: "{{ controller_recovery_progress_empty | to_json(ensure_ascii=true) }}"
+        controller_recovery_completed: false
+  no_log: true
+
+- name: Emit the one ordinary recovery observation separately from original outcome
+  ansible.builtin.debug:
+    msg: "Controller recovery observation: {{ controller_recovery_progress_wire }}"

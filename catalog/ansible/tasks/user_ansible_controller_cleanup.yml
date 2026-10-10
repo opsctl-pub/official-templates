@@ -16,8 +16,14 @@
 
     - name: Close the exact recorded process through the public helper
       ansible.builtin.command:
-        argv: [/bin/sh, "{{ controller_record }}/close.sh", "{{ controller_record }}", "{{ controller_cleanup_operation }}", normal]
+        argv: "{{ ['/bin/sh', controller_record + '/close.sh', controller_record, controller_cleanup_operation, 'normal'] + (['terminal-bash-gate'] if controller_terminal_gate_fence_qualified | default(false) else []) }}"
         expand_argument_vars: false
+      environment:
+        FENCE_RECORD_DEVICE: "{{ controller_record_identity.stat.dev | default('') | string }}"
+        FENCE_RECORD_INODE: "{{ controller_record_identity.stat.inode | default('') | string }}"
+        FENCE_GATE_DEVICE: "{{ controller_journal.private_identities.gate.dev | default('') | string }}"
+        FENCE_GATE_INODE: "{{ controller_journal.private_identities.gate.inode | default('') | string }}"
+        FENCE_JOURNAL_DIGEST: "{{ controller_journal_after.stat.checksum | default('') }}"
       when: controller_container_id is not none
       register: controller_closed
       no_log: true
@@ -27,7 +33,7 @@
         controller_process_closed: true
         controller_close_presence: "{{ controller_closed.stdout.split(':')[2] }}"
         controller_timed_out: >-
-          {{ controller_timed_out if controller_execution_known | default(false)
+          {{ controller_timed_out if (controller_execution_known | default(false) or controller_terminal_gate_fence_qualified | default(false))
           else controller_closed.stdout.split(':')[1] == 'deadline' }}
       when:
         - controller_container_id is not none
@@ -56,41 +62,61 @@
   when: not (controller_collect_only | default(false))
   no_log: true
 
-- name: Settle the independent deadline after process closure
+- name: Fence exact allocation-complete Bash effects before releasing other liabilities
   block:
-    - name: Stop the owned deadline after observed closure without waiting under its lock
-      ansible.builtin.command:
-        argv: [timeout, -k, '2', '15', systemctl, stop, "{{ controller_unit }}.timer", "{{ controller_unit }}.service"]
-        expand_argument_vars: false
-      when: controller_deadline_cleanup == 'retained'
+    - name: Reobserve all original labels and frozen Bash command before removal
+      community.docker.docker_container_info:
+        name: "{{ controller_container_id }}"
+      register: controller_fence_before_remove
 
-    - name: Observe the exact deadline inactive before deleting its record
-      ansible.builtin.command:
-        argv: [timeout, -k, '2', '5', systemctl, is-active, "{{ item }}"]
-        expand_argument_vars: false
-      changed_when: false
-      register: controller_deadline_after
-      failed_when: controller_deadline_after.rc not in [3, 4]
-      loop: ["{{ controller_unit | default('') }}.timer", "{{ controller_unit | default('') }}.service"]
-      when: controller_deadline_cleanup == 'retained'
+    - name: Require the exact stopped network-none gate identity
+      ansible.builtin.assert:
+        that:
+          - controller_fence_before_remove.exists
+          - controller_fence_before_remove.container.Id == controller_container_id
+          - controller_fence_before_remove.container.Config.Labels['opsctl.operation'] == controller_cleanup_operation
+          - controller_fence_before_remove.container.Config.Labels['opsctl.source_digest'] == controller_journal.source_digest
+          - controller_fence_before_remove.container.Config.Labels['opsctl.input_digest'] == controller_journal.input_digest
+          - controller_fence_before_remove.container.Config.Labels['opsctl.payload_engine'] == 'bash'
+          - controller_fence_before_remove.container.Config.Cmd == ['/run/opsctl-gate'] + controller_journal.payload_argv
+          - controller_fence_before_remove.container.HostConfig.NetworkMode == 'none'
+          - controller_fence_before_remove.container.NetworkSettings.Networks.keys() | list | difference(['none']) | length == 0
+          - controller_fence_before_remove.container.State.Running is sameas false
+          - controller_fence_before_remove.container.State.Pid is integer
+          - controller_fence_before_remove.container.State.Pid is not boolean
+          - controller_fence_before_remove.container.State.Pid == 0
+      when: controller_fence_before_remove.exists
 
-    - name: Record verified deadline closure
+    - name: Remove only this stopped full-ID gate without recreating it
+      community.docker.docker_container:
+        name: "{{ controller_container_id }}"
+        state: absent
+        keep_volumes: true
+      when: controller_fence_before_remove.exists
+
+    - name: Positively observe exact full-ID absence before deadline or material release
+      community.docker.docker_container_info:
+        name: "{{ controller_container_id }}"
+      register: controller_fence_after_remove
+
+    - name: Refuse uncertain removal rather than infer an effect fence
+      ansible.builtin.assert:
+        that: controller_fence_after_remove.exists is sameas false
+
+    - name: Retain only authoritative absence without manufacturing writer completion
       ansible.builtin.set_fact:
-        controller_deadline_cleanup: removed
-      when: controller_deadline_cleanup == 'retained'
+        controller_effect_fenced: true
+        controller_close_presence: absent
   rescue:
-    - name: Preserve the original reason and this phase liability
+    - name: Keep ambiguous effect removal and original outcome independent
       ansible.builtin.set_fact:
-        controller_original_reason: >-
-          {{ controller_original_reason if controller_original_reason is not none else
-          (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
+        controller_effect_fenced: false
+        controller_original_reason: "{{ controller_original_reason if controller_original_reason is not none else controller_reason }}"
         controller_reason: cleanup_failed
-        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
   when:
+    - controller_terminal_gate_fence_qualified | default(false)
     - controller_process_closed
-    - not (controller_existing_invocation | default(false))
     - not (controller_collect_only | default(false))
-    - controller_writer_closed | default(false)
   no_log: true
 
 - name: Collect bounded logs independently of safe liability cleanup
@@ -226,6 +252,7 @@
     - not (controller_existing_invocation | default(false))
     - not (controller_collect_only | default(false))
     - controller_writer_closed | default(false)
+    - not (controller_terminal_gate_fence_qualified | default(false))
   no_log: true
 
 - name: Settle only the exact owned network and policy
@@ -325,7 +352,7 @@
     - not (controller_existing_invocation | default(false))
     - not (controller_collect_only | default(false))
     - controller_network_cleanup == 'retained'
-    - controller_writer_closed | default(false)
+    - controller_writer_closed | default(false) or controller_effect_fenced | default(false)
   no_log: true
 
 - name: Release only revalidated fresh private material
@@ -410,11 +437,32 @@
         test -d "$RECORD" && test ! -L "$RECORD"
         test "$(stat -c '%u:%a:%d:%i' "$RECORD")" = "0:700:$DEVICE:$INODE"
         test ! -L "$RECORD/lock"
+        if test -e "$RECORD/lock"; then
+          test -f "$RECORD/lock"
+          test "$(stat -c '%u:%a' "$RECORD/lock")" = 0:600
+        fi
         exec 8>"$RECORD/lock"
         flock -x -w 5 8
         test -f "$RECORD/closed" && test ! -L "$RECORD/closed"
-        test -f "$RECORD/writer-closed" && test ! -L "$RECORD/writer-closed"
-        test "$(stat -c '%u:%a' "$RECORD/writer-closed")" = 0:600
+        test "$(stat -c '%u:%a' "$RECORD/closed")" = 0:600
+        if test "$EFFECT_FENCED" = true; then
+          test -f "$RECORD/journal.json" && test ! -L "$RECORD/journal.json"
+          test "$(stat -c '%u:%a' "$RECORD/journal.json")" = 0:600
+          actual=$(sha256sum "$RECORD/journal.json")
+          test "${actual%% *}" = "$JOURNAL_DIGEST"
+          test -d "$SOURCE" && test ! -L "$SOURCE"
+          test "$(stat -c '%u:%a:%d:%i' "$SOURCE")" = "$SOURCE_UID:700:$SOURCE_DEVICE:$SOURCE_INODE"
+          test -d "$RECORD/keys" && test ! -L "$RECORD/keys"
+          test "$(stat -c '%u:%a:%d:%i' "$RECORD/keys")" = "$KEY_UID:700:$KEY_DEVICE:$KEY_INODE"
+          test ! -L "$RECORD/gate"
+          test -d "$RECORD/gate"
+          test "$(stat -c '%u:%a:%d:%i' "$RECORD/gate")" = "0:755:$GATE_DEVICE:$GATE_INODE"
+          test -f "$RECORD/gate/closed" && test ! -L "$RECORD/gate/closed"
+          test "$(stat -c '%u:%a' "$RECORD/gate/closed")" = 0:444
+        else
+          test -f "$RECORD/writer-closed" && test ! -L "$RECORD/writer-closed"
+          test "$(stat -c '%u:%a' "$RECORD/writer-closed")" = 0:600
+        fi
         if test -e "$RECORD/source"; then
           test -d "$RECORD/source" && test ! -L "$RECORD/source"
           test "$(stat -c '%u:%a' "$RECORD/source")" = 0:700
@@ -432,6 +480,17 @@
         RECORD: "{{ controller_record }}"
         DEVICE: "{{ controller_record_identity.stat.dev | string }}"
         INODE: "{{ controller_record_identity.stat.inode | string }}"
+        EFFECT_FENCED: "{{ 'true' if controller_effect_fenced | default(false) else 'false' }}"
+        GATE_DEVICE: "{{ controller_journal.private_identities.gate.dev | default('') | string }}"
+        GATE_INODE: "{{ controller_journal.private_identities.gate.inode | default('') | string }}"
+        JOURNAL_DIGEST: "{{ controller_journal_after.stat.checksum | default('') }}"
+        SOURCE: "{{ controller_source_workspace | default('') }}"
+        SOURCE_UID: "{{ controller_cleanup_uid | string }}"
+        SOURCE_DEVICE: "{{ controller_source_identity.stat.dev | default('') | string }}"
+        SOURCE_INODE: "{{ controller_source_identity.stat.inode | default('') | string }}"
+        KEY_UID: "{{ controller_journal.private_identities['keys'].uid | default('') | string }}"
+        KEY_DEVICE: "{{ controller_journal.private_identities['keys'].dev | default('') | string }}"
+        KEY_INODE: "{{ controller_journal.private_identities['keys'].inode | default('') | string }}"
       when: controller_record_owned | default(false)
 
     - name: Observe fresh private-material absence
@@ -463,9 +522,47 @@
   when:
     - controller_process_closed
     - not (controller_existing_invocation | default(false))
-    - controller_writer_closed | default(false)
+    - controller_writer_closed | default(false) or controller_effect_fenced | default(false)
     - not (controller_collect_only | default(false))
     - controller_material_cleanup != 'removed'
+  no_log: true
+
+- name: Settle the independent deadline after process and private closure
+  block:
+    - name: Stop the owned deadline after observed closure without waiting under its lock
+      ansible.builtin.command:
+        argv: [timeout, -k, '2', '15', systemctl, stop, "{{ controller_unit }}.timer", "{{ controller_unit }}.service"]
+        expand_argument_vars: false
+      when: controller_deadline_cleanup == 'retained'
+
+    - name: Observe the exact deadline inactive before deleting its record
+      ansible.builtin.command:
+        argv: [timeout, -k, '2', '5', systemctl, is-active, "{{ item }}"]
+        expand_argument_vars: false
+      changed_when: false
+      register: controller_deadline_after
+      failed_when: controller_deadline_after.rc not in [3, 4]
+      loop: ["{{ controller_unit | default('') }}.timer", "{{ controller_unit | default('') }}.service"]
+      when: controller_deadline_cleanup == 'retained'
+
+    - name: Record verified deadline closure
+      ansible.builtin.set_fact:
+        controller_deadline_cleanup: removed
+      when: controller_deadline_cleanup == 'retained'
+  rescue:
+    - name: Preserve the original reason and this phase liability
+      ansible.builtin.set_fact:
+        controller_original_reason: >-
+          {{ controller_original_reason if controller_original_reason is not none else
+          (controller_reason if controller_outcome != 'succeeded' else 'cleanup_failed') }}
+        controller_reason: cleanup_failed
+        controller_outcome: "{{ controller_outcome if controller_execution_known | default(false) else 'unknown' }}"
+  when:
+    - controller_process_closed
+    - not (controller_existing_invocation | default(false))
+    - not (controller_collect_only | default(false))
+    - controller_writer_closed | default(false) or controller_effect_fenced | default(false)
+    - not (controller_terminal_gate_fence_qualified | default(false)) or controller_material_cleanup == 'removed'
   no_log: true
 
 - name: Persist only observed cleanup facts without replacing original execution
@@ -523,5 +620,5 @@
     - controller_journal is defined
     - not (controller_collect_only | default(false))
     - not (controller_existing_invocation | default(false))
-    - controller_writer_closed | default(false)
+    - controller_writer_closed | default(false) or controller_effect_fenced | default(false)
   no_log: true

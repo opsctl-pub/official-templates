@@ -285,11 +285,26 @@
         - controller_route_qualified
         - template_execution_recovery is defined
 
+    - name: Classify management independently from the original payload outcome
+      ansible.builtin.set_fact:
+        controller_management_succeeded: >-
+          {{ controller_route_qualified and
+          controller_reason not in ['cleanup_failed', 'log_collection_failed'] and
+          ((controller_recovery_completed | default(false) and
+          (template_execution_recovery.mode == 'observe' or
+          (controller_process_closed and
+          [controller_material_cleanup, controller_network_cleanup, controller_deadline_cleanup] |
+          difference(['removed', 'not_allocated']) | length == 0)))
+          if template_execution_recovery is defined else
+          (controller_outcome == 'succeeded' and
+          'retained' not in [controller_material_cleanup, controller_network_cleanup, controller_deadline_cleanup])) }}
+      no_log: true
+
     - name: Publish safe terminal progress
       ansible.builtin.debug:
         msg: >-
           OPERATION_STEP={{ {'name': 'template:controller', 'status':
-          'completed' if controller_outcome == 'succeeded' else 'failed',
+          'completed' if controller_management_succeeded else 'failed',
           'metadata': {'display_name': 'User Ansible controller', 'reason': controller_reason}} | to_json }}
 
     - name: Publish one documented execution result
@@ -309,6 +324,4 @@
     - name: Fail without echoing private native diagnostics
       ansible.builtin.fail:
         msg: "User Ansible controller did not succeed: {{ controller_reason }}"
-      when: >-
-        controller_outcome != 'succeeded' or controller_reason in ['cleanup_failed', 'log_collection_failed'] or
-        'retained' in [controller_material_cleanup, controller_network_cleanup, controller_deadline_cleanup]
+      when: not controller_management_succeeded

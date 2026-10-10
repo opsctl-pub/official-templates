@@ -45,7 +45,8 @@ def transport():
         if result.returncode:
             return result.returncode
         fields = result.stdout.strip().split(':')
-        fields[0] = '0'
+        if '%u' in args[1] and not any(part in args[-1] for part in ('/keys', '/source/')):
+            fields[0] = '0'
         print(':'.join(fields))
         return 0
     if tool == 'flock':
@@ -76,6 +77,14 @@ def transport():
 def named(tasks, name):
     """Select one actual task, retaining its assertions and native control flow."""
     return copy.deepcopy(next(task for task in tasks if task['name'] == name))
+
+
+def walk(tasks):
+    """Visit loaded block bodies for explicit native transport substitutions."""
+    for task in tasks:
+        yield task
+        for section in ('block', 'rescue', 'always'):
+            yield from walk(task.get(section, []))
 
 
 def delivery_transport():
@@ -168,8 +177,13 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     '{{ ' + register + " | combine({'stat': " + register
                     + ".stat | combine({'uid': 0})}) }}"},
                     'when': task.get('when', True), 'no_log': True})
-            if register in ('controller_recovery_ancestors', 'controller_private_before_remove'):
-                uid = '0' if register == 'controller_recovery_ancestors' else "0 if row.item == 'gate' else row.stat.uid"
+            if register in ('controller_recovery_ancestors', 'controller_private_before_remove',
+                            'controller_fence_private', 'controller_recovery_markers'):
+                uid = '0'
+                if register == 'controller_private_before_remove':
+                    uid = "0 if row.item == 'gate' else row.stat.uid"
+                if register == 'controller_fence_private':
+                    uid = "0 if row.item.key == 'gate' else row.stat.uid"
                 result.append({'ansible.builtin.set_fact': {register:
                     "{% set ns = namespace(rows=[]) %}{% for row in " + register + ".results %}"
                     "{% if row.stat.exists | default(false) %}"
@@ -213,9 +227,10 @@ class UserAnsibleControllerTests(unittest.TestCase):
         (record / 'journal.json').chmod(0o600)
         return record, journal
 
-    def recovery_tasks(self, record, native):
+    def recovery_tasks(self, record, native, fence=False, removal_failed=False):
         tasks = copy.deepcopy(self.recovery)
-        block = tasks[0]['block']
+        block = next(task['block'] for task in tasks
+                     if task['name'] == 'Rejoin only the frozen nonprivate original record')
         bind = next(task for task in block if task['name'] == 'Retain safe recovery identity and unknown original liabilities')
         bind['ansible.builtin.set_fact']['controller_record'] = str(record)
         next(task for task in block if task.get('register') == 'controller_recovery_ancestors')[
@@ -229,16 +244,28 @@ class UserAnsibleControllerTests(unittest.TestCase):
             observation['ansible.builtin.set_fact'] = {'controller_recovery_container': native}
         cleanup = self.root / 'recovery-cleanup.yml'
         cleanup_tasks = self.root_tasks(self.cleanup)
-        for task in cleanup_tasks:
-            for child in task.get('block', []):
-                if 'community.docker.docker_container_info' in child:
-                    child.pop('community.docker.docker_container_info')
-                    register = child.pop('register')
-                    child['ansible.builtin.set_fact'] = {register: {'exists': False}}
+        for task in walk(cleanup_tasks):
+            if 'community.docker.docker_container_info' in task:
+                task.pop('community.docker.docker_container_info')
+                register = task.pop('register')
+                value = native if fence and register == 'controller_fence_before_remove' else {'exists': False}
+                task['ansible.builtin.set_fact'] = {register: value}
+            if fence and 'community.docker.docker_container' in task:
+                options = task.pop('community.docker.docker_container')
+                self.assertEqual(options['name'], '{{ controller_container_id }}')
+                self.assertEqual(options['state'], 'absent')
+                task['ansible.builtin.command'] = {'argv': ['/bin/false'] if removal_failed else [
+                    '/bin/sh', '-c', 'test "$1" = "$2" && test -f "$3/closed" '
+                    '&& test -f "$3/gate/closed" && rm -- "$4"', 'remove-exact',
+                    '{{ controller_container_id }}', CONTAINER, str(record),
+                    str(record.parent / 'container-present')], 'expand_argument_vars': False}
         cleanup.write_text(yaml.safe_dump(cleanup_tasks, sort_keys=False))
         for task in block:
             if task.get('ansible.builtin.include_tasks') == 'user_ansible_controller_cleanup.yml':
                 task['ansible.builtin.include_tasks'] = str(cleanup)
+            if task['name'] == 'Refresh current trusted close code only for qualified original settlement':
+                task['environment']['HELPER'] = "{{ lookup('ansible.builtin.file', '" + str(
+                    self.helper('close')) + "', rstrip=false) }}"
         return tasks
 
     def run_tasks(self, tasks, variables=None, cleanup=None, exports=None, module_defaults=None):
@@ -308,7 +335,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                            else 'opsctl-user-' + OPERATION},
             'NetworkSettings': {'Networks': {'none' if self.carrier['payload_engine'] == 'bash'
                                             else 'opsctl-user-' + OPERATION: {}}},
-            'State': {'Running': running, 'Pid': 123 if running else 0, 'ExitCode': 0}}}
+            'State': {'Running': running, 'Pid': 123 if running else 0,
+                      'ExitCode': 0, 'OOMKilled': False}}}
 
     def payload_argv(self):
         if self.carrier['payload_engine'] == 'bash':
@@ -316,6 +344,229 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     '/workspace/user/' + self.carrier['entrypoint'], '/run/opsctl-keys/inputs.json']
         return ['/usr/bin/ansible-playbook', '--inventory', '/run/opsctl-keys/inventory.json',
                 '/source/' + self.carrier['entrypoint'], '--extra-vars', '@/run/opsctl-keys/inputs.json']
+
+    def gate_pending_fixture(self, directory, outcome='unknown'):
+        self.carrier.update(payload_engine='bash', entrypoint='main.sh', targets=[])
+        record, journal = self.record_fixture(directory, outcome, writer_closed=False)
+        workspace = record / 'source/opsctl-template-fixture'
+        workspace.mkdir(mode=0o700)
+        (workspace / 'main.sh').write_bytes(b'synthetic source never executed')
+        (workspace / 'main.sh').chmod(0o700)
+        for name, mode in [('keys', 0o700), ('gate', 0o755)]:
+            (record / name).mkdir(mode=mode)
+        (record / 'keys/inputs.json').write_text('{"opsctl_inputs":{}}')
+        (record / 'keys/inputs.json').chmod(0o600)
+        (record / 'close.sh').write_text('#!/bin/sh\nexit 99\n')
+        (record / 'close.sh').chmod(0o700)
+        journal.update(phase='gate_pending', deadline_cleanup='retained',
+                       source_workspace=str(workspace), source_identity={
+                           **self.source_identity(workspace)['stat'], 'uid': os.getuid()},
+                       private_identities={name: {
+                           'dev': (record / name).stat().st_dev,
+                           'inode': (record / name).stat().st_ino,
+                           'uid': 0 if name == 'gate' else os.getuid(),
+                           'mode': '0755' if name == 'gate' else '0700'}
+                           for name in ('keys', 'gate')})
+        if outcome == 'failed':
+            journal.update(reason='execution_failed', exit_code=37, original_reason='delivery_failed')
+        self.persist_fixture(record, journal)
+        (directory / 'container-present').write_text(CONTAINER)
+        native = self.native_observation()
+        native['container']['Config'].update(
+            Entrypoint=['/bin/sh', '/run/opsctl-gate/start.sh'], WorkingDir='/workspace/user',
+            User=str(os.getuid()) + ':' + str(os.getgid()))
+        native['container']['HostConfig'].update(ReadonlyRootfs=True, Privileged=False)
+        native['container']['Mounts'] = [{'Type': 'bind', 'RW': False,
+            'Source': str(path), 'Destination': destination} for path, destination in [
+                (workspace, '/workspace/user'), (record / 'keys', '/run/opsctl-keys'),
+                (record / 'gate', '/run/opsctl-gate')]]
+        return record, journal, native
+
+    def fence_carrier(self):
+        return {**self.recovery_carrier('settle'), 'terminal_bash_gate_fence': {
+            'controller_source_digest': 'e' * 64,
+            'job_name': 'op-' + OPERATION.replace('-', ''),
+            'job_uid': '00000000-0000-4000-8000-000000000003', 'condition': 'failed'}}
+
+    def run_recovery_play(self, record, native, carrier, removal_failed=False):
+        """Complete production play; only management UID and native transport modeled."""
+        recovery = self.root / 'full-recovery.yml'
+        recovery.write_text(yaml.safe_dump(self.root_tasks(self.recovery_tasks(
+            record, native, fence='terminal_bash_gate_fence' in carrier,
+            removal_failed=removal_failed)), sort_keys=False))
+        play = copy.deepcopy(self.play)
+        play['become'] = False
+        play['vars'].update(template_execution_recovery=carrier,
+                            ansible_python_interpreter=sys.executable)
+        for task in walk(play['tasks']):
+            if task.get('register') == 'controller_management_uid':
+                task.pop('ansible.builtin.command')
+                task.pop('register')
+                task['ansible.builtin.set_fact'] = {'controller_management_uid': {'stdout': '0'}}
+            if task.get('ansible.builtin.include_tasks') == '../tasks/user_ansible_controller_recover.yml':
+                task['ansible.builtin.include_tasks'] = str(recovery)
+        path = self.root / 'full-play.yml'
+        path.write_text(yaml.safe_dump([play], sort_keys=False))
+        result = subprocess.run(['ansible-playbook', '-i', '127.0.0.1,', '-c', 'local', str(path)],
+                                env=self.environment(), stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=110)
+        messages = []
+        for line in result.stdout.splitlines():
+            if line.strip().startswith('"msg": "'):
+                messages.append(json.loads(line.strip()[7:].rstrip(',')))
+        def projection(prefix):
+            values = [message[len(prefix):] for message in messages if message.startswith(prefix)]
+            self.assertEqual(len(values), 1, result.stdout + result.stderr)
+            return json.loads(values[0])
+        report = projection('TEMPLATE_OUTPUT_JSON=')['template_execution_result']
+        progress = projection('Controller recovery observation: ')
+        terminal = [json.loads(message.split('=', 1)[1]) for message in messages
+                    if message.startswith('OPERATION_STEP=')][-1]
+        self.assertEqual(self.sentinel.read_bytes(), b'unrelated sentinel')
+        self.assertEqual(stat.S_IMODE(self.sentinel.stat().st_mode), 0o640)
+        self.assertEqual(report['logs'], '')
+        self.assertFalse(report['logs_truncated'])
+        self.assertNotIn('synthetic source never executed', result.stdout + result.stderr)
+        self.assertNotIn(str(record), '\n'.join(messages))
+        return result, report, progress, terminal
+
+    def fence_transports(self):
+        identity = ' '.join([CONTAINER, OPERATION, self.carrier['source_digest'],
+                             self.carrier['input_digest'], 'false', '0', 'bash', 'none']) + '\n'
+        self.bind_transport({'docker': [{'stdout': identity}] * 2,
+            'systemctl': [{'stdout': 'ActiveState=active\nLastTriggerUSecMonotonic=0\n'},
+                          {}, {'rc': 3}, {'rc': 3}]})
+
+    def test_terminal_gate_fence_full_wire_preserves_outcome_and_refuses_unsafe_release(self):
+        for case in ('unknown', 'failed', 'early', 'malformed', 'foreign', 'unavailable', 'remove-failed'):
+            with self.subTest(case=case):
+                record, journal, native = self.gate_pending_fixture(
+                    self.root / case, 'failed' if case == 'failed' else 'unknown')
+                carrier = self.fence_carrier()
+                if case == 'early':
+                    journal['phase'] = 'deadline_pending'
+                    self.persist_fixture(record, journal)
+                if case == 'malformed':
+                    carrier['terminal_bash_gate_fence']['condition'] = 'completed'
+                if case == 'foreign':
+                    native['container']['Config']['Labels']['opsctl.operation'] = 'foreign'
+                self.fence_transports()
+                result, report, _progress, terminal = self.run_recovery_play(
+                    record, 'unavailable' if case == 'unavailable' else native,
+                    carrier, removal_failed=case == 'remove-failed')
+                success = case in ('unknown', 'failed')
+                self.assertEqual(result.returncode, 0 if success else 2, result.stdout + result.stderr)
+                self.assertEqual(terminal['status'], 'completed' if success else 'failed')
+                self.assertEqual(report['outcome'], journal['outcome'])
+                persisted = json.loads((record / 'journal.json').read_text())
+                for field in ('outcome', 'reason', 'original_reason', 'exit_code', 'writer_closed'):
+                    self.assertEqual(persisted[field], journal[field])
+                self.assertFalse((record / 'writer-closed').exists())
+                for field in ('material_cleanup', 'deadline_cleanup'):
+                    self.assertEqual(report[field], 'removed' if success else 'retained')
+                self.assertEqual((record.parent / 'container-present').exists(), not success)
+                self.assertEqual((record / 'keys').exists(), not success)
+                if success:
+                    self.assertTrue(report['process_closed'])
+                    self.assertEqual(report['exit_code'], journal['exit_code'])
+                    self.assertTrue((record / 'closed').exists())
+                    self.assertEqual(stat.S_IMODE((record / 'closed').stat().st_mode), 0o600)
+                    self.assertEqual((record / 'close.sh').read_text(), self.helper('close').read_text())
+                self.assertFalse(any('start' in call['argv'] or 'logs' in call['argv']
+                                     for call in self.calls() if call['tool'] == 'docker'))
+
+    def test_current_fence_tombstones_block_waiting_start_and_late_release(self):
+        record, journal, native = self.gate_pending_fixture(self.root / 'delayed')
+        self.fence_transports()
+        gate = record / 'gate'
+        helper = self.helper('start', gate)
+        command = ['/bin/sh', str(helper), str(gate), str(self.bin / 'bash'), *journal['payload_argv'][1:]]
+        process = subprocess.Popen(command, env=self.environment(), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.2)
+            self.assertIsNone(process.poll())
+            result, report, _progress, _terminal = self.run_recovery_play(record, native, self.fence_carrier())
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 75, stdout + stderr)
+            self.assertEqual(stdout, '')
+            self.assertTrue(report['process_closed'])
+            late = subprocess.run(['/bin/sh', '-c',
+                'printf release >"$1/release.pending" && chmod 0444 "$1/release.pending" '
+                '&& mv "$1/release.pending" "$1/release"', 'late-release', str(gate)],
+                capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(late.returncode, 0)
+            self.assertFalse(gate.exists())
+            self.assertFalse(any(call['tool'] == 'bash' for call in self.calls()))
+            self.assertFalse(json.loads((record / 'journal.json').read_text())['writer_closed'])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_read_only_recovery_progress_and_later_refusals_control_management(self):
+        expected_keys = {'phase', 'writer_closed', 'root_closed', 'gate_closed', 'release_present',
+                         'running', 'pid_zero', 'exit_code', 'oom_killed', 'timer_active',
+                         'timer_never_triggered'}
+        for case in ('running', 'marker', 'native', 'source', 'log'):
+            with self.subTest(case=case):
+                record, journal, native = self.gate_pending_fixture(self.root / case)
+                native['container']['State'].update(Running=True, Pid=123)
+                if case == 'marker':
+                    (record / 'closed').symlink_to(self.sentinel)
+                if case == 'source':
+                    journal['source_digest'] = 'f' * 64
+                    self.persist_fixture(record, journal)
+                carrier = self.recovery_carrier('observe')
+                if case == 'log':
+                    carrier['log_bytes'] = 1
+                self.bind_transport({'systemctl': [{
+                    'stdout': 'ActiveState=active\nLastTriggerUSecMonotonic=0\n'}],
+                    'docker': [{'rc': 37, 'stdout': 'private log marker'}]})
+                before = self.record_snapshot(record)
+                result, report, progress, terminal = self.run_recovery_play(
+                    record, 'unavailable' if case == 'native' else native, carrier)
+                self.assertEqual(result.returncode, 0 if case == 'running' else 2,
+                                 result.stdout + result.stderr)
+                self.assertEqual(terminal['status'], 'completed' if case == 'running' else 'failed')
+                self.assertEqual(self.record_snapshot(record), before)
+                self.assertEqual(set(progress), expected_keys)
+                self.assertLessEqual(len(('Controller recovery observation: ' + json.dumps(
+                    progress, ensure_ascii=True) + '\n').encode('ascii')), 2048)
+                self.assertFalse(report['process_closed'])
+                self.assertEqual(report['outcome'], 'unknown')
+                self.assertEqual(report['material_cleanup'], 'retained')
+                self.assertNotIn('private log marker', result.stdout + result.stderr)
+                if case == 'running':
+                    self.assertEqual(progress, dict(phase='gate_pending', writer_closed=False,
+                        root_closed=False, gate_closed=False, release_present=False, running=True,
+                        pid_zero=False, exit_code=0, oom_killed=False, timer_active=True,
+                        timer_never_triggered=True))
+                    self.assertTrue(all(call['tool'] == 'systemctl' and call['argv'][0] == 'show'
+                                        for call in self.calls()))
+                if case in ('marker', 'native', 'source'):
+                    self.assertTrue(all(value is None for value in progress.values()))
+
+    def test_final_management_predicate_preserves_fresh_success_and_refusal(self):
+        tasks = [named(self.play['tasks'], name) for name in (
+            'Classify management independently from the original payload outcome',
+            'Publish safe terminal progress', 'Fail without echoing private native diagnostics')]
+        for case in ('success', 'payload-refused', 'retained', 'cleanup', 'log', 'route'):
+            with self.subTest(case=case):
+                result, facts = self.run_tasks(tasks, {
+                    'controller_route_qualified': case != 'route',
+                    'controller_outcome': 'refused' if case == 'payload-refused' else 'succeeded',
+                    'controller_reason': {'cleanup': 'cleanup_failed',
+                        'log': 'log_collection_failed'}.get(case, 'exited'),
+                    'controller_material_cleanup': 'retained' if case == 'retained' else 'removed',
+                    'controller_network_cleanup': 'not_allocated', 'controller_deadline_cleanup': 'removed'},
+                    exports=['controller_management_succeeded', 'controller_outcome'])
+                self.assertEqual(result.returncode, 0 if case == 'success' else 2,
+                                 result.stdout + result.stderr)
+                self.assertEqual(facts['controller_management_succeeded'], case == 'success')
+                self.assertEqual(facts['controller_outcome'],
+                                 'refused' if case == 'payload-refused' else 'succeeded')
 
     def test_zero_log_observe_preserves_original_resources_and_unknown_liability(self):
         self.bind_transport({})
@@ -787,7 +1038,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(len(namespace_calls), 0 if bash else 8)
                     self.assertTrue(all('OUTPUT' in args for args in namespace_calls))
 
-    def helper(self, name):
+    def helper(self, name, gate=None):
         """Bind only unavailable native executable/bind paths, preserving helper logic."""
         body = (CATALOG / ('scripts/user_ansible_controller_' + name + '.sh')).read_text()
         body = body.replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin',
@@ -796,7 +1047,7 @@ class UserAnsibleControllerTests(unittest.TestCase):
         body = body.replace('PATH=/usr/local/bin:/usr/bin:/bin',
                             'PATH=' + str(self.bin) + ':/usr/local/bin:/usr/bin:/bin')
         if name == 'start':
-            body = body.replace('/run/opsctl-gate', str(self.root / 'gate'))
+            body = body.replace('/run/opsctl-gate', str(gate or self.root / 'gate'))
             body = body.replace('/usr/bin/ansible-playbook', str(self.bin / 'ansible-playbook'))
             body = body.replace('/bin/bash', str(self.bin / 'bash'))
         path = self.root / (name + '.sh')
