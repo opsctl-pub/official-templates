@@ -197,16 +197,48 @@
             runtime_info: "{{ runtime_daemon.host_info }}"
           no_log: true
 
-        - name: Qualify only versioned direct effective backend evidence
+        - name: Qualify only direct effective backend evidence
           ansible.builtin.set_fact:
             runtime_checks: >-
               {{ runtime_checks | combine({
                 'linux': runtime_checks.linux and runtime_info.OSType == 'linux',
                 'rootful_docker': ('name=rootless' not in runtime_info.SecurityOptions and 'name=userns' not in runtime_info.SecurityOptions) if runtime_info.SecurityOptions is defined and runtime_info.SecurityOptions is sequence and runtime_info.SecurityOptions is not string else none,
-                'iptables_backend': (runtime_info.FirewallBackend.Driver == 'iptables' and runtime_reads.docker_user.rc == 0) if runtime_info.ID | default('') | length > 0 and runtime_info.ServerVersion in ['29.0.0', '29.8.0'] and runtime_info.FirewallBackend is defined and runtime_info.FirewallBackend is mapping and runtime_info.FirewallBackend.Driver | default('') in ['iptables', 'nftables'] else none,
+                'iptables_backend': (runtime_info.FirewallBackend.Driver == 'iptables' and runtime_reads.docker_user.rc == 0) if runtime_info.ID is defined and runtime_info.ID is string and runtime_info.ID | length > 0 and runtime_info.FirewallBackend is defined and runtime_info.FirewallBackend is mapping and runtime_info.FirewallBackend.Driver is defined and runtime_info.FirewallBackend.Driver is string and runtime_info.FirewallBackend.Driver in ['iptables', 'nftables'] else none,
                 'cgroup_v2': (runtime_info.CgroupVersion == '2' and runtime_info.CgroupDriver == 'systemd' and ['cpu', 'memory', 'pids'] | difference(runtime_reads.controllers.stdout.split()) | length == 0 and runtime_info.MemoryLimit is sameas true and runtime_info.SwapLimit is sameas true and runtime_info.CpuCfsQuota is sameas true and runtime_info.CpuCfsPeriod is sameas true and runtime_info.PidsLimit is sameas true) if runtime_reads.controllers.rc == 0 else none
               }) }}
           no_log: true
+
+        - name: Prepare one bounded safe backend progress observation
+          block:
+            - name: Serialize only closed backend diagnostic scalars
+              ansible.builtin.set_fact:
+                runtime_backend_wire: >-
+                  {{ {
+                    'server_version': runtime_info.ServerVersion if runtime_info.ServerVersion is defined and runtime_info.ServerVersion is string and runtime_info.ServerVersion | length <= 64 and runtime_info.ServerVersion is regex('[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?', match_type='fullmatch') else none,
+                    'firewall_backend_present': 'FirewallBackend' in runtime_info,
+                    'driver_string_present': runtime_info.FirewallBackend is defined and runtime_info.FirewallBackend is mapping and runtime_info.FirewallBackend.Driver is defined and runtime_info.FirewallBackend.Driver is string and runtime_info.FirewallBackend.Driver | length > 0,
+                    'driver': runtime_info.FirewallBackend.Driver if runtime_info.FirewallBackend is defined and runtime_info.FirewallBackend is mapping and runtime_info.FirewallBackend.Driver is defined and runtime_info.FirewallBackend.Driver is string and runtime_info.FirewallBackend.Driver in ['iptables', 'nftables'] else none,
+                    'docker_user_read_succeeded': runtime_reads.docker_user.rc == 0
+                  } | to_json(ensure_ascii=true) }}
+              no_log: true
+
+            - name: Bound the exact backend progress serialization and newline
+              ansible.builtin.assert:
+                that: >-
+                  runtime_backend_wire | length + ('Runtime backend observation: ' | length) + 1 <= 1024
+              no_log: true
+          rescue:
+            - name: Serialize closed unobserved backend diagnostic scalars
+              ansible.builtin.set_fact:
+                runtime_backend_wire: >-
+                  {{ {'server_version': none, 'firewall_backend_present': false,
+                    'driver_string_present': false, 'driver': none,
+                    'docker_user_read_succeeded': false} | to_json(ensure_ascii=true) }}
+              no_log: true
+
+        - name: Emit one safe backend progress observation
+          ansible.builtin.debug:
+            msg: "Runtime backend observation: {{ runtime_backend_wire }}"
 
         - name: Refuse unsupported or unavailable profile before any image pull
           ansible.builtin.set_fact:

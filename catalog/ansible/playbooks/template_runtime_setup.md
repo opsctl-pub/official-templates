@@ -25,9 +25,11 @@ service/firewall/config changes or resource allocations occur.
 Docker modules bind only `unix:///var/run/docker.sock`, auto API, TLS/certificate
 validation false and timeout10. Object enumeration stays disabled. Effective
 backend evidence comes only from the same daemon's direct `FirewallBackend.Driver`
-on source-qualified versions29.0.0 and29.8.0; unknown versions/missing evidence
-remain null/unsupported. Disk config and retained DOCKER-USER never prove backend.
-DOCKER-USER readability is separately necessary. Rootless/userns remapping refuses.
+with a nonempty string daemon ID and exact string driver `iptables` or `nftables`;
+no daemon-version whitelist applies. Missing/malformed/other/suffixed drivers remain
+null/unsupported; `nftables` refuses. Disk config and retained DOCKER-USER never
+prove backend. `iptables` also requires the existing chain read to succeed.
+Rootless/userns remapping refuses.
 Local daemon identity/version/backend/security/cgroup facts are rechecked afterward.
 
 Versioned [Moby29.8.0 info](https://github.com/moby/moby/blob/docker-v29.8.0/daemon/info.go)
@@ -35,6 +37,18 @@ and [29.0.0 info](https://github.com/moby/moby/blob/docker-v29.0.0/daemon/info.g
 obtain the backend from the live network controller, not a config file.
 [Docker's nftables migration contract](https://docs.docker.com/engine/network/firewall-nftables/)
 explains why DOCKER-USER may remain after migration. No legacy/default fallback.
+The [Engine info transport](https://github.com/moby/moby/blob/v28.5.1/api/server/router/system/system_routes.go)
+omits the direct field for API versions below1.49; absence is not backend proof.
+
+Before host eligibility refusal, one ordinary `Runtime backend observation: `
+progress message reports only `server_version`, `firewall_backend_present`,
+`driver_string_present`, `driver` and `docker_user_read_succeeded`. Version is null
+unless an ASCII version string of at most64 characters matches the closed numeric
+triplet/optional suffix grammar. Presence distinguishes absent from malformed;
+driver is exactly `iptables`, `nftables` or null, never a raw unsupported value.
+The stored ASCII JSON plus prefix/newline is bounded to1024 bytes with a same-key
+null/false fallback. This diagnostic grants no eligibility and changes no typed
+result fields; raw native/module/security/config failures remain private.
 
 Prepare's only setup mutation is `docker_image_pull` for that digest,
 `platform: linux/amd64`, `pull: not_present`, followed by exact local reinspection.
