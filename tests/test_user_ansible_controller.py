@@ -1235,14 +1235,14 @@ class UserAnsibleControllerTests(unittest.TestCase):
                            'ShmSize': 348160, 'CapDrop': ['ALL'], 'CapAdd': [],
                            'SecurityOpt': ['no-new-privileges:true'], 'Devices': [],
                            'PidMode': '', 'IpcMode': 'private', 'UTSMode': '', 'PortBindings': {},
-                           'Tmpfs': {'/dev': 'rw,nosuid,noexec,size=348160,mode=0755',
+                           'Tmpfs': {'/dev': 'rw,nosuid,noexec,dev,size=348160,mode=0755',
                                      '/tmp': 'rw,nosuid,nodev,size=348160,mode=0700,uid='
                                      + str(os.getuid()) + ',gid=' + str(os.getgid())},
                            'LogConfig': {'Type': 'json-file', 'Config': {'max-size': '1m', 'max-file': '2'}}},
             'Mounts': [{'Type': 'bind', 'RW': False}] * 3,
             'NetworkSettings': {'Networks': {'selected-network': {}}},
         }
-        for case in ['valid', 'identity-drift', 'command-drift', 'policy-failure',
+        for case in ['valid', 'identity-drift', 'command-drift', 'missing-dev-drift', 'policy-failure',
                      'bash-valid', 'bash-network-drift', 'bash-command-drift', 'bash-expired']:
             with self.subTest(case=case):
                 bash = case.startswith('bash-')
@@ -1274,6 +1274,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     container['HostConfig']['NetworkMode'] = 'bridge'
                 if case == 'identity-drift':
                     container['Id'] = 'f' * 64
+                if case == 'missing-dev-drift':
+                    container['HostConfig']['Tmpfs']['/dev'] = 'rw,nosuid,noexec,size=348160,mode=0755'
                 if case in ('command-drift', 'bash-command-drift'):
                     container['Config']['Cmd'][-1] = '@/arbitrary.json'
                 start = named(self.prepare, 'Start only the trusted gate then install and observe namespace policy under the lock')
@@ -1308,13 +1310,20 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 self.assertTrue(args['read_only'])
                 self.assertEqual(args['cap_drop'], ['ALL'])
                 self.assertEqual(args['capabilities'], [])
+                self.assertEqual(args['security_opts'], ['no-new-privileges:true'])
                 self.assertEqual(args['memory_swap'], args['memory'])
                 self.assertEqual(args['command'], ['/run/opsctl-gate'] + self.payload_argv())
                 self.assertEqual(args['entrypoint'], observed['Config']['Entrypoint'])
                 self.assertEqual(args['healthcheck'], {'test': ['NONE']})
                 self.assertTrue(all(mount['read_only'] for mount in args['mounts']))
+                self.assertEqual(args['tmpfs'], [
+                    '/tmp:' + observed['HostConfig']['Tmpfs']['/tmp'],
+                    '/dev:' + observed['HostConfig']['Tmpfs']['/dev'],
+                ])
+                self.assertEqual(int(args['shm_size']), observed['HostConfig']['ShmSize'])
                 self.assertEqual(sum(int(item.split('size=')[1].split(',')[0]) for item in args['tmpfs'])
                                  + int(args['shm_size']), 1044480)
+                self.assertLessEqual(1044480, self.carrier['limits']['tmpfs_mib'] * 1048576)
                 calls = self.calls()
                 self.assertEqual((record / 'gate/release').exists(), valid)
                 if bash:
@@ -1323,7 +1332,8 @@ class UserAnsibleControllerTests(unittest.TestCase):
                     self.assertEqual(args['mounts'][0]['target'], '/workspace/user')
                     self.assertEqual(args['env'], {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin'})
                     self.assertFalse(any(call['tool'] in ('iptables', 'nsenter', 'ip6tables') for call in calls))
-                if case in ['identity-drift', 'command-drift', 'bash-network-drift', 'bash-command-drift']:
+                if case in ['identity-drift', 'command-drift', 'missing-dev-drift',
+                            'bash-network-drift', 'bash-command-drift']:
                     self.assertFalse(any(call['tool'] in ['systemd-run', 'docker', 'nsenter'] for call in calls))
                     continue
                 timer = next(index for index, call in enumerate(calls) if call['tool'] == 'systemd-run')

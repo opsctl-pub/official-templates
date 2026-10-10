@@ -795,7 +795,7 @@
       - {type: bind, source: "{{ controller_record }}/gate", target: /run/opsctl-gate, read_only: true, propagation: rprivate}
     tmpfs:
       - "/tmp:rw,nosuid,nodev,size={{ controller_writable_bytes }},mode=0700,uid={{ template_execution.uid }},gid={{ template_execution.gid }}"
-      - "/dev:rw,nosuid,noexec,size={{ controller_writable_bytes }},mode=0755"
+      - "/dev:rw,nosuid,noexec,dev,size={{ controller_writable_bytes }},mode=0755"
     shm_size: "{{ controller_writable_bytes | string }}"
     cpus: "{{ template_execution.limits.cpu_millicores / 1000 }}"
     memory: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
@@ -889,7 +889,7 @@
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == 3
       - controller_stopped.container.Mounts | selectattr('Type', 'equalto', 'bind') | selectattr('RW', 'equalto', true) | list | length == 0
       - controller_stopped.container.HostConfig.Tmpfs.keys() | list | sort(case_sensitive=true) == ['/dev', '/tmp']
-      - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,size=' + (controller_writable_bytes | string) + ',mode=0755'
+      - controller_stopped.container.HostConfig.Tmpfs['/dev'] == 'rw,nosuid,noexec,dev,size=' + (controller_writable_bytes | string) + ',mode=0755'
       - controller_stopped.container.HostConfig.Tmpfs['/tmp'] == 'rw,nosuid,nodev,size=' + (controller_writable_bytes | string) + ',mode=0700,uid=' + (template_execution.uid | string) + ',gid=' + (template_execution.gid | string)
       - controller_stopped.container.Config.Entrypoint == ['/bin/sh', '/run/opsctl-gate/start.sh']
       - controller_stopped.container.Config.Cmd == ['/run/opsctl-gate'] + controller_payload_argv

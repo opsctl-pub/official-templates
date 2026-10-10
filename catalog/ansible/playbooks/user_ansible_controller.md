@@ -141,7 +141,9 @@ Private generated inputs and copied credentials remain `0600`; staged credential
 checks still require `0400` or `0600`. Regular-source mode preservation does not
 relax those private permissions.
 The candidate divides the writable budget between `/tmp`, `/dev` and `/dev/shm`,
-rounding each allocation down to a 4096-byte boundary. Before marker release,
+rounding each allocation down to a 4096-byte boundary. Only `/dev` explicitly
+uses `dev` for runtime device nodes, retaining nosuid/noexec/size/mode; `/tmp`
+remains nodev. Before marker release,
 observe effective cgroup limits rather than infer enforcement from create options.
 
 ## Destination-Only Policy
