@@ -637,6 +637,112 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 if case in ('marker', 'native', 'source'):
                     self.assertTrue(all(value is None for value in progress.values()))
 
+    def test_docker_start_detail_preserves_complete_text_and_original_failure_before_cleanup(self):
+        """Production producer/rescue; native inspection and cleanup effects modeled."""
+        carrier = {**self.carrier, 'payload_engine': 'bash', 'targets': [],
+                   'entrypoint': 'main.sh', 'staging_directory': str(self.root / 'staged'),
+                   'supplied_files': [{'path': 'main.sh', 'mode': '0700'}]}
+        expected_report = {
+            'operation_id': OPERATION, 'controller_server_id': carrier['controller_server_id'],
+            'outcome': 'unknown', 'reason': 'execution_unknown',
+            'original_reason': 'execution_unknown', 'container_id': CONTAINER,
+            'exit_code': None, 'timed_out': False, 'process_closed': False,
+            'material_cleanup': 'not_allocated', 'network_cleanup': 'not_allocated',
+            'deadline_cleanup': 'not_allocated', 'logs': '', 'logs_truncated': False,
+        }
+        cases = {'intact': '  daemon refused  ', 'edge': 'é' * 256,
+                 'overlength': 'é' * 256 + 'x', 'control': 'PRIVATE_MARKER\n',
+                 'empty': '', 'malformed': {'private': 'PRIVATE_MARKER'},
+                 'identity': 'daemon refused', 'label': 'daemon refused',
+                 'observation': 'daemon refused', 'invalid-status': 'daemon refused'}
+        for case, error in cases.items():
+            with self.subTest(case=case):
+                record, _journal = self.record_fixture(self.root / case, writer_closed=False)
+                (record / 'gate').mkdir(mode=0o755)
+                self.bind_transport({'systemctl': [{'stdout': 'active\n'}, {'stdout': '0\n'}],
+                                     'docker': [{'rc': 37, 'stdout': 'PRIVATE_MARKER'}]})
+                observation = {'exists': True, 'container': {
+                    'Id': CONTAINER, 'Config': {'Labels': {
+                        'opsctl.operation': OPERATION, 'opsctl.source_digest': carrier['source_digest'],
+                        'opsctl.input_digest': carrier['input_digest'], 'opsctl.payload_engine': 'bash'}},
+                    'State': {'Error': error}}}
+                if case == 'identity':
+                    observation['container']['Id'] = 'e' * 64
+                elif case == 'label':
+                    observation['container']['Config']['Labels']['opsctl.source_digest'] = 'e' * 64
+                elif case == 'observation':
+                    observation = {'failed': True, 'msg': 'PRIVATE_MARKER'}
+                start = named(self.prepare,
+                    'Start only the trusted gate then install and observe namespace policy under the lock')
+                start['environment']['PATH'] = str(self.bin) + ':/usr/sbin:/usr/bin:/sbin:/bin'
+                if case == 'invalid-status':
+                    # Only this injected case qualifies framing, not a native timeout.
+                    start['ansible.builtin.shell'] = 'printf \'%s\\n\' "$WIRE"; exit 65'
+                    start['environment']['WIRE'] = (
+                        'controller_start_failed_check=docker_start\ncontroller_start_native_rc=124')
+                prepared = record / 'start-only.yml'
+                prepared.write_text(yaml.safe_dump([{'ansible.builtin.set_fact': {
+                    'controller_record': str(record), 'controller_record_owned': True,
+                    'controller_unit': 'opsctl-user-ansible-' + OPERATION,
+                    'controller_container_id': CONTAINER,
+                    'controller_reason': 'execution_unknown'}}, start], sort_keys=False))
+                cleanup = record / 'cleanup-only.yml'
+                cleanup.write_text(yaml.safe_dump([{'ansible.builtin.copy': {
+                    'dest': str(record / 'cleanup-observed'), 'content': 'cleanup reached'}}]))
+                play = copy.deepcopy(self.play)
+                play['become'] = False
+                play['vars'].update(template_execution=carrier,
+                                    modeled_start_observation=observation,
+                                    ansible_python_interpreter=sys.executable)
+                for task in walk(play['tasks']):
+                    if task.get('register') == 'controller_management_uid':
+                        task.pop('ansible.builtin.command')
+                        task.pop('register')
+                        task['ansible.builtin.set_fact'] = {'controller_management_uid': {'stdout': '0'}}
+                    if task.get('ansible.builtin.include_tasks') == '../tasks/user_ansible_controller_prepare.yml':
+                        task['ansible.builtin.include_tasks'] = str(prepared)
+                    if task.get('ansible.builtin.include_tasks') == '../tasks/user_ansible_controller_cleanup.yml':
+                        task['ansible.builtin.include_tasks'] = str(cleanup)
+                    if task.get('register') == 'controller_start_observation':
+                        self.assertEqual(task['community.docker.docker_container_info']['name'],
+                                         '{{ controller_container_id }}')
+                        task.pop('community.docker.docker_container_info')
+                        task.pop('register')
+                        task['ansible.builtin.set_fact'] = {
+                            'controller_start_observation': '{{ modeled_start_observation }}'}
+                path = record / 'full-play.yml'
+                path.write_text(yaml.safe_dump([play], sort_keys=False))
+                result = subprocess.run([
+                    'ansible-playbook', '-i', '127.0.0.1,', '-c', 'local', str(path)],
+                    env=self.environment(), stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=100)
+                output = result.stdout + result.stderr
+                messages = [json.loads(line.strip()[7:].rstrip(','))
+                            for line in result.stdout.splitlines()
+                            if line.strip().startswith('"msg": "')]
+                details = [message for message in messages
+                           if message.startswith('Controller Docker start failure: ')]
+                expected_detail = error if case in ('intact', 'edge') else 'unavailable'
+                self.assertEqual(details, [] if case == 'invalid-status' else [
+                    'Controller Docker start failure: rc=37; detail=' + expected_detail], output)
+                tokens = [message for message in messages
+                          if message.startswith('Controller start failed check: ')]
+                self.assertEqual(tokens, [] if case == 'invalid-status' else [
+                    'Controller start failed check: docker_start'], output)
+                reports = [json.loads(message.split('=', 1)[1]) for message in messages
+                           if message.startswith('TEMPLATE_OUTPUT_JSON=')]
+                self.assertEqual(reports, [{'template_execution_result': expected_report}], output)
+                self.assertEqual(result.returncode, 2, output)
+                terminal = [json.loads(message.split('=', 1)[1]) for message in messages
+                            if message.startswith('OPERATION_STEP=')][-1]
+                self.assertEqual(terminal['status'], 'failed')
+                self.assertEqual((record / 'cleanup-observed').read_text(), 'cleanup reached')
+                self.assertFalse((record / 'gate/release').exists())
+                self.assertNotIn('PRIVATE_MARKER', output)
+                self.assertNotIn(str(record), '\n'.join(messages))
+                self.assertEqual(self.sentinel.read_bytes(), b'unrelated sentinel')
+                self.assertEqual(stat.S_IMODE(self.sentinel.stat().st_mode), 0o640)
+
     def test_start_failure_visibility_requires_exact_task_token_without_private_output(self):
         """Actual start/main bodies; allocation, root and native observations modeled."""
         carrier = {**self.carrier, 'payload_engine': 'bash', 'targets': [],

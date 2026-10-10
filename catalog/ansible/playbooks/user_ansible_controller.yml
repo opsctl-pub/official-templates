@@ -34,6 +34,8 @@
         controller_writer_closed: false
         controller_execution_known: false
         controller_start_failed_check: null
+        controller_start_native_rc: null
+        controller_start_detail: unavailable
 
     - name: Publish controller preparation progress
       ansible.builtin.debug:
@@ -264,6 +266,17 @@
             JOURNAL: "{{ controller_journal | to_json }}"
           diff: false
       rescue:
+        - name: Preserve the exact Docker start native status before diagnostic observation
+          ansible.builtin.set_fact:
+            controller_start_failed_check: docker_start
+            controller_start_native_rc: "{{ ansible_failed_result.stdout.splitlines()[1].split('=')[1] | int }}"
+          when:
+            - ansible_failed_task.name == 'Start only the trusted gate then install and observe namespace policy under the lock'
+            - ansible_failed_task.action == 'ansible.builtin.shell'
+            - ansible_failed_result is mapping
+            - ansible_failed_result.rc | default(none) == 65
+            - ansible_failed_result.stdout | default(none) is string
+            - ansible_failed_result.stdout is regex('controller_start_failed_check=docker_start\ncontroller_start_native_rc=([1-9]|[1-9][0-9]|1[01][0-9]|12[0-3])\n', match_type='fullmatch')
         - name: Retain only an exact closed token from this failed start task
           ansible.builtin.set_fact:
             controller_start_failed_check: "{{ ansible_failed_result.stdout.split('=')[1][:-1] }}"
@@ -274,6 +287,40 @@
             - ansible_failed_result.rc | default(none) == 65
             - ansible_failed_result.stdout | default(none) is string
             - ansible_failed_result.stdout is regex('controller_start_failed_check=(lock|tombstone|timer_active|timer_never_triggered|docker_start|container_identity_pid|unified_cgroup|memory|swap|pids|cpu|engine_network|final_identity|final_tombstone|final_timer_active|final_timer_never_triggered|release)\n', match_type='fullmatch')
+        - name: Observe only the requalified failed-start container before ordinary cleanup
+          block:
+            - name: Inspect only the recorded full container ID
+              community.docker.docker_container_info:
+                name: "{{ controller_container_id }}"
+              register: controller_start_observation
+              failed_when: false
+            - name: Require exact current identity and existing invocation labels
+              ansible.builtin.assert:
+                fail_msg: Controller start detail unavailable
+                that:
+                  - controller_start_observation.exists | default(false) == true
+                  - controller_start_observation.container is mapping
+                  - controller_start_observation.container.Id == controller_container_id
+                  - controller_start_observation.container.Config.Labels is mapping
+                  - controller_start_observation.container.Config.Labels['opsctl.operation'] == template_execution.operation_id
+                  - controller_start_observation.container.Config.Labels['opsctl.source_digest'] == template_execution.source_digest
+                  - controller_start_observation.container.Config.Labels['opsctl.input_digest'] == template_execution.input_digest
+                  - controller_start_observation.container.Config.Labels['opsctl.payload_engine'] == template_execution.payload_engine
+                  - controller_start_observation.container.State.Error is string
+                  - controller_start_observation.container.State.Error | length > 0
+                  - controller_start_observation.container.State.Error.isprintable()
+                  - controller_start_observation.container.State.Error.encode('utf-8') | length <= 512
+            - name: Retain only complete unchanged single-line daemon failure detail
+              ansible.builtin.set_fact:
+                controller_start_detail: "{{ controller_start_observation.container.State.Error }}"
+          rescue:
+            - name: Keep diagnostic unavailability independent from original failure and cleanup
+              ansible.builtin.set_fact:
+                controller_start_detail: unavailable
+          when:
+            - controller_start_native_rc is not none
+            - controller_container_id is string
+            - controller_container_id is regex('[0-9a-f]{64}', match_type='fullmatch')
         - name: Preserve the original finite reason without raw exception output
           ansible.builtin.set_fact:
             controller_original_reason: "{{ controller_reason }}"
@@ -300,6 +347,11 @@
       ansible.builtin.debug:
         msg: "Controller start failed check: {{ controller_start_failed_check }}"
       when: controller_start_failed_check is not none
+
+    - name: Publish only projected Docker start status and bounded operational detail
+      ansible.builtin.debug:
+        msg: "Controller Docker start failure: rc={{ controller_start_native_rc }}; detail={{ controller_start_detail }}"
+      when: controller_start_native_rc is not none
 
     - name: Classify management independently from the original payload outcome
       ansible.builtin.set_fact:

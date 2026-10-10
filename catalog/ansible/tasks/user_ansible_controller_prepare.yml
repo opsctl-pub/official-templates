@@ -938,6 +938,9 @@
     umask 077
     failed_check() {
       printf 'controller_start_failed_check=%s\n' "$1"
+      if test "$1" = docker_start && test "$#" = 2; then
+        printf 'controller_start_native_rc=%s\n' "$2"
+      fi
       exit 65
     }
     native_failure() {
@@ -946,6 +949,7 @@
       esac
       test "$2" -lt 128 || exit "$2"
       if test "$1" = lock && test "$2" = 1; then exit 1; fi
+      if test "$1" = docker_start; then failed_check "$1" "$2"; fi
       failed_check "$1"
     }
     exec 8>"$RECORD/lock"

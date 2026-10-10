@@ -319,6 +319,16 @@ Command timeout/interruption, missing/malformed/multiple tokens and other tasks
 remain unattributed. This optional progress is not an outcome, eligibility or
 historical-cause fact; raw command/private output remains censored.
 
+Only an exact attributed Docker start failure additionally retains its original
+CLI status and observes the recorded full container ID before ordinary cleanup.
+Exact ID and Operation/source/input/engine labels must match before State.Error
+is retained only as complete, nonempty, printable single-line valid UTF-8 text
+within 512 bytes; otherwise detail is unavailable. No stripping, truncation,
+trimming, replacement or normalization transforms protected values.
+Raw observations remain censored; ordinary Runner protected-manifest redaction
+still applies to this operational progress, including protected collisions.
+Diagnostic failure neither suppresses cleanup nor changes the original failure.
+
 Keep exit observation independent of output collection. `detach: false` calls
 the installed module's log reader with `tail: all` and stores raw `Output` even
 when `output_logs: false`. Auto-removal also loses terminal inspection. Both are
