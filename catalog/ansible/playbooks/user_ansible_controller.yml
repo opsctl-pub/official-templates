@@ -33,6 +33,7 @@
         controller_route_qualified: false
         controller_writer_closed: false
         controller_execution_known: false
+        controller_start_failed_check: null
 
     - name: Publish controller preparation progress
       ansible.builtin.debug:
@@ -263,6 +264,16 @@
             JOURNAL: "{{ controller_journal | to_json }}"
           diff: false
       rescue:
+        - name: Retain only an exact closed token from this failed start task
+          ansible.builtin.set_fact:
+            controller_start_failed_check: "{{ ansible_failed_result.stdout.split('=')[1][:-1] }}"
+          when:
+            - ansible_failed_task.name == 'Start only the trusted gate then install and observe namespace policy under the lock'
+            - ansible_failed_task.action == 'ansible.builtin.shell'
+            - ansible_failed_result is mapping
+            - ansible_failed_result.rc | default(none) == 65
+            - ansible_failed_result.stdout | default(none) is string
+            - ansible_failed_result.stdout is regex('controller_start_failed_check=(lock|tombstone|timer_active|timer_never_triggered|docker_start|container_identity_pid|unified_cgroup|memory|swap|pids|cpu|engine_network|final_identity|final_tombstone|final_timer_active|final_timer_never_triggered|release)\n', match_type='fullmatch')
         - name: Preserve the original finite reason without raw exception output
           ansible.builtin.set_fact:
             controller_original_reason: "{{ controller_reason }}"
@@ -284,6 +295,11 @@
       when:
         - controller_route_qualified
         - template_execution_recovery is defined
+
+    - name: Publish only the qualified fixed start failure token
+      ansible.builtin.debug:
+        msg: "Controller start failed check: {{ controller_start_failed_check }}"
+      when: controller_start_failed_check is not none
 
     - name: Classify management independently from the original payload outcome
       ansible.builtin.set_fact:

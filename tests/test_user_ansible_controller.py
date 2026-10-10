@@ -637,6 +637,113 @@ class UserAnsibleControllerTests(unittest.TestCase):
                 if case in ('marker', 'native', 'source'):
                     self.assertTrue(all(value is None for value in progress.values()))
 
+    def test_start_failure_visibility_requires_exact_task_token_without_private_output(self):
+        """Actual start/main bodies; allocation, root and native observations modeled."""
+        carrier = {**self.carrier, 'payload_engine': 'bash', 'targets': [],
+                   'entrypoint': 'main.sh', 'staging_directory': str(self.root / 'staged'),
+                   'supplied_files': [{'path': 'main.sh', 'mode': '0700'}]}
+        expected_report = {
+            'operation_id': OPERATION, 'controller_server_id': carrier['controller_server_id'],
+            'outcome': 'unknown', 'reason': 'execution_unknown',
+            'original_reason': 'execution_unknown', 'container_id': CONTAINER,
+            'exit_code': None, 'timed_out': False, 'process_closed': False,
+            'material_cleanup': 'not_allocated', 'network_cleanup': 'not_allocated',
+            'deadline_cleanup': 'not_allocated', 'logs': '', 'logs_truncated': False,
+        }
+        injected = {
+            'missing': '',
+            'malformed': 'controller_start_failed_check=PRIVATE_MARKER',
+            'multiple': 'controller_start_failed_check=memory\ncontroller_start_failed_check=cpu',
+            'trailing': 'controller_start_failed_check=memory PRIVATE_MARKER',
+            'extra-newline': 'controller_start_failed_check=memory\n',
+            'other-task': 'controller_start_failed_check=memory',
+        }
+        for case in ('tombstone', 'memory', 'timeout', 'interruption', *injected):
+            with self.subTest(case=case):
+                record, _journal = self.record_fixture(self.root / case, writer_closed=False)
+                (record / 'gate').mkdir(mode=0o755)
+                proc = record / 'proc/123'
+                proc.mkdir(parents=True)
+                (proc / 'cgroup').write_text('0::/payload\n')
+                cgroup = record / 'cgroup/payload'
+                cgroup.mkdir(parents=True)
+                for key, value in {'memory.max': '67108864', 'memory.swap.max': '0',
+                                   'pids.max': '8', 'cpu.max': '10000 100000'}.items():
+                    (cgroup / key).write_text(value)
+                identity = CONTAINER + ' ' + OPERATION + ' 123\n'
+                responses = {
+                    'systemctl': [{'stdout': 'active\n'}, {'stdout': '0\n'},
+                                  {'stdout': 'active\n'}, {'stdout': '0\n'}],
+                    'docker': [{}, {'stdout': identity}, {'stdout': 'none|none,'},
+                               {'stdout': identity}],
+                }
+                if case == 'tombstone':
+                    (record / 'closed').write_text('closed\n')
+                elif case == 'memory':
+                    (cgroup / 'memory.max').write_text('PRIVATE_MARKER')
+                elif case == 'timeout':
+                    responses['docker'][0] = {'sleep': 15, 'stdout': 'PRIVATE_MARKER'}
+                self.bind_transport(responses)
+                if case == 'interruption':
+                    (self.bin / 'docker').write_text(
+                        '#!' + sys.executable + '\nimport os, signal\n'
+                        'os.kill(os.getpid(), signal.SIGTERM)\n')
+                start = named(self.prepare,
+                    'Start only the trusted gate then install and observe namespace policy under the lock')
+                start['ansible.builtin.shell'] = start['ansible.builtin.shell'].replace(
+                    '/proc/', str(record / 'proc') + '/').replace(
+                    '/sys/fs/cgroup', str(record / 'cgroup'))
+                start['environment']['PATH'] = str(self.bin) + ':/usr/sbin:/usr/bin:/sbin:/bin'
+                if case in injected:
+                    # Injected wire qualifies rescue framing, not native failure attribution.
+                    start['ansible.builtin.shell'] = 'printf \'%s\\n\' "$WIRE"; exit 65'
+                    start['environment']['WIRE'] = injected[case]
+                    if case == 'other-task':
+                        start['name'] = 'Unrelated modeled native failure'
+                prepared = record / 'start-only.yml'
+                prepared.write_text(yaml.safe_dump([{'ansible.builtin.set_fact': {
+                    'controller_record': str(record),
+                    'controller_unit': 'opsctl-user-ansible-' + OPERATION,
+                    'controller_container_id': CONTAINER,
+                    'controller_reason': 'execution_unknown'}}, start], sort_keys=False))
+                play = copy.deepcopy(self.play)
+                play['become'] = False
+                play['vars'].update(template_execution=carrier,
+                                    ansible_python_interpreter=sys.executable)
+                for task in walk(play['tasks']):
+                    if task.get('register') == 'controller_management_uid':
+                        task.pop('ansible.builtin.command')
+                        task.pop('register')
+                        task['ansible.builtin.set_fact'] = {'controller_management_uid': {'stdout': '0'}}
+                    if task.get('ansible.builtin.include_tasks') == '../tasks/user_ansible_controller_prepare.yml':
+                        task['ansible.builtin.include_tasks'] = str(prepared)
+                path = record / 'full-play.yml'
+                path.write_text(yaml.safe_dump([play], sort_keys=False))
+                result = subprocess.run([
+                    'ansible-playbook', '-i', '127.0.0.1,', '-c', 'local', str(path)],
+                    env=self.environment(), stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=100)
+                output = result.stdout + result.stderr
+                messages = [json.loads(line.strip()[7:].rstrip(','))
+                            for line in result.stdout.splitlines()
+                            if line.strip().startswith('"msg": "')]
+                visible = [message for message in messages
+                           if message.startswith('Controller start failed check: ')]
+                self.assertEqual(visible, ['Controller start failed check: ' + case]
+                                 if case in ('tombstone', 'memory') else [], output)
+                reports = [json.loads(message.split('=', 1)[1]) for message in messages
+                           if message.startswith('TEMPLATE_OUTPUT_JSON=')]
+                self.assertEqual(reports, [{'template_execution_result': expected_report}], output)
+                self.assertEqual(result.returncode, 2, output)
+                terminal = [json.loads(message.split('=', 1)[1]) for message in messages
+                            if message.startswith('OPERATION_STEP=')][-1]
+                self.assertEqual(terminal['status'], 'failed')
+                self.assertNotIn('PRIVATE_MARKER', output)
+                self.assertNotIn(str(record), '\n'.join(messages))
+                self.assertFalse((record / 'gate/release').exists())
+                self.assertEqual(self.sentinel.read_bytes(), b'unrelated sentinel')
+                self.assertEqual(stat.S_IMODE(self.sentinel.stat().st_mode), 0o640)
+
     def test_final_management_predicate_preserves_fresh_success_and_refusal(self):
         tasks = [named(self.play['tasks'], name) for name in (
             'Classify management independently from the original payload outcome',

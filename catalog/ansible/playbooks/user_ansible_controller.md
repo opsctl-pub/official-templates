@@ -310,6 +310,15 @@ does not itself fail management, and remains unchanged in result/journal/history
 
 ## Logs And Plain Results
 
+Fresh start failure may emit `Controller start failed check: <member>` only from
+the exact failed start task's single closed token. Members are lock, tombstone,
+timer_active, timer_never_triggered, docker_start, container_identity_pid,
+unified_cgroup, memory, swap, pids, cpu, engine_network, final_identity,
+final_tombstone, final_timer_active, final_timer_never_triggered and release.
+Command timeout/interruption, missing/malformed/multiple tokens and other tasks
+remain unattributed. This optional progress is not an outcome, eligibility or
+historical-cause fact; raw command/private output remains censored.
+
 Keep exit observation independent of output collection. `detach: false` calls
 the installed module's log reader with `tail: all` and stores raw `Output` even
 when `output_logs: false`. Auto-removal also loses terminal inspection. Both are

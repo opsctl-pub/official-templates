@@ -936,59 +936,81 @@
     exec timeout -k 2 30 /bin/sh <<'OPSCTL_START'
     set -eu
     umask 077
+    failed_check() {
+      printf 'controller_start_failed_check=%s\n' "$1"
+      exit 65
+    }
+    native_failure() {
+      case "$2" in
+        124|125|126|127) exit "$2" ;;
+      esac
+      test "$2" -lt 128 || exit "$2"
+      if test "$1" = lock && test "$2" = 1; then exit 1; fi
+      failed_check "$1"
+    }
     exec 8>"$RECORD/lock"
-    flock -x -w 5 8
-    test ! -e "$RECORD/closed"
-    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null
-    test "$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value)" = 0
-    timeout 10 docker --host unix:///var/run/docker.sock start "$CONTAINER" >/dev/null
-    facts=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER")
+    flock -x -w 5 8 || native_failure lock "$?"
+    test ! -e "$RECORD/closed" || failed_check tombstone
+    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null || native_failure timer_active "$?"
+    triggered=$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value) || native_failure timer_never_triggered "$?"
+    test "$triggered" = 0 || failed_check timer_never_triggered
+    timeout 10 docker --host unix:///var/run/docker.sock start "$CONTAINER" >/dev/null || native_failure docker_start "$?"
+    facts=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER") || native_failure container_identity_pid "$?"
     set -- $facts
-    test "$#" = 3 && test "$1" = "$CONTAINER" && test "$2" = "$OPERATION" && test "$3" -gt 0
+    { test "$#" = 3 && test "$1" = "$CONTAINER" && test "$2" = "$OPERATION" && test "$3" -gt 0; } || failed_check container_identity_pid
     pid=$3
-    cgroup=$(awk -F: '$1 == "0" && $2 == "" {print $3}' "/proc/$pid/cgroup")
+    cgroup=$(awk -F: '$1 == "0" && $2 == "" {print $3}' "/proc/$pid/cgroup") || native_failure unified_cgroup "$?"
     case "$cgroup" in
       /*) ;;
-      *) exit 65 ;;
+      *) failed_check unified_cgroup ;;
     esac
-    case "$cgroup" in *'/../'*|*'/./'*|*/..|*/.) exit 65 ;; esac
-    test "$(cat "/sys/fs/cgroup$cgroup/memory.max")" = "$MEMORY_BYTES"
-    test "$(cat "/sys/fs/cgroup$cgroup/memory.swap.max")" = 0
-    test "$(cat "/sys/fs/cgroup$cgroup/pids.max")" = "$PID_LIMIT"
-    set -- $(cat "/sys/fs/cgroup$cgroup/cpu.max")
-    test "$#" = 2 && test "$2" -gt 0
-    test "$1" -gt 0 && test "$(( $1 * 1000 ))" = "$(( CPU_MILLICORES * $2 ))"
+    case "$cgroup" in *'/../'*|*'/./'*|*/..|*/.) failed_check unified_cgroup ;; esac
+    memory=$(cat "/sys/fs/cgroup$cgroup/memory.max") || native_failure memory "$?"
+    test "$memory" = "$MEMORY_BYTES" || failed_check memory
+    swap=$(cat "/sys/fs/cgroup$cgroup/memory.swap.max") || native_failure swap "$?"
+    test "$swap" = 0 || failed_check swap
+    pids=$(cat "/sys/fs/cgroup$cgroup/pids.max") || native_failure pids "$?"
+    test "$pids" = "$PID_LIMIT" || failed_check pids
+    cpu=$(cat "/sys/fs/cgroup$cgroup/cpu.max") || native_failure cpu "$?"
+    set -- $cpu
+    { test "$#" = 2 && test "$2" -gt 0; } || failed_check cpu
+    { test "$1" -gt 0 && test "$(( $1 * 1000 ))" = "$(( CPU_MILLICORES * $2 ))"; } || failed_check cpu
     case "$ENGINE" in
       ansible)
         exec 9<"/proc/$pid/ns/net"
-        namespace=$(readlink "/proc/$pid/ns/net")
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -d 127.0.0.11 -j REJECT
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p udp -j REJECT
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p tcp --dport 53 -j REJECT
-        timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -P OUTPUT DROP
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -d 127.0.0.11 -j REJECT
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p udp -j REJECT
-        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p tcp --dport 53 -j REJECT
-        test "$(timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -S OUTPUT)" = '-P OUTPUT DROP'
-        test "$(readlink "/proc/$pid/ns/net")" = "$namespace"
+        namespace=$(readlink "/proc/$pid/ns/net") || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -d 127.0.0.11 -j REJECT >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p udp -j REJECT >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -I OUTPUT 1 -p tcp --dport 53 -j REJECT >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -P OUTPUT DROP >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -d 127.0.0.11 -j REJECT >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p udp -j REJECT >/dev/null || native_failure engine_network "$?"
+        timeout 10 nsenter --net=/proc/self/fd/9 iptables -w 5 -C OUTPUT -p tcp --dport 53 -j REJECT >/dev/null || native_failure engine_network "$?"
+        policy=$(timeout 10 nsenter --net=/proc/self/fd/9 ip6tables -w 5 -S OUTPUT) || native_failure engine_network "$?"
+        test "$policy" = '-P OUTPUT DROP' || failed_check engine_network
+        current_namespace=$(readlink "/proc/$pid/ns/net") || native_failure engine_network "$?"
+        test "$current_namespace" = "$namespace" || failed_check engine_network
         ;;
       bash)
-        network=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.HostConfig.NetworkMode}}|{{range $name, $network := .NetworkSettings.Networks}}{{$name}},{{end}}{% endraw %}' "$CONTAINER")
-        case "$network" in 'none|'|'none|none,') ;; *) exit 65 ;; esac
+        network=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.HostConfig.NetworkMode}}|{{range $name, $network := .NetworkSettings.Networks}}{{$name}},{{end}}{% endraw %}' "$CONTAINER") || native_failure engine_network "$?"
+        case "$network" in 'none|'|'none|none,') ;; *) failed_check engine_network ;; esac
         ;;
-      *) exit 65 ;;
+      *) failed_check engine_network ;;
     esac
-    test "$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER")" = "$facts"
-    test ! -e "$RECORD/closed"
-    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null
-    test "$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value)" = 0
+    final_facts=$(timeout 10 docker --host unix:///var/run/docker.sock inspect --format '{% raw %}{{.Id}} {{index .Config.Labels "opsctl.operation"}} {{.State.Pid}}{% endraw %}' "$CONTAINER") || native_failure final_identity "$?"
+    test "$final_facts" = "$facts" || failed_check final_identity
+    test ! -e "$RECORD/closed" || failed_check final_tombstone
+    timeout -k 2 5 systemctl is-active "$UNIT.timer" >/dev/null || native_failure final_timer_active "$?"
+    final_triggered=$(timeout -k 2 5 systemctl show "$UNIT.timer" --property=LastTriggerUSecMonotonic --value) || native_failure final_timer_never_triggered "$?"
+    test "$final_triggered" = 0 || failed_check final_timer_never_triggered
     umask 022
-    : >"$RECORD/gate/release.pending"
-    chmod 0444 "$RECORD/gate/release.pending"
-    mv "$RECORD/gate/release.pending" "$RECORD/gate/release"
+    : >"$RECORD/gate/release.pending" || native_failure release "$?"
+    chmod 0444 "$RECORD/gate/release.pending" || native_failure release "$?"
+    mv "$RECORD/gate/release.pending" "$RECORD/gate/release" || native_failure release "$?"
     OPSCTL_START
   args:
     executable: /bin/sh
+    strip_empty_ends: false
   environment:
     PATH: /usr/sbin:/usr/bin:/sbin:/bin
     DOCKER_CONTEXT: ''
@@ -1003,6 +1025,7 @@
     MEMORY_BYTES: "{{ (template_execution.limits.memory_mib * 1048576) | string }}"
     PID_LIMIT: "{{ template_execution.limits.pids | string }}"
     CPU_MILLICORES: "{{ template_execution.limits.cpu_millicores | string }}"
+  register: controller_start_result
   no_log: true
 
 - name: Record execution entered only through the released gate
