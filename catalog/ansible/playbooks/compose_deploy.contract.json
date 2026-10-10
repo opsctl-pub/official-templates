@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "item_id": "compose_deploy",
+  "engine": "ansible",
+  "managed_behavior": {
+    "id": "opsctl.compose_deploy",
+    "revision": 1
+  }
+}
