@@ -1,0 +1,103 @@
+---
+- name: Observe the frozen Prometheus blackbox association
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Initialize a safe unavailable observation
+      ansible.builtin.set_fact:
+        monitoring_observation_report:
+          outcome: unknown
+          reason: invalid_inputs
+          collection_origin: host-on-b
+          probe_origin: workload-on-b
+          declared_server_b_id: null
+          declared_prometheus_container_id: null
+          declared_exporter_container_id: null
+          job: null
+          module: null
+          instance: null
+          target_url: null
+          loaded_job_matches: null
+          loaded_module_matches: null
+          target_healthy: null
+          last_error_empty: null
+          probe_success: null
+          native_start: null
+          native_end: null
+          evaluation_time: null
+          last_scrape: null
+          sample_time: null
+          max_age_seconds: null
+
+    - name: Keep the closed unavailable shape for transport refusal
+      ansible.builtin.set_fact:
+        monitoring_observation_empty: "{{ monitoring_observation_report }}"
+
+    - name: Collect only the scoped read-only native observation
+      block:
+        - name: Require one selected inventory host and application input envelope
+          ansible.builtin.assert:
+            that:
+              - ansible_play_hosts_all | length == 1
+              - opsctl_inputs is mapping
+              - opsctl_inputs.monitoring_observation is mapping
+            fail_msg: Invalid monitoring observation inputs.
+          no_log: true
+
+        - name: Run the accepted bounded observation helper
+          ansible.builtin.script:
+            cmd: >-
+              {{ playbook_dir }}/../scripts/prometheus_blackbox_observe.py
+              {{ opsctl_inputs.monitoring_observation | to_json | b64encode }}
+            executable: python3
+          register: monitoring_observation_native
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Retain only a complete bounded helper report
+          ansible.builtin.assert:
+            that:
+              - monitoring_observation_native.rc == 0
+              - monitoring_observation_native.stdout | length <= 16384
+              - monitoring_observation_native.stdout_lines | length == 1
+            fail_msg: Monitoring observation unavailable.
+          no_log: true
+
+        - name: Read the complete helper object
+          ansible.builtin.set_fact:
+            monitoring_observation_report: "{{ monitoring_observation_native.stdout | from_json }}"
+          no_log: true
+
+        - name: Require exactly the closed public fields
+          ansible.builtin.assert:
+            that:
+              - monitoring_observation_report is mapping
+              - monitoring_observation_report.keys() | list | sort == monitoring_observation_empty.keys() | list | sort
+            fail_msg: Monitoring observation unavailable.
+          no_log: true
+
+        - name: Serialize exactly the ASCII public message to be emitted
+          ansible.builtin.set_fact:
+            monitoring_observation_wire: "{{ monitoring_observation_report | to_json(ensure_ascii=true) }}"
+          no_log: true
+
+        - name: Bound the complete serialized message including newline
+          ansible.builtin.assert:
+            that:
+              - monitoring_observation_wire | length + 1 <= 16384
+            fail_msg: Monitoring observation unavailable.
+          no_log: true
+      rescue:
+        - name: Retain safe unavailable transport truth
+          ansible.builtin.set_fact:
+            monitoring_observation_report:
+              "{{ monitoring_observation_empty | combine({'reason': 'response_unavailable'}) }}"
+
+        - name: Serialize only the safe unknown fallback
+          ansible.builtin.set_fact:
+            monitoring_observation_wire: "{{ monitoring_observation_report | to_json(ensure_ascii=true) }}"
+
+    - name: Emit one public observation in bounded Template logs
+      ansible.builtin.debug:
+        msg: "{{ monitoring_observation_wire }}"
