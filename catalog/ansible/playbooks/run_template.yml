@@ -1,0 +1,179 @@
+---
+- name: Deliver the immutable source through the existing materializer
+  ansible.builtin.import_playbook: materialize_template_files.yml
+
+- name: Run user content on its explicitly authorized host
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Execute only within the delivered private workspace
+      block:
+        - name: Require the admitted engine and completed delivery
+          ansible.builtin.assert:
+            that:
+              - template_delivery_outcome == 'delivered'
+              - template_execution.payload_engine in ['bash', 'ansible']
+              - template_execution.timeout_seconds is integer
+              - template_execution.timeout_seconds >= 1
+              - template_execution.timeout_seconds <= 900
+              - template_execution.targets is sequence
+              - template_execution.targets is not string
+              - template_execution.targets | length == 0 if template_execution.payload_engine == 'bash' else template_execution.targets | length >= 1
+          no_log: true
+
+        - name: Deliver the exact private input file
+          ansible.builtin.copy:
+            src: "{{ template_execution.staging_directory }}/template-inputs.json"
+            dest: "{{ template_delivery_workspace }}/template-inputs.json"
+            mode: '0600'
+          diff: false
+          no_log: true
+
+        - name: Observe the delivered input digest
+          ansible.builtin.stat:
+            path: "{{ template_delivery_workspace }}/template-inputs.json"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+            get_mime: false
+          register: template_host_inputs
+          no_log: true
+
+        - name: Require the original input identity
+          ansible.builtin.assert:
+            that:
+              - template_host_inputs.stat.isreg | default(false)
+              - not template_host_inputs.stat.islnk | default(true)
+              - template_host_inputs.stat.mode == '0600'
+              - template_host_inputs.stat.checksum == template_execution.input_digest
+          no_log: true
+
+        - name: Deliver only the selected target private keys
+          ansible.builtin.copy:
+            src: "{{ template_execution.staging_directory }}/{{ item.credential_file }}"
+            dest: "{{ template_delivery_workspace }}/{{ item.credential_file }}"
+            mode: '0600'
+          loop: "{{ template_execution.targets }}"
+          when: template_execution.payload_engine == 'ansible'
+          diff: false
+          no_log: true
+
+        - name: Write inventory from the frozen selected targets
+          ansible.builtin.copy:
+            dest: "{{ template_delivery_workspace }}/inventory.json"
+            mode: '0600'
+            content: >-
+              {%- set hosts = namespace(values={}) -%}
+              {%- for target in template_execution.targets -%}
+              {%- set hosts.values = hosts.values | combine({target.server_id: {
+                'ansible_host': target.address, 'ansible_port': target.port,
+                'ansible_user': target.username,
+                'ansible_ssh_private_key_file': template_delivery_workspace + '/' + target.credential_file,
+                'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + template_delivery_workspace + '/known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes'}}) -%}
+              {%- endfor -%}
+              {{ {'all': {'hosts': hosts.values}} | to_json }}
+          when: template_execution.payload_engine == 'ansible'
+          diff: false
+          no_log: true
+
+        - name: Write only the observed selected host keys
+          ansible.builtin.copy:
+            dest: "{{ template_delivery_workspace }}/known_hosts"
+            mode: '0600'
+            content: |
+              {% for target in template_execution.targets %}
+              {{ target.address if target.port == 22 else '[' + target.address + ']:' + (target.port | string) }} {{ target.host_public_key }}
+              {% endfor %}
+          when: template_execution.payload_engine == 'ansible'
+          diff: false
+          no_log: true
+
+        - name: Execute Bash on the actual selected host
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --signal=TERM
+              - --kill-after=5s
+              - "{{ template_execution.timeout_seconds | string }}s"
+              - bash
+              - "{{ template_delivery_workspace + '/' + template_delivery_entrypoint }}"
+            chdir: "{{ template_delivery_workspace }}"
+            expand_argument_vars: false
+          environment:
+            OPSCTL_INPUTS_FILE: "{{ template_delivery_workspace }}/template-inputs.json"
+          register: template_host_bash
+          failed_when: false
+          no_log: true
+          when: template_execution.payload_engine == 'bash'
+
+        - name: Execute user Ansible on its selected controller
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --signal=TERM
+              - --kill-after=5s
+              - "{{ template_execution.timeout_seconds | string }}s"
+              - ansible-playbook
+              - "{{ template_delivery_workspace + '/' + template_delivery_entrypoint }}"
+              - -i
+              - "{{ template_delivery_workspace }}/inventory.json"
+              - -e
+              - "{{ '@' + template_delivery_workspace + '/template-inputs.json' }}"
+            chdir: "{{ template_delivery_workspace }}"
+            expand_argument_vars: false
+          environment:
+            ANSIBLE_HOST_KEY_CHECKING: 'True'
+            ANSIBLE_INVENTORY: "{{ template_delivery_workspace }}/inventory.json"
+            SSH_AUTH_SOCK: ''
+          register: template_host_ansible
+          failed_when: false
+          no_log: true
+          when: template_execution.payload_engine == 'ansible'
+
+        - name: Retain the actual host command result for presentation
+          ansible.builtin.set_fact:
+            template_host_result: "{{ template_host_bash if template_execution.payload_engine == 'bash' else template_host_ansible }}"
+          no_log: true
+
+        - name: Publish command presentation through the Runner redactor
+          ansible.builtin.debug:
+            msg: "{{ template_host_result.stdout | default('') }}\n{{ template_host_result.stderr | default('') }}"
+
+        - name: Fail the management Job for an unsuccessful host command
+          ansible.builtin.fail:
+            msg: "Template host command exited with code {{ template_host_result.rc }}"
+          when: template_host_result.rc != 0
+
+      always:
+        - name: Reobserve the materializer-owned workspace without following links
+          ansible.builtin.stat:
+            path: "{{ template_delivery_workspace }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: template_host_workspace
+          when: template_delivery_workspace | default(none) is not none
+          no_log: true
+
+        - name: Require the original workspace identity before cleanup
+          ansible.builtin.assert:
+            that:
+              - template_host_workspace.stat.isdir | default(false)
+              - not template_host_workspace.stat.islnk | default(true)
+              - template_host_workspace.stat.dev == template_delivery_owned_identity.dev
+              - template_host_workspace.stat.inode == template_delivery_owned_identity.inode
+              - template_host_workspace.stat.uid == template_delivery_owned_identity.uid
+          when:
+            - template_delivery_workspace | default(none) is not none
+            - template_host_workspace.stat.exists
+          no_log: true
+
+        - name: Remove only the revalidated private workspace
+          ansible.builtin.file:
+            path: "{{ template_delivery_workspace }}"
+            state: absent
+          when:
+            - template_delivery_workspace | default(none) is not none
+            - template_host_workspace.stat.exists
+          no_log: true
