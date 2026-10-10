@@ -6,6 +6,18 @@ revision flow. Logical Operation type remains `deploy_container`. Org overrides
 use these public variables and facts; no private API, receipt or protocol is needed.
 Inventory, SSH access and privilege escalation use the existing Ansible contract.
 
+## Managed Behavior Declaration
+
+The adjacent [closed declaration](compose_deploy.contract.json) binds strict
+integer format/revision fields to this item and engine in the same accepted Git
+source. Its stable approved behavior identity describes the current reviewed
+meaning, not a retrospective compatibility baseline. Review must increment the
+revision for any managed input, default, output or side-effect meaning change;
+a refactor may retain it only after review establishes unchanged meanings.
+Exact source closure remains separately custodied. Accepting the declaration
+does not establish behavioral equivalence, grant access, guarantee convergence
+or authorize stale execution; commit, content or name equality alone is not trust.
+
 ## Inputs
 
 | Variable | Default/type | Origin and meaning |
