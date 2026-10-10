@@ -17,6 +17,13 @@ registry credentials, Compose apply, image pull, login, creation or deletion occ
 | `compose_known_networks` | `[]` | Up to 64 `{id,name,origin}`; origin `created|reused|external|unknown`. |
 | `compose_known_volumes` | `[]` | Up to 64 `{name,created_at,origin}`; nullable timestamp, same origins. |
 
+Central eligibility excludes authenticated env/secret roles and exact
+owner-delivered protected/generated/credential material, and requires
+immutable-original/consumed-delivery membership. The authorized caller selects
+`nonsecret_files` for digest disclosure; opaque originals are not sensitivity
+certified because custody has no content-sensitivity field. Dependency roles
+classify use only, not content sensitivity.
+
 Native project listing includes stopped instances. Inspect each current/recorded
 ID, resource incarnation and image through info modules. Readiness covers all
 replicas and inherited health, strict completed dependency exit-zero and captured
