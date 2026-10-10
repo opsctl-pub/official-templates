@@ -388,8 +388,6 @@ def blank_report():
     return {'outcome': 'unknown', 'reason': 'invalid_inputs',
             'collection_origin': 'host-on-b', 'probe_origin': 'workload-on-b',
             **{key: None for key in (
-                'declared_server_b_id', 'declared_prometheus_container_id',
-                'declared_exporter_container_id', 'job', 'module', 'instance', 'target_url',
                 'loaded_job_matches', 'loaded_module_matches', 'target_healthy',
                 'last_error_empty', 'probe_success', 'native_start', 'native_end',
                 'evaluation_time', 'last_scrape', 'sample_time', 'max_age_seconds')}}
@@ -403,13 +401,8 @@ def collect(args, requests=None):
     try:
         validate_inputs(args)
         strict_yaml('modules: {}')
-        bindings = args['bindings']
         report.update({
-            'declared_server_b_id': bindings['server_b_id'],
-            'declared_prometheus_container_id': bindings['prometheus_container_id'],
-            'declared_exporter_container_id': bindings['exporter_container_id'],
-            **{key: args[key] for key in ('job', 'module', 'instance', 'target_url',
-                                        'max_age_seconds')},
+            'max_age_seconds': args['max_age_seconds'],
             'native_start': start, 'evaluation_time': start})
         requests = requests or Requests()
         prometheus = args['prometheus_base_url']

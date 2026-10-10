@@ -204,13 +204,38 @@ class PrometheusBlackboxObserveTests(unittest.TestCase):
                 requests.get('no further read')
             self.assertEqual(error.exception.reason, 'response_limit_exceeded')
             self.assertEqual(run.call_count, 4)
+
+    def test_reduced_public_output_contract_and_emit_cap(self):
+        fields = {'outcome', 'reason', 'collection_origin', 'probe_origin',
+                  'loaded_job_matches', 'loaded_module_matches', 'target_healthy',
+                  'last_error_empty', 'probe_success', 'native_start', 'native_end',
+                  'evaluation_time', 'last_scrape', 'sample_time', 'max_age_seconds'}
+        removed = {'declared_server_b_id', 'declared_prometheus_container_id',
+                   'declared_exporter_container_id', 'job', 'module', 'instance', 'target_url'}
+        transport = Responses('healthy')
+        healthy = observer.collect(inputs(), transport)
+        self.assertEqual((healthy['outcome'], healthy['reason']), ('succeeded', 'observed'))
+        self.assertEqual(len(transport.calls), 5)
+        for report in (observer.blank_report(), healthy):
+            with self.subTest(outcome=report['outcome']):
+                output = io.BytesIO()
+                with mock.patch.object(observer.sys, 'stdout', type('Sink', (), {'buffer': output})()):
+                    observer.emit(report)
+                wire = output.getvalue()
+                emitted = json.loads(wire)
+                self.assertEqual(set(emitted), fields)
+                self.assertFalse(set(emitted) & removed)
+                self.assertTrue(wire.isascii())
+                self.assertEqual(wire.count(b'\n'), 1)
+                self.assertLessEqual(len(wire), 16384)
         output = io.BytesIO()
         with mock.patch.object(observer.sys, 'stdout', type('Sink', (), {'buffer': output})()):
             report = observer.blank_report()
-            report['target_url'] = 'x' * 16384
+            report['collection_origin'] = 'x' * 16384
             observer.emit(report)
         self.assertLessEqual(len(output.getvalue()), 16384)
-        self.assertEqual(json.loads(output.getvalue())['reason'], 'report_limit_exceeded')
+        self.assertEqual(json.loads(output.getvalue()), {
+            **observer.blank_report(), 'reason': 'report_limit_exceeded'})
 
     def test_actual_worker_timeout_and_read_limits_close_owned_processes(self):
         expected = {'slow': 'collection_deadline', 'length': 'response_limit_exceeded',
@@ -300,7 +325,7 @@ class PrometheusBlackboxObserveTests(unittest.TestCase):
 
 
 def transport_output(case):
-    """Only unavailable script transport is substituted; no collector semantics."""
+    """Padding is malformed-output framing evidence, not semantic qualification."""
     report = observer.blank_report()
     report['reason'] = 'response_invalid'
     if case == 'nonobject':
@@ -308,7 +333,7 @@ def transport_output(case):
     elif case == 'extra':
         report['unexpected'] = 'PRIVATE_EXTRA_MARKER'
     elif case == 'missing':
-        del report['job']
+        del report['loaded_job_matches']
     elif case == 'truncated':
         sys.stdout.write('{"outcome":')
         return 0
@@ -316,9 +341,9 @@ def transport_output(case):
         sys.stdout.write('{}\n{}\n')
         return 0
     elif case in ('at_cap', 'over_cap', 'escaped'):
-        report['target_url'] = ''
+        report['collection_origin'] = ''
         size = len(json.dumps(report, ensure_ascii=True)) + 1
-        report['target_url'] = ('\u754c' * 2700 if case == 'escaped' else
+        report['collection_origin'] = ('\u754c' * 2700 if case == 'escaped' else
                                 'a' * ((16384 if case == 'at_cap' else 16385) - size))
     print(json.dumps(report, ensure_ascii=False, separators=(',', ':')))
     return 37 if case == 'rc' else 0

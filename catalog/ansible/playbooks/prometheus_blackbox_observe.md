@@ -58,9 +58,7 @@ including newline; PM2 qualifies journey reports and immutable pre/post associat
 ## Public Report
 
 Closed scalars/booleans/nulls: `outcome`, `reason`, `collection_origin:host-on-b`,
-`probe_origin:workload-on-b`, `declared_server_b_id`,
-`declared_prometheus_container_id`, `declared_exporter_container_id`, `job`,
-`module`, `instance`, `target_url`, `loaded_job_matches`, `loaded_module_matches`,
+`probe_origin:workload-on-b`, `loaded_job_matches`, `loaded_module_matches`,
 `target_healthy`, `last_error_empty`, `probe_success`, `native_start`, `native_end`,
 `evaluation_time`, `last_scrape`, `sample_time`, `max_age_seconds`.
 Unavailable facts are null. Outcomes are succeeded/failed/unknown; reasons are
@@ -68,6 +66,11 @@ observed, probe_down, probe_failed, invalid_inputs, unsupported_prerequisite,
 association_mismatch, ambiguous_target, ambiguous_series, config_mismatch,
 stale_observation, clock_invalid, response_unavailable, response_invalid,
 response_limit_exceeded, collection_deadline, report_limit_exceeded.
+
+Reports do not echo declared identities or selectors. Correlation uses the frozen
+invocation/input/source, exact native management and current pre/post A/B receipts.
+Protected-output redaction remains enforced; a malformed or redacted report is
+uncertain, not evidence of successful observation.
 
 Host-on-B API collection is not itself a workload-origin probe or B identity
 proof. Exact loaded-config/target/series association and separately qualified

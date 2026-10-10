@@ -10,13 +10,6 @@
           reason: invalid_inputs
           collection_origin: host-on-b
           probe_origin: workload-on-b
-          declared_server_b_id: null
-          declared_prometheus_container_id: null
-          declared_exporter_container_id: null
-          job: null
-          module: null
-          instance: null
-          target_url: null
           loaded_job_matches: null
           loaded_module_matches: null
           target_healthy: null
