@@ -510,6 +510,38 @@
               - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
               - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
 
+        - name: Require explicit empty storage or its exact owned incarnation
+          when: compose_empty_volume_keys is defined
+          block:
+            - name: Select empty data refusal
+              ansible.builtin.set_fact:
+                compose_reason: compose_empty_data_conflict
+
+            - name: Require complete native logical volume membership
+              ansible.builtin.assert:
+                that:
+                  - compose_observation_complete
+                  - compose_empty_volume_keys | sort == compose_native_config.get('volumes', {}).keys() | list | sort
+
+            - name: Require absent or exact known native volume
+              ansible.builtin.assert:
+                that:
+                  - native_volume_name | length > 0
+                  - native_volume_observations | length == 1
+                  - >-
+                    not native_volume_observations[0].exists or
+                    (known_native_volumes | length == 1 and
+                     known_native_volumes[0].created_at is not none and
+                     native_volume_observations[0].volume.CreatedAt | default(none) == known_native_volumes[0].created_at)
+              vars:
+                native_volume_name: "{{ compose_native_config.volumes[empty_volume_key].name | default('') }}"
+                native_volume_observations: "{{ compose_volume_info.results | default([]) | selectattr('compose_volume_name', 'equalto', native_volume_name) | list }}"
+                known_native_volumes: "{{ compose_known_volumes | default([]) | selectattr('name', 'equalto', native_volume_name) | list }}"
+              loop: "{{ compose_empty_volume_keys }}"
+              loop_control:
+                loop_var: empty_volume_key
+                label: native volume
+
         - name: Retain complete native pre-apply resource observations
           ansible.builtin.set_fact:
             compose_prior_networks: >-
