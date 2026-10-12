@@ -77,7 +77,7 @@
           diff: false
           no_log: true
 
-        - name: Write only the observed selected host keys
+        - name: Write only the original enrolled selected host keys
           ansible.builtin.copy:
             dest: "{{ template_delivery_workspace }}/known_hosts"
             mode: '0600'
