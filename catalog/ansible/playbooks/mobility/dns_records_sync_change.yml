@@ -1,6 +1,10 @@
 ---
 - name: Apply one Cloudflare managed DNS change
   block:
+    - name: Reset the item-local confirmed deletion observation
+      set_fact:
+        dns_sync_delete_already_absent: false
+
     - name: Read the exact provider record before confirmed external delete
       uri:
         url: "{{ cloudflare_api_base }}/zones/{{ provider_zone_id }}/dns_records/{{ dns_change.provider_record_id }}"
@@ -8,13 +12,51 @@
         headers:
           Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
           Content-Type: "application/json"
-        status_code: 200
+        status_code: [200, 404]
         return_content: true
       register: dns_sync_compare_result
       no_log: true
       when:
         - dns_change.action == 'delete'
         - compare_before_apply | default(false) | bool
+
+    - name: Verify hostname and type absence after an exact record is missing
+      uri:
+        url: >-
+          {{ cloudflare_api_base }}/zones/{{ provider_zone_id }}/dns_records?name.exact={{ dns_change.hostname | urlencode }}&type={{ dns_change.record_type | urlencode }}&match=all&page=1
+        method: GET
+        headers:
+          Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+          Content-Type: "application/json"
+        status_code: 200
+        return_content: true
+      register: dns_sync_absence_result
+      no_log: true
+      when:
+        - dns_change.action == 'delete'
+        - compare_before_apply | default(false) | bool
+        - dns_sync_compare_result.status | int == 404
+
+    - name: Qualify the confirmed deletion as already absent
+      assert:
+        that:
+          - dns_sync_absence_result.json is mapping
+          - dns_sync_absence_result.json.success is sameas true
+          - dns_sync_absence_result.json.result == []
+        fail_msg: "Confirmed external DNS hostname and type absence is not established"
+      no_log: true
+      when:
+        - dns_change.action == 'delete'
+        - compare_before_apply | default(false) | bool
+        - dns_sync_compare_result.status | int == 404
+
+    - name: Retain the qualified item-local deletion absence
+      set_fact:
+        dns_sync_delete_already_absent: true
+      when:
+        - dns_change.action == 'delete'
+        - compare_before_apply | default(false) | bool
+        - dns_sync_compare_result.status | int == 404
 
     - name: Assert the exact provider record still matches the confirmed plan
       assert:
@@ -31,6 +73,7 @@
       when:
         - dns_change.action == 'delete'
         - compare_before_apply | default(false) | bool
+        - dns_sync_compare_result.status | int == 200
 
     - name: Read the exact provider record before adoption
       uri:
@@ -109,13 +152,14 @@
         return_content: true
       register: dns_sync_apply_result
       no_log: true
-      when: dns_change.action != 'adopt'
+      when: dns_change.action != 'adopt' and not dns_sync_delete_already_absent
 
     - name: Record only an explicit provider authorization denial
       set_fact:
         dns_sync_authorization_denied: true
       when:
         - dns_change.action != 'adopt'
+        - not (dns_sync_apply_result.skipped | default(false))
         - dns_sync_apply_result.status | int in [401, 403]
 
     - name: Assert the Cloudflare change succeeded
@@ -124,7 +168,9 @@
           - dns_sync_apply_result.status | int == 200
           - dns_sync_apply_result.json.success | default(false)
         fail_msg: "Cloudflare managed DNS write failed"
-      when: dns_change.action != 'adopt'
+      when:
+        - dns_change.action != 'adopt'
+        - not (dns_sync_apply_result.skipped | default(false))
 
     - name: Verify the provider returned the planned record
       assert:
@@ -138,7 +184,9 @@
           - dns_sync_apply_result.json.result.proxied == dns_change.proxied
           - dns_change.action == 'create' or dns_sync_apply_result.json.result.id == dns_change.provider_record_id
         fail_msg: "Cloudflare record does not match the managed DNS plan"
-      when: dns_change.action in ['create', 'update']
+      when:
+        - dns_change.action in ['create', 'update']
+        - not (dns_sync_apply_result.skipped | default(false))
 
     - name: Accumulate the applied managed DNS change
       set_fact:
@@ -154,12 +202,16 @@
                 "ttl": dns_change.ttl,
                 "proxied": dns_change.proxied,
                 "provider_record_id": (
+                  dns_change.provider_record_id
+                  if dns_sync_delete_already_absent
+                  else (
                   dns_sync_apply_result.json.result.id
                   if (
                     dns_sync_apply_result.json.result is defined and
                     dns_sync_apply_result.json.result.id is defined
                   )
                   else dns_change.provider_record_id
+                  )
                 ),
                 "deployment_id": dns_change.deployment_id | default(None),
                 "tracked_record_id": dns_change.tracked_record_id | default(None)
