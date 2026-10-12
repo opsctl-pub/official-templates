@@ -70,7 +70,7 @@
                 'ansible_host': target.address, 'ansible_port': target.port,
                 'ansible_user': target.username,
                 'ansible_ssh_private_key_file': template_delivery_workspace + '/' + target.credential_file,
-                'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + template_delivery_workspace + '/known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes'}}) -%}
+                'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + template_delivery_workspace + '/known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o UpdateHostKeys=no -o ControlMaster=no -o ControlPath=none -o ControlPersist=no'}}) -%}
               {%- endfor -%}
               {{ {'all': {'hosts': hosts.values}} | to_json }}
           when: template_execution.payload_engine == 'ansible'

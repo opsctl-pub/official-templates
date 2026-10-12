@@ -20,4 +20,4 @@ Nonzero commands fail the Job. Presentation passes through the existing Runner r
 Normal success/failure removes only the materializer's exact private workspace.
 Lost SSH, timeout or Job cancellation does not prove every remote descendant stopped;
 the procedure supplies no remote replay, recovery or containment guarantee. Platform
-management SSH host verification retains its existing documented limitation.
+generated SSH verifies enrolled keys without multiplexing or key updates. Privileged overrides are excluded; TOFU/private-only first enrollment limits remain.
