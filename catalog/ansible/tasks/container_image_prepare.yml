@@ -134,6 +134,9 @@
       ansible.builtin.command:
         expand_argument_vars: false
         argv:
+          - timeout
+          - --kill-after=2s
+          - 5s
           - docker
           - image
           - inspect
@@ -141,9 +144,8 @@
           - '{% raw %}{"os":{{json .Os}},"architecture":{{json .Architecture}},"variant":{{json .Variant}}}{% endraw %}'
           - "{{ app_image }}"
       register: inspect_result
-      failed_when: false
+      failed_when: inspect_result.rc not in [0, 1]
       changed_when: false
-      timeout: 5
       no_log: true
 
     - name: OPERATION_STEP image:check complete
@@ -166,6 +168,9 @@
           ansible.builtin.command:
             expand_argument_vars: false
             argv:
+              - timeout
+              - --kill-after=2s
+              - 5s
               - docker
               - info
               - --format
@@ -173,7 +178,6 @@
           register: daemon_platform_result
           changed_when: false
           failed_when: false
-          timeout: 5
           no_log: true
 
         - name: Pull image "{{ app_image }}" from registry
@@ -190,6 +194,9 @@
           ansible.builtin.command:
             expand_argument_vars: false
             argv:
+              - timeout
+              - --kill-after=2s
+              - 5s
               - docker
               - image
               - inspect
@@ -199,7 +206,6 @@
           register: image_platform_result
           changed_when: false
           failed_when: false
-          timeout: 5
           no_log: true
 
         - name: Compare prepared image with actual Docker platform
