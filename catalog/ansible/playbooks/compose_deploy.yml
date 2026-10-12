@@ -510,8 +510,8 @@
               - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
               - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
 
-        - name: Require explicit empty storage or its exact owned incarnation
-          when: compose_empty_volume_keys is defined
+        - name: Require explicit native volume data choices
+          when: compose_empty_volume_keys is defined or compose_reuse_volumes is defined
           block:
             - name: Select empty data refusal
               ansible.builtin.set_fact:
@@ -521,7 +521,8 @@
               ansible.builtin.assert:
                 that:
                   - compose_observation_complete
-                  - compose_empty_volume_keys | sort == compose_native_config.get('volumes', {}).keys() | list | sort
+                  - (compose_empty_volume_keys | default([])) | intersect((compose_reuse_volumes | default({})).keys() | list) | length == 0
+                  - (compose_empty_volume_keys | default([])) | union((compose_reuse_volumes | default({})).keys() | list) | sort == compose_native_config.get('volumes', {}).keys() | list | sort
 
             - name: Require absent or exact known native volume
               ansible.builtin.assert:
@@ -537,10 +538,58 @@
                 native_volume_name: "{{ compose_native_config.volumes[empty_volume_key].name | default('') }}"
                 native_volume_observations: "{{ compose_volume_info.results | default([]) | selectattr('compose_volume_name', 'equalto', native_volume_name) | list }}"
                 known_native_volumes: "{{ compose_known_volumes | default([]) | selectattr('name', 'equalto', native_volume_name) | list }}"
-              loop: "{{ compose_empty_volume_keys }}"
+              loop: "{{ compose_empty_volume_keys | default([]) }}"
               loop_control:
                 loop_var: empty_volume_key
                 label: native volume
+
+            - name: Select retained volume reuse refusal
+              ansible.builtin.set_fact:
+                compose_reason: compose_volume_reuse_conflict
+              when: compose_reuse_volumes | default({}) | length > 0
+
+            - name: Require the exact retained local volume incarnation
+              ansible.builtin.assert:
+                that:
+                  - compose_native_config.volumes[reuse_volume.key].name == reuse_volume.value.name
+                  - native_volume_observations | length == 1
+                  - native_volume_observations[0].exists
+                  - native_volume_observations[0].volume.Name == reuse_volume.value.name
+                  - native_volume_observations[0].volume.CreatedAt | default(none) is not none
+                  - native_volume_observations[0].volume.CreatedAt == reuse_volume.value.created_at
+                  - native_volume_observations[0].volume.Driver == 'local'
+                  - not native_volume_observations[0].volume.Options | default(none)
+              vars:
+                native_volume_observations: "{{ compose_volume_info.results | default([]) | selectattr('compose_volume_name', 'equalto', reuse_volume.value.name) | list }}"
+              loop: "{{ compose_reuse_volumes | default({}) | dict2items }}"
+              loop_control:
+                loop_var: reuse_volume
+                label: retained native volume
+
+            - name: Collect all running and stopped retained volume consumers
+              ansible.builtin.command:
+                argv: [timeout, 10s, docker, container, ls, --all, --quiet, --no-trunc, --filter, "{{ 'volume=' + reuse_volume.value.name }}"]
+              changed_when: false
+              failed_when: false
+              register: compose_reuse_consumers
+              loop: "{{ compose_reuse_volumes | default({}) | dict2items }}"
+              loop_control:
+                loop_var: reuse_volume
+                label: retained native volume
+
+            - name: Require complete bounded consumers belonging only to this Deployment
+              ansible.builtin.assert:
+                that:
+                  - consumer_result.rc == 0
+                  - mounted_containers | length <= 128
+                  - mounted_containers | reject('match', '^[0-9a-f]{64}$') | list | length == 0
+                  - mounted_containers | difference(compose_known_containers | default([])) | length == 0
+              vars:
+                mounted_containers: "{{ consumer_result.stdout_lines | reject('equalto', '') | list }}"
+              loop: "{{ compose_reuse_consumers.results | default([]) }}"
+              loop_control:
+                loop_var: consumer_result
+                label: retained native volume consumers
 
         - name: Retain complete native pre-apply resource observations
           ansible.builtin.set_fact:
