@@ -6,6 +6,8 @@
   hosts: all
   gather_facts: false
   become: false
+  vars:
+    ansible_ssh_use_tty: false
   tasks:
     - name: Execute only within the delivered private workspace
       block:

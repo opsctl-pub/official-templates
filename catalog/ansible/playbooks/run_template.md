@@ -15,6 +15,7 @@ The host must already provide Bash or Ansible, GNU timeout and declared dependen
 Execution uses the existing management login without adding a privilege policy or
 installer. The requested timeout sends TERM followed by bounded KILL. CPU, memory,
 PID, tmpfs and container-log limits retained in authoring are not host containment.
+Generated user-content delivery is noninteractive and does not allocate an SSH PTY.
 
 Nonzero commands fail the Job. Presentation passes through the existing Runner redactor.
 Normal success/failure removes only the materializer's exact private workspace.
