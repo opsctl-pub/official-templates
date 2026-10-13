@@ -184,9 +184,14 @@
           {%- endfor -%}
           {%- if result.exists or known | length > 0 -%}
           {%- set id = result.network.Id if result.exists else known[0].id -%}
-          {%- set origin = known[0].origin if known | length > 0 and known[0].id == id else
+          {%- set builtin = result.exists and result.network.Name == result.compose_network_name and
+            result.network.Scope == 'local' and
+            ((result.network.Name == 'none' and result.network.Driver == 'null') or
+             (result.network.Name == 'host' and result.network.Driver == 'host')) and
+            (known | length == 0 or (known[0].id == id and known[0].origin == 'unknown')) -%}
+          {%- set origin = 'external' if builtin else (known[0].origin if known | length > 0 and known[0].id == id else
             ('external' if external.value else ('created' if prior | length > 0 and prior[0].presence == 'absent' else
-            ('reused' if prior | length > 0 and prior[0].presence == 'present' and prior[0].id == id else 'unknown'))) -%}
+            ('reused' if prior | length > 0 and prior[0].presence == 'present' and prior[0].id == id else 'unknown')))) -%}
           {%- set networks.values = networks.values + [{'id': id, 'name': result.compose_network_name,
             'origin': origin, 'presence': 'absent' if not result.exists else
               ('unknown' if known | length > 0 and known[0].id != id and not

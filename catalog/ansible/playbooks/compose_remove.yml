@@ -38,7 +38,7 @@
             that:
               - compose_observation_complete
               - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
-              - compose_known_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
+              - compose_observed_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
               - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
 
         - name: Require created network identity and no foreign users before deletion effects

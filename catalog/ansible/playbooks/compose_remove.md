@@ -13,10 +13,14 @@ source files, registry Secret, generated Compose model or private protocol.
 | `compose_workspace` | required | Stable absolute backend Server/project workspace; retained, never recursively removed. |
 | `compose_services` | required | Up to 32 captured `{name,replicas,condition,allow_completion:false}`; total replicas<=128; same conditions as deploy. |
 | `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs eligible for exact removal. |
-| `compose_known_networks` | required list, may be empty | Up to 64 recorded `{id,name,origin:created|reused|external|unknown}`. Unknown ownership refuses mutation. |
+| `compose_known_networks` | required list, may be empty | Up to 64 recorded `{id,name,origin:created|reused|external|unknown}`. Unresolved observed ownership refuses mutation. |
 | `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,origin}`, nullable timestamp; unknown incarnation remains incomplete, not deletion permission. |
 
 Observe current project members and recorded incarnations/users before effects.
+Exact inspected local built-ins `none`/`null` and `host`/`host` are external when
+no origin is recorded or a matching full recorded ID has unknown origin. Original
+inputs stay unchanged; a recorded created origin is never replaced. Built-ins are
+retained, while missing/mismatched or other unresolved unknown networks refuse.
 Unknown project IDs or replaced resources refuse before mutation. Remove only
 recorded container IDs with `docker_container`, `keep_volumes=true`, normal stop
 timeout, no forced kill. Reobserve absence. Only recorded `created` networks with
