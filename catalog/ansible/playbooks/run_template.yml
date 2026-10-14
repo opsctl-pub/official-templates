@@ -61,6 +61,15 @@
           diff: false
           no_log: true
 
+        - name: Allocate invocation-private target SSH controls
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: opsctl-ssh-
+            path: "{{ template_delivery_workspace }}"
+          register: template_host_ssh_control
+          when: template_execution.payload_engine == 'ansible'
+          no_log: true
+
         - name: Write inventory from the frozen selected targets
           ansible.builtin.copy:
             dest: "{{ template_delivery_workspace }}/inventory.json"
@@ -70,9 +79,9 @@
               {%- for target in template_execution.targets -%}
               {%- set hosts.values = hosts.values | combine({target.server_id: {
                 'ansible_host': target.address, 'ansible_port': target.port,
-                'ansible_user': target.username,
+                'ansible_user': target.username, 'ansible_pipelining': true,
                 'ansible_ssh_private_key_file': template_delivery_workspace + '/' + target.credential_file,
-                'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + template_delivery_workspace + '/known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o UpdateHostKeys=no -o ControlMaster=no -o ControlPath=none -o ControlPersist=no'}}) -%}
+                'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + ((template_delivery_workspace + '/known_hosts') | quote) + ' -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o UpdateHostKeys=no -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=' + (((template_host_ssh_control.path | basename) + '/' + (loop.index0 | string)) | quote)}}) -%}
               {%- endfor -%}
               {{ {'all': {'hosts': hosts.values}} | to_json }}
           when: template_execution.payload_engine == 'ansible'
@@ -169,6 +178,37 @@
           when:
             - template_delivery_workspace | default(none) is not none
             - template_host_workspace.stat.exists
+          no_log: true
+
+        - name: Close only invocation-owned target SSH masters
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=1s
+              - 5s
+              - ssh
+              - -S
+              - "{{ (template_host_ssh_control.path | basename) + '/' + (template_target_index | string) }}"
+              - -O
+              - exit
+              - -p
+              - "{{ item.port | string }}"
+              - -l
+              - "{{ item.username }}"
+              - "{{ item.address }}"
+            chdir: "{{ template_delivery_workspace }}"
+            expand_argument_vars: false
+          environment:
+            SSH_AUTH_SOCK: ''
+          loop: "{{ template_execution.targets }}"
+          loop_control:
+            index_var: template_target_index
+          when:
+            - template_execution.payload_engine == 'ansible'
+            - template_host_ssh_control.path is defined
+            - template_host_workspace.stat.exists | default(false)
+          changed_when: false
+          failed_when: false
           no_log: true
 
         - name: Remove only the revalidated private workspace
