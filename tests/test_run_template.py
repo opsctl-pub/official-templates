@@ -115,6 +115,29 @@ exit 37
                     'expand_argument_vars': False}},
                 {'ansible.builtin.copy': {'dest': '{{ opsctl_inputs.workspace_marker }}',
                     'content': "{{ playbook_dir }}"}},
+                {'ansible.builtin.command': {'argv': ['python3', '-c', '''
+import json, os, pathlib, shlex, sys
+workspace = pathlib.Path(sys.argv[1])
+host = json.loads((workspace / 'inventory.json').read_text())['all']['hosts'][sys.argv[2]]
+assert pathlib.Path.cwd() == workspace
+assert host['ansible_pipelining'] is True
+assert host['ansible_host'] == '127.0.0.1' and host['ansible_port'] == 22
+assert host['ansible_user'] == 'selected-user'
+assert host['ansible_ssh_private_key_file'] == str(workspace / 'selected.key')
+assert (workspace / 'selected.key').stat().st_mode & 0o777 == 0o600
+options = dict(arg.split('=', 1) for arg in shlex.split(host['ansible_ssh_common_args']) if arg != '-o')
+control = pathlib.Path(options['ControlPath'])
+assert not control.is_absolute() and len(str(control)) < 108
+assert control.name == '0' and control.parent.name.startswith('opsctl-ssh-')
+directory = workspace / control.parent
+assert directory.is_dir() and not directory.is_symlink()
+assert directory.stat().st_mode & 0o777 == 0o700
+assert options == {'StrictHostKeyChecking': 'yes', 'UserKnownHostsFile': 'known_hosts',
+    'GlobalKnownHostsFile': '/dev/null', 'IdentitiesOnly': 'yes', 'UpdateHostKeys': 'no',
+    'ControlMaster': 'auto', 'ControlPersist': '60s', 'ControlPath': str(control)}
+assert (workspace / options['UserKnownHostsFile']).stat().st_mode & 0o777 == 0o600
+assert os.environ.get('SSH_AUTH_SOCK', '') == ''
+''', '{{ playbook_dir }}', target['server_id']], 'expand_argument_vars': False}},
                 {'ansible.builtin.assert': {'that': [
                     "ansible_user == 'selected-user'",
                     "'StrictHostKeyChecking=yes' in ansible_ssh_common_args",
