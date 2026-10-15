@@ -25,6 +25,8 @@
               - compose_known_networks is defined
               - compose_known_networks | length <= 64
               - compose_known_volumes | default([]) | length <= 64
+              - compose_delete_volumes | default([]) | length <= 64
+              - compose_delete_volumes | default([]) | map(attribute='name') | unique | length == compose_delete_volumes | default([]) | length
 
         - name: Observe membership and resource incarnations before effects
           ansible.builtin.include_tasks: ../tasks/compose_observe.yml
@@ -56,6 +58,23 @@
           when: >-
             compose_known_networks | selectattr('name', 'equalto', native_network.compose_network_name) |
             selectattr('origin', 'equalto', 'created') | list | length > 0
+
+        - name: Require every explicit data selection to be an exact original eligible incarnation
+          ansible.builtin.assert:
+            that:
+              - selected_volume.name is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+              - selected_volume.created_at is string and selected_volume.created_at | length > 0
+              - original | length == 1 and original[0].origin == 'created'
+              - original[0].created_at == selected_volume.created_at
+              - observed | length == 1 and observed[0].created_at == selected_volume.created_at
+              - observed[0].presence == 'absent' or observed[0].delete_eligible
+          vars:
+            original: "{{ compose_known_volumes | default([]) | selectattr('name', 'equalto', selected_volume.name) | list }}"
+            observed: "{{ compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) | list }}"
+          loop: "{{ compose_delete_volumes | default([]) }}"
+          loop_control:
+            loop_var: selected_volume
+            label: selected native volume
 
         - name: Select native removal failure
           ansible.builtin.set_fact:
@@ -139,6 +158,40 @@
           ansible.builtin.set_fact:
             compose_changed: "{{ compose_changed or compose_network_removals.changed }}"
 
+        - name: Reobserve exact data incarnations and users immediately before selected deletion
+          ansible.builtin.include_tasks: ../tasks/compose_observe.yml
+          when: compose_delete_volumes | default([]) | length > 0
+
+        - name: Require selected data to remain the original unused incarnation
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - observed | length == 1 and observed[0].created_at == selected_volume.created_at
+              - observed[0].presence == 'absent' or observed[0].delete_eligible
+          vars:
+            observed: "{{ compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) | list }}"
+          loop: "{{ compose_delete_volumes | default([]) }}"
+          loop_control:
+            loop_var: selected_volume
+            label: selected native volume
+
+        - name: Remove only selected unused native volumes without force
+          ansible.builtin.command:
+            argv: [docker, volume, rm, --, "{{ selected_volume.name }}"]
+          loop: "{{ compose_delete_volumes | default([]) }}"
+          loop_control:
+            loop_var: selected_volume
+            label: selected native volume
+          when: >-
+            compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) |
+            selectattr('presence', 'equalto', 'present') | list | length == 1
+          register: compose_volume_removals
+          changed_when: compose_volume_removals.rc == 0
+
+        - name: Preserve actual selected data-removal effects
+          ansible.builtin.set_fact:
+            compose_changed: "{{ compose_changed or compose_volume_removals.changed }}"
+
         - name: Publish completed native removal and begin final observation
           ansible.builtin.debug:
             msg: 'OPERATION_STEP={"name":"compose:remove","status":"completed","metadata":{"display_name":"Remove recorded Compose workloads"}}'
@@ -163,7 +216,19 @@
               - compose_observed_instances | length == 0
               - compose_observed_networks | selectattr('origin', 'equalto', 'created') | rejectattr('presence', 'equalto', 'absent') | list | length == 0
 
-        - name: Record complete removal without readiness or data deletion
+        - name: Require consumed absence of every selected exact native incarnation
+          ansible.builtin.assert:
+            that:
+              - observed | length == 1
+              - observed[0].presence == 'absent' and observed[0].created_at == selected_volume.created_at
+          vars:
+            observed: "{{ compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) | list }}"
+          loop: "{{ compose_delete_volumes | default([]) }}"
+          loop_control:
+            loop_var: selected_volume
+            label: deleted native volume
+
+        - name: Record complete removal without claiming retained-data protection
           ansible.builtin.set_fact:
             compose_removed_containers: "{{ compose_absent_containers }}"
             compose_outcome: succeeded
@@ -175,7 +240,7 @@
             compose_failure_reason: "{{ compose_reason }}"
             compose_changed: >-
               {{ compose_changed or compose_container_removals.changed | default(false) or
-                compose_network_removals.changed | default(false) }}
+                compose_network_removals.changed | default(false) or compose_volume_removals.changed | default(false) }}
 
         - name: Reobserve partial removal effects without expanding admitted membership
           ansible.builtin.include_tasks: ../tasks/compose_observe.yml
@@ -187,5 +252,5 @@
             compose_removed_containers: "{{ compose_absent_containers }}"
       no_log: true
 
-    - name: Publish exactly one final data-retaining result
+    - name: Publish exactly one final removal result
       ansible.builtin.include_tasks: ../tasks/compose_publish.yml

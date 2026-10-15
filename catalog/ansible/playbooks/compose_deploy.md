@@ -144,7 +144,7 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes any fixed fail
 | `services` | `{name,desired_replicas,condition,state,instances}` for every selected service. State `running|healthy|starting|completed|scaled_down|stopped|failed|missing|unknown|drifted`. |
 | `unexpected_containers` | Actual project instances outside recorded/selected membership. |
 | `networks` | `{id,name,origin,presence}`; absence retains recorded ID; presence `present|absent|unknown`. |
-| `volumes` | `{name,created_at,origin,presence}`, including anonymous mounts. Timestamp nullable; all are retained. |
+| `volumes` | `{name,created_at,origin,presence,delete_eligible,deletion_reason}`, including anonymous mounts. Timestamp nullable; all are retained. Native deletion eligibility requires exact original creation, local backing/ownership and no foreign users; unavailable observations explain refusal, never imply consent. |
 | `removed_containers` | Recorded full IDs actually reobserved absent, never inferred from stop success. |
 
 Every instance includes `{id,name,replica,image_ref,image_id,image_digest,state,

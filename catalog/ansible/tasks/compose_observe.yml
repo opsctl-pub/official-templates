@@ -170,6 +170,18 @@
         label: native volume
       register: compose_volume_info
 
+    - name: Observe every native volume consumer including stopped containers
+      community.docker.docker_host_info:
+        containers: true
+        containers_all: true
+        containers_filters:
+          volume: "{{ compose_volume_name }}"
+      loop: "{{ compose_volume_names }}"
+      loop_control:
+        loop_var: compose_volume_name
+        label: native volume consumers
+      register: compose_volume_users
+
     - name: Project native network identity origin and presence
       ansible.builtin.set_fact:
         compose_observed_networks: >-
@@ -219,9 +231,26 @@
             ('external' if external.value else ('created' if prior | length > 0 and prior[0].presence == 'absent' else
             ('reused' if timestamp is not none and prior | length > 0 and prior[0].presence == 'present' and
               prior[0].created_at == timestamp else 'unknown'))) -%}
-          {%- set volumes.values = volumes.values + [{'name': result.compose_volume_name, 'created_at': timestamp,
-            'origin': origin, 'presence': 'absent' if not result.exists else
-              ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp) else 'present')}] -%}
+          {%- set presence = 'absent' if not result.exists else
+            ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp) else 'present') -%}
+          {%- set user_rows = compose_volume_users.results | selectattr('compose_volume_name', 'equalto', result.compose_volume_name) | list -%}
+          {%- set users = user_rows[0].containers if user_rows | length == 1 else [] -%}
+          {%- set allowed = (compose_known_containers | default([])) +
+            (compose_observed_instances | map(attribute='instance.id') | list if
+              compose_action == 'deploy' and compose_allow_new_instances | default(false) else []) -%}
+          {%- set labels = result.volume.Labels | default({}, true) if result.exists else {} -%}
+          {%- set reason = 'The volume is absent.' if not result.exists else
+            ('This volume was not created by the original workload.' if origin != 'created' else
+            ('The original volume incarnation is unavailable.' if timestamp is none or presence != 'present' else
+            ('The volume is not an ordinary local native backing.' if result.volume.Driver | default('') != 'local' or
+              result.volume.Scope | default('') != 'local' or result.volume.Options | default({}, true) | length != 0 else
+            ('Original workload ownership is unavailable.' if labels.get('com.docker.compose.project') != compose_project_name or
+              not labels.get('com.docker.compose.volume') else
+            ('Current volume consumers are unavailable.' if user_rows | length != 1 or users | length > 128 else
+            ('Other containers use this volume.' if users | map(attribute='Id') | difference(allowed) | length > 0 else none)))))) -%}
+          {%- set recorded_time = timestamp if result.exists else (known[0].created_at if known | length == 1 else none) -%}
+          {%- set volumes.values = volumes.values + [{'name': result.compose_volume_name, 'created_at': recorded_time,
+            'origin': origin, 'presence': presence, 'delete_eligible': reason is none, 'deletion_reason': reason}] -%}
           {%- endfor -%}
           {{ volumes.values }}
 
