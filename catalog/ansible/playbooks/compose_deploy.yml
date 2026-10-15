@@ -668,6 +668,11 @@
               - compose_observation_complete
               - compose_ready
 
+        - name: Publish completed native observation
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:observe","status":"completed","metadata":{"display_name":"Observe Compose readiness"}}'
+          no_log: false
+
         - name: Record complete native deployment
           ansible.builtin.set_fact:
             compose_outcome: succeeded
