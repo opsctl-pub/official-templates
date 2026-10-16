@@ -153,7 +153,7 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes any fixed fail
 | `observed_at` | UTC RFC3339 or null when observation failed. |
 | `outcome`, `observation_complete`, `changed` | `succeeded|failed|unknown`, complete observation boolean, actual-effect boolean. |
 | `ready` | Boolean when complete; null when incomplete. Failure/unknown cannot install a revision. |
-| `phase`, `reason` | Actual phase and closed safe reason below; reason null on success. |
+| `phase`, `reason` | Actual bounded diagnostic phase/reason below; reason null on success. |
 | `files_written` | Successfully copied relative paths, including partial delivery; no content/hash. |
 | `services` | `{name,desired_replicas,condition,state,instances}` for every selected service. State `running|healthy|starting|completed|scaled_down|stopped|failed|missing|unknown|drifted`. |
 | `unexpected_containers` | Actual project instances outside recorded/selected membership. |
@@ -174,12 +174,31 @@ and native stderr remain private.
 Phases/progress names: `compose:prepare`, `compose:files`, `compose:apply`,
 `compose:observe`, `compose:remove`, `compose:complete`. OPERATION_STEP carries
 actual `running|completed|failed`, fixed display name and safe reason only.
-Closed reasons: `compose_prerequisite_unavailable`, `compose_project_conflict`,
+Current producer reasons include `compose_prerequisite_unavailable`, `compose_project_conflict`,
 `compose_configuration_changed`, `compose_file_delivery_failed`,
 `compose_registry_auth_failed`, `compose_apply_failed`, `compose_readiness_timeout`,
 `compose_observation_failed`, `compose_observation_limit`, `compose_resource_changed`,
 `compose_resource_in_use`, `compose_remove_failed`, `compose_build_unavailable`.
 Generic module errors do not become invented precise diagnoses.
+
+### Public result evolution
+
+Only the root `compose` result accepts additive fields; decoded API facts project
+the known fields and discard unknown root members. Nested additions remain
+unsupported: service/instance/port/mount/network/volume/file facts and their state,
+coverage and reason vocabularies stay closed, as do private inputs and admission
+records. Presence of root `procedure_error`, even null, refuses result consumption.
+The complete raw result is bounded to 256 KiB before projection; existing enclosing
+output limits still apply. Ignoring a field does not redact the original marker
+or Operation logs and never permits secrets or private native errors in output.
+
+Root `phase` is a strict ASCII token matching `^compose:[a-z][a-z0-9_]*$`, at
+most 64 characters; nullable root `reason` matches `^compose_[a-z][a-z0-9_]*$`, at
+most 128 characters. New diagnostic codes do not grant new meaning or coverage.
+Successful consumption still requires exact `compose:complete`, null reason,
+successful terminal execution, required observation/readiness and exact admitted
+identity/membership. Complete failed observations remain failed-only evidence,
+not installation or success. No history is rewritten or source repinned.
 
 Bounds: 256 KiB output, 32 services, 128 total instances, 64 networks/volumes,
 256 ports and 128 mounts per instance. Overflow emits incomplete/unknown, never

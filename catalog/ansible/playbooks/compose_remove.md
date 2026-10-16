@@ -60,7 +60,7 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes fixed failure.
 | `observed_at` | UTC RFC3339 or null if observation failed. |
 | `outcome`, `observation_complete`, `changed` | `succeeded|failed|unknown`, complete facts boolean, actual effects boolean. |
 | `ready` | Always null; retained data presence is not failed absence. |
-| `phase`, `reason` | Actual prepare/remove/observe/complete phase, null or closed safe reason. |
+| `phase`, `reason` | Actual prepare/remove/observe/complete phase, null or bounded root diagnostic reason. |
 | `files_written` | Empty. |
 | `services` | `{name,desired_replicas,condition,state,instances}`; captured desired services can be missing after successful removal. |
 | `unexpected_containers` | Project extras, never implicitly removed. |
@@ -75,7 +75,7 @@ service-state literals follow [deployment](compose_deploy.md#results). Ports are
 `{type:volume|bind|tmpfs|other,source,target,read_only}`. No env/options/labels/health
 commands/native errors or backend attribution IDs are exposed.
 
-Closed reasons are listed in [deployment](compose_deploy.md#results); removal uses
+Current producer reasons are listed in [deployment](compose_deploy.md#results); removal uses
 prerequisite_unavailable, resource_changed, resource_in_use, remove_failed,
 observation_failed/limit with the `compose_` prefix. OPERATION_STEP carries fixed
 display text, actual running/completed/failed status and safe reason. Bounds: 256
@@ -83,6 +83,13 @@ KiB, 32 services, 128 total instances, 64 networks/volumes, 256 ports and 128 mo
 per instance. Overflow is explicit incomplete/unknown, not truncated success.
 Incomplete partial facts do not release backend references. Job failure stays
 failure even if earlier facts looked successful.
+
+The [root-only evolution policy](compose_deploy.md#public-result-evolution) applies:
+unknown root fields are projected away after the raw 256 KiB bound; any root
+`procedure_error` key refuses even when null. Bounded new diagnostic codes do not
+qualify success, removal or coverage. Nested identities/states remain closed;
+exact complete/null-reason and recorded incarnation/absence guards are unchanged.
+Projection does not redact raw markers/logs or authorize secret output.
 
 ## Example
 

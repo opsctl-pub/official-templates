@@ -43,13 +43,20 @@ the detailed neutral instance vocabulary is in [deployment](compose_deploy.md#re
 | `observed_at` | UTC RFC3339 or null on failed observation. |
 | `outcome`, `observation_complete`, `changed` | `succeeded|failed|unknown`, boolean completeness, always false for changed. |
 | `ready` | Complete readiness boolean, otherwise null. |
-| `phase`, `reason` | `compose:observe|compose:complete`; null or closed observation failure/limit reason. |
+| `phase`, `reason` | Producer uses `compose:observe|compose:complete`; null or bounded root diagnostic reason. |
 | `files_written`, `removed_containers` | Empty arrays; inspect performs no delivery/removal. |
 | `services` | `{name,desired_replicas,condition,state,instances}`; state `running|healthy|starting|completed|scaled_down|stopped|failed|missing|unknown|drifted`. |
 | `unexpected_containers` | Instances outside captured/selected project membership. |
 | `networks` | `{id,name,origin,presence:present|absent|unknown}`; absent recorded networks retain ID. |
 | `volumes` | `{name,created_at,origin,presence}` including mounted anonymous volumes; timestamp nullable. |
 | `selected_file_observations`, `selected_file_observation_complete` | Ordered selected disk metadata and independent coverage; empty selection is `[]`/false. |
+
+The [root-only evolution policy](compose_deploy.md#public-result-evolution) applies:
+unknown root fields are discarded only after the full raw 256 KiB bound and explicit
+`procedure_error` presence refusal. Bounded new root diagnostic codes grant no
+success/coverage; exact complete/null-reason and all identity/truth guards remain.
+Nested additions, including selected-file reason changes, are unsupported. Raw
+markers/logs are not redacted by projection; secrets remain forbidden.
 
 Each selected row is exactly `{path,presence,size_bytes,mode,sha256,reason}`.
 Present rows report nonnegative byte size, four-octal filesystem mode (including
