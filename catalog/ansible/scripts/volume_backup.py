@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 RESTIC = 'restic/restic@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510'
 RCLONE = 'rclone/rclone@sha256:34c729127386abec1c610b2aa024e39b4498dc2b4a72a0798ae21fbdc1b0493b'
+RCLONE_ARGUMENTS = 'serve restic --stdio --config /dev/null --low-level-retries 1 --retries 1'
 DIGEST = re.compile(r'^[a-f0-9]{64}$')
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$')
 
@@ -265,7 +266,7 @@ def execute(inputs, directory, result):
 
         def restic(*argv):
             return docker('exec', tool, 'restic', '-o', 'rclone.program=/usr/bin/rclone',
-                '-o', 'rclone.args=serve restic --stdio --config /dev/null', *argv).stdout
+                '-o', 'rclone.args=' + RCLONE_ARGUMENTS, *argv).stdout
 
         version = restic('version').decode().split()
         if len(version) < 2 or version[0] != 'restic':
@@ -299,7 +300,7 @@ def execute(inputs, directory, result):
             # Only the selected snapshot's reachable bytes are read. No pack parser or history scan.
             digest = docker('exec', tool, '/bin/sh', '-c',
                 'set -o pipefail; restic -o rclone.program=/usr/bin/rclone '
-                '-o "rclone.args=serve restic --stdio --config /dev/null" '
+                '-o ' + shlex.quote('rclone.args=' + RCLONE_ARGUMENTS) + ' '
                 '--no-cache dump ' + snapshot_id + ':/data / | sha256sum').stdout.decode().split()[0]
             if not DIGEST.fullmatch(digest):
                 raise ValueError('selected_data_verification_incomplete')

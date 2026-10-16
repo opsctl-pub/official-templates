@@ -8,6 +8,7 @@ Restic0.19.1 and rclone1.70.3 are digest-pinned in the readable
 script. rclone S3 `no_check_bucket` skips bucket creation, including races after
 preparation. TLS verification remains enabled; an optional user CA is delivered
 privately with the invocation. Storage permissions require read/list/write/lock.
+Restic owns repository retries; rclone does not multiply them with nested retries.
 
 Backup requires detached, ordinary local/no-options storage and zero native
 containers (including stopped users). The original is mounted read-only until
