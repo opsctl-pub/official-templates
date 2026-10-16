@@ -64,7 +64,7 @@ when observation is unavailable, not in supplied incarnation references.
 
 ## Plain Results
 
-Every ordinary-image removal emits one final `TEMPLATE_OUTPUT_JSON` containing
+When removal reaches final observation it emits `TEMPLATE_OUTPUT_JSON` containing
 `image_runtime` (empty resource lists when unmanaged), plus any independently
 qualified route/drain results. `image_runtime` has exactly these fields:
 
@@ -77,6 +77,23 @@ qualified route/drain results. `image_runtime` has exactly these fields:
 | `previous_container_absent` | Boolean after an actual predecessor lookup; null if no predecessor was supplied or lookup was unavailable. |
 | `volumes` | `{name,created_at,presence,users:[{id,state,read_only}]}`; presence is `present`, `absent` or `unknown`. |
 | `networks` | `{id,name,presence,containers:[fullDockerID]}` with the same presence values. |
+
+The adjacent [version1 declaration](container_remove.contract.json) checks four
+closed safe examples with the existing `image_runtime` decoder: recorded predecessor
+absent, target absent without a predecessor, present/not removed, and incomplete
+with null readiness. These are compatibility distinctions, not cleanup authority
+or a promise that each shape is emitted on every refusal. Global/override Validate
+and accept/save reobservation use the exact fetched revision; no native execution
+or attachment release is qualified by the examples. Runtime facts are unchanged.
+
+Early identity, inspection or route checks can refuse before final image facts.
+Drain failure may emit only `connection_drain` with `procedure_error`, without
+`image_runtime`. Missing image facts never establish absence. Optional route/drain
+siblings have separate typed consumers and combined-envelope limits; this
+declaration does not validate those contracts or grant their acceptance coverage.
+An omitted predecessor input remains distinct from explicit null (absent target
+only) and a full recorded ID. A null public predecessor observation does not satisfy
+installed-removal/attachment consumers that require qualified predecessor absence.
 
 A safe instance is `{id,name,replica,image_ref,image_id,image_digest,state,health,
 exit_code,ports,mounts}`. For an image container `replica` is null; unavailable
