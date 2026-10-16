@@ -233,6 +233,11 @@
             loop_var: selected_volume
             label: deleted native volume
 
+        - name: Publish completed final native observation
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"compose:observe","status":"completed","metadata":{"display_name":"Observe final retained resources"}}'
+          no_log: false
+
         - name: Record complete removal without claiming retained-data protection
           ansible.builtin.set_fact:
             compose_removed_containers: "{{ compose_absent_containers }}"
