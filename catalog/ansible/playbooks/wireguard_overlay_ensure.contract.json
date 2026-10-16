@@ -1,0 +1,55 @@
+{
+  "format_version": 1,
+  "item_id": "wireguard_overlay_ensure",
+  "engine": "ansible",
+  "result_version": 1,
+  "examples": [
+    {
+      "case": "active",
+      "outputs": {
+        "wireguard_ip": "10.77.0.1",
+        "wireguard_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "wireguard_interface": "wg-example",
+        "wireguard_service": {
+          "manager": "systemd",
+          "name": "wg-quick@wg-example.service",
+          "state": "active"
+        },
+        "diagnostic_code": "example_only"
+      }
+    },
+    {
+      "case": "guarded_absent",
+      "outputs": {
+        "wireguard_absent": true,
+        "wireguard_ip": "10.77.0.1",
+        "wireguard_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "wireguard_interface": "wg-example",
+        "wireguard_service": {
+          "manager": "systemd",
+          "name": "wg-quick@wg-example.service",
+          "state": "inactive"
+        }
+      }
+    },
+    {
+      "case": "unknown",
+      "outputs": {
+        "wireguard_ip": "10.77.0.1",
+        "wireguard_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "wireguard_interface": "wg-example",
+        "wireguard_service": {
+          "manager": "systemd",
+          "name": "wg-quick@wg-example.service",
+          "state": "unknown"
+        }
+      }
+    },
+    {
+      "case": "procedure_error",
+      "outputs": {
+        "procedure_error": {"phase": "observe", "code": "example_unavailable"}
+      }
+    }
+  ]
+}
