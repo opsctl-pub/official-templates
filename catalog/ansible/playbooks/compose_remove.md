@@ -16,6 +16,7 @@ source files, registry Secret, generated Compose model or private protocol.
 | `compose_known_networks` | required list, may be empty | Up to 64 recorded `{id,name,origin:created|reused|external|unknown}`. Unresolved observed ownership refuses mutation. |
 | `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,birth_marker,origin}`; nullable timestamp/marker means keep-only. |
 | `compose_delete_volumes` | `[]` | Up to 64 unique explicit `{name,created_at,birth_marker}` selections; original created identity only. |
+| `compose_managed_volumes` | `[]` | Exact existing `{name,created_at,labels}` managed bindings; retain data, verify local identity and no foreign users. Only the managed Volume owner deletes these external backings. |
 
 Observe current project members and recorded incarnations/users before effects.
 Exact inspected local built-ins `none`/`null` and `host`/`host` are external when

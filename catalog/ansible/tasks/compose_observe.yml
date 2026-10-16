@@ -127,7 +127,8 @@
           {%- endfor -%}
           {{ names.values | unique | sort }}
         compose_volume_names: >-
-          {%- set names = namespace(values=compose_known_volumes | default([]) | map(attribute='name') | list) -%}
+          {%- set names = namespace(values=(compose_known_volumes | default([]) | map(attribute='name') | list) +
+            (compose_managed_volumes | default([]) | map(attribute='name') | list)) -%}
           {%- for volume in (compose_native_config | default({})).get('volumes', {}).values() -%}
           {%- if volume.name | default('') | length > 0 -%}{%- set names.values = names.values + [volume.name] -%}{%- endif -%}
           {%- endfor -%}
@@ -182,6 +183,29 @@
         label: native volume consumers
       register: compose_volume_users
 
+    - name: Require exact existing managed native identity and exclude foreign consumers
+      ansible.builtin.assert:
+        that:
+          - matches | length == 1 and matches[0].exists
+          - matches[0].volume.CreatedAt == managed_volume.created_at
+          - matches[0].volume.Driver == 'local'
+          - matches[0].volume.Scope == 'local'
+          - matches[0].volume.Options | default({}, true) | length == 0
+          - matches[0].volume.Labels | default({}, true) == managed_volume.labels
+          - users | length == 1 and users[0].containers | length <= 128
+          - users[0].containers | map(attribute='Id') | difference(allowed) | length == 0
+      vars:
+        matches: "{{ compose_volume_info.results | selectattr('compose_volume_name', 'equalto', managed_volume.name) | list }}"
+        users: "{{ compose_volume_users.results | selectattr('compose_volume_name', 'equalto', managed_volume.name) | list }}"
+        allowed: >-
+          {{ (compose_known_containers | default([])) +
+            (compose_observed_instances | map(attribute='instance.id') | list if
+              compose_action == 'deploy' and compose_allow_new_instances | default(false) else []) }}
+      loop: "{{ compose_managed_volumes | default([]) }}"
+      loop_control:
+        loop_var: managed_volume
+        label: managed native volume
+
     - name: Project native network identity origin and presence
       ansible.builtin.set_fact:
         compose_observed_networks: >-
@@ -220,7 +244,9 @@
           {%- for result in compose_volume_info.results -%}
           {%- set known = compose_known_volumes | default([]) | selectattr('name', 'equalto', result.compose_volume_name) | list -%}
           {%- set prior = compose_prior_volumes | default([]) | selectattr('name', 'equalto', result.compose_volume_name) | list -%}
-          {%- set external = namespace(value=false) -%}
+          {%- set managed = result.compose_volume_name in
+            (compose_managed_volumes | default([]) | map(attribute='name') | list) -%}
+          {%- set external = namespace(value=managed) -%}
           {%- for volume in (compose_native_config | default({})).get('volumes', {}).values() -%}
           {%- if volume.name | default('') == result.compose_volume_name and volume.external | default(false) -%}
           {%- set external.value = true -%}{%- endif -%}
@@ -231,13 +257,13 @@
           {%- set marker = raw_marker if raw_marker is string and raw_marker is match('^[a-f0-9]{64}$') else none -%}
           {%- set births = compose_birth_volumes | default({}) | dict2items |
             selectattr('value.name', 'equalto', result.compose_volume_name) | list -%}
-          {%- set origin = known[0].origin if known | length > 0 and
+          {%- set origin = 'external' if managed else (known[0].origin if known | length > 0 and
             (not result.exists or (timestamp is not none and known[0].created_at == timestamp and
               known[0].birth_marker | default(none) == marker)) else
             ('external' if external.value else ('created' if births | length == 1 and
               marker == births[0].value.marker and prior | length > 0 and prior[0].presence == 'absent' else
             ('reused' if timestamp is not none and prior | length > 0 and prior[0].presence == 'present' and
-              prior[0].created_at == timestamp else 'unknown'))) -%}
+              prior[0].created_at == timestamp else 'unknown')))) -%}
           {%- set presence = 'absent' if not result.exists else
             ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp or
               known[0].birth_marker | default(none) != marker) else 'present') -%}

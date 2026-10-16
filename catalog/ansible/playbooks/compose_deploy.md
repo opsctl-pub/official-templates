@@ -47,6 +47,8 @@ or authorize stale execution; commit, content or name equality alone is not trus
 | `compose_known_containers` | `[]`; up to 128 full IDs | Recorded installed/partial instances; only these pre-existing project members permit mutation. |
 | `compose_known_networks` | `[]`; up to 64 objects | Recorded `{id,name,origin}`; origin `created|reused|external|unknown`. |
 | `compose_known_volumes` | `[]`; up to 64 objects | Recorded `{name,created_at,birth_marker,origin}`; timestamp/marker nullable, same origins. Missing marker is keep-only, without backfill. |
+| `compose_managed_override_file` | null | Exact `compose_source_directory + '/compose-managed-volumes.yaml'`; qualified external-volume `!override`, separate from originals and applied last. |
+| `compose_managed_volumes` | `[]`; up to 64 objects | Existing `{name,created_at,labels}` managed identities; exact local driver/options/labels/incarnation and no foreign consumers are verified, never created or deleted. |
 
 Files/env selections must resolve to supplied paths. Supplied paths are regular
 files, not symlinks/special files. Workspace ancestors and destinations are checked
@@ -115,7 +117,9 @@ Privately read `docker compose config --format json` from the original project
 base. Compare selected service/count/readiness/completion intent, not full-model
 hashes. Changed selected references can cause `compose_configuration_changed`
 before apply. Native include/extends/path bases and source platform/image/pull policy
-remain authoritative; no generated overrides or OpsCtl revision labels are injected.
+remain authoritative. Only explicit managed-volume selections append the qualified
+external-volume override; original files remain unchanged and no revision labels
+are injected. Backend attachment admission supports one service/instance per backing.
 
 Apply with `docker_compose_v2`: exact project_src/name/files/env/profiles,
 `state=present`, `pull=policy`, `build=never`, `recreate=auto`,
