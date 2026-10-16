@@ -1,0 +1,84 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_route_observe",
+  "engine": "ansible",
+  "result_version": 1,
+  "examples": [
+    {
+      "case": "succeeded_present",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "present",
+          "hosts": ["app.example.test"],
+          "route_port": 18473,
+          "https": false,
+          "redirect_http_to_https": false,
+          "middlewares": [],
+          "backends": ["http://127.0.0.1:18473"],
+          "router_name": "example-route@file"
+        }
+      }
+    },
+    {
+      "case": "succeeded_absent",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "absent",
+          "hosts": [],
+          "route_port": null,
+          "https": null,
+          "redirect_http_to_https": null,
+          "middlewares": [],
+          "backends": [],
+          "router_name": null
+        }
+      }
+    },
+    {
+      "case": "incomplete_unknown",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "incomplete",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "unknown",
+          "hosts": [],
+          "route_port": null,
+          "https": null,
+          "redirect_http_to_https": null,
+          "middlewares": [],
+          "backends": [],
+          "router_name": null
+        }
+      }
+    },
+    {
+      "case": "present_with_gateway",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "present",
+          "hosts": ["app.example.test"],
+          "route_port": 18473,
+          "https": false,
+          "redirect_http_to_https": false,
+          "middlewares": [],
+          "backends": ["http://127.0.0.1:18473"],
+          "router_name": "example-route@file"
+        },
+        "gateway_bootstrap_observation": {
+          "interface": "wg-example",
+          "ipv4": "10.73.0.1",
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "service": {"manager": "systemd", "name": "wg-quick@wg-example.service", "state": "active"},
+          "route_backend_urls": ["http://127.0.0.1:18473"],
+          "observed_at": "2026-10-16T00:00:00Z"
+        }
+      }
+    }
+  ]
+}

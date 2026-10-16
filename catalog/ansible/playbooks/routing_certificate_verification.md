@@ -264,7 +264,9 @@ Common inputs identify the Deployment, organization and target Server through
 the existing inventory. Ports are strict integers 1..65535; normalized hosts are
 sorted/unique (maximum 100), private/loopback endpoints unique (maximum 64).
 Middleware references are opaque strings (maximum 255 characters, 50 entries).
-`simulate=true` changes nothing and supplies no consumed success.
+Convergence/canary `simulate=true` exits before effects and supplies no facts or
+consumed success. Route observation remains read-only; its configured facts alone
+are not a simulated readiness result.
 
 `traefik_route_observe` needs only its subject and optional recorded WireGuard
 references. `traefik_route_converge` adds explicit `route_state=present|absent`,
@@ -295,6 +297,15 @@ output, and simulate supplies no readiness. This declaration does not establish
 compatibility for other routing items or expand organization override eligibility;
 `traefik_route_converge` is not eligible through the current org override catalog.
 
+The adjacent [route-observe declaration](traefik_route_observe.contract.json)
+defines version1 with four closed envelopes: succeeded present/absent, incomplete
+unknown, and present with actual `GatewayBootstrapObservation` facts. The optional
+paired gateway references require the observed single loopback route/backend and
+active WireGuard service; missing/ambiguous evidence refuses before publication.
+Ordinary unknown facts are emitted before failure; earlier prerequisites may emit
+nothing. Unknown never qualifies success. Examples validate existing typed facts,
+not current native references, bootstrap readiness or serving.
+
 `traefik_backend_canary` adds `action=observe|converge_present|converge_absent`,
 `promotion_id`, `gateway_id`, `target_node_id`, `target_revision_id`, one admitted
 temporary `route_hosts` entry, `canary_router` naming intent, `route_port` and
@@ -305,6 +316,15 @@ Absent/unknown uses null host/router and empty backends. Keep the temporary
 router private-only. Never recompute a backend naming digest in an override.
 The full observed provider reference is opaque; neither configured presence nor
 successful publication establishes active serving (see Verification).
+
+The adjacent [canary declaration](mobility/traefik_backend_canary.contract.json)
+defines version1 with only succeeded configured present/absent envelopes. It does
+not invent unknown, error or restored-state results: ownership/CAS refusals and
+failed convergence/restoration may emit no facts. Canary simulation ends at the
+first pretask, before validation, reads or writes, and emits no result/readiness.
+Global Validate/Accept checks both declarations and safe examples at the fetched
+revision; it does not run the procedures or confer source/Run/mutation authority.
+Neither member is currently org-override eligible; no sibling contract is implied.
 
 ## WireGuard References
 
