@@ -120,7 +120,7 @@ def recovery_kit(location, snapshot, version):
             'If ca_pem is supplied save it as USER_CA_FILE. Preserve verified TLS; never disable certificate checking.',
             'export RESTIC_REPOSITORY=' + shlex.quote(uri),
             tool + ' cat config # require the exact repository_id above',
-            'set -o pipefail; ' + tool + ' dump ' + identity + ':/data / | sha256sum # require archive_sha256 above',
+            'set -o pipefail; ' + tool + ' --no-cache dump ' + identity + ':/data / | sha256sum # require archive_sha256 above',
             tool + ' restore ' + identity + ':/data --target NEW_EMPTY_DIRECTORY --verify',
             'Use only a new empty destination. No OpsCtl database is needed; attachment, cutover and application consistency are separate.',
         ]}
@@ -202,10 +202,14 @@ def execute(inputs, directory, result):
             locks.append(lock)
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if inputs.get('interrupted_operation_id') is not None:
-            previous = inputs['interrupted_operation_id']
-            if action != 'inspect' or not re.fullmatch(r'[a-f0-9-]{36}', previous):
+            previous = inputs.get('interrupted_operation_ids', [])
+            if (action != 'inspect' or not previous or len(previous) > 64
+                    or previous[-1] != inputs['interrupted_operation_id']
+                    or len(set(previous)) != len(previous)
+                    or any(not re.fullmatch(r'[a-f0-9-]{36}', item) for item in previous)):
                 raise ValueError('interrupted_selection_invalid')
-            close_idle_tool(previous, repository_uri)
+            for identity in previous:
+                close_idle_tool(identity, repository_uri)
         if selected is not None:
             require_zero_users(selected['name'])
             if action == 'backup':
@@ -296,7 +300,7 @@ def execute(inputs, directory, result):
             digest = docker('exec', tool, '/bin/sh', '-c',
                 'set -o pipefail; restic -o rclone.program=/usr/bin/rclone '
                 '-o "rclone.args=serve restic --stdio --config /dev/null" '
-                'dump ' + snapshot_id + ':/data / | sha256sum').stdout.decode().split()[0]
+                '--no-cache dump ' + snapshot_id + ':/data / | sha256sum').stdout.decode().split()[0]
             if not DIGEST.fullmatch(digest):
                 raise ValueError('selected_data_verification_incomplete')
             snapshot.update(ready=True, verified_at=now(), archive_sha256=digest)
@@ -309,10 +313,19 @@ def execute(inputs, directory, result):
         result['interruption_checked'] = inputs.get('interrupted_operation_id') is not None
         result['outcome'] = 'succeeded'
     finally:
+        closure_failed = False
         for identity in reversed(owned):
-            docker('rm', '-f', identity, check=False)
+            try:
+                removed = docker('rm', '-f', identity, check=False)
+                remaining = docker('container', 'ls', '-aq', '--no-trunc', '--filter', 'id=' + identity)
+                if removed.returncode or remaining.stdout.strip():
+                    closure_failed = True
+            except (ValueError, OSError, subprocess.SubprocessError):
+                closure_failed = True
         for lock in reversed(locks):
             lock.close()
+        if closure_failed:
+            raise ValueError('owned_tool_closure_unverified')
 
 
 def main():

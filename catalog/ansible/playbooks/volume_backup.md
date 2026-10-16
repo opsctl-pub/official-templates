@@ -36,7 +36,9 @@ inspection; it may be removed through the ordinary data-loss owner, not attached
 actual tool version, outcome, native exclusion, selected snapshot verification,
 bounded recorded snapshot inventory and nullable target creation facts. Snapshot
 identity is content-addressed, not a WORM/availability promise. Only selected
-reachable bytes are verified, not all historical packs. A portable recovery kit
+reachable bytes are verified without the upload/restore cache, not all historical packs.
+Owned tool/container closure must be verified before success; uncertain closure retains
+API exclusion/recovery ownership. A portable recovery kit
 plus independently retained password/storage credentials can use native-S3 restic
 without the OpsCtl database. Losing that password loses recovery.
 
