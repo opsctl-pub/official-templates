@@ -325,6 +325,7 @@ def execute(inputs, directory, result):
         for lock in reversed(locks):
             lock.close()
         if closure_failed:
+            result['interruption_checked'] = False
             raise ValueError('owned_tool_closure_unverified')
 
 
