@@ -1,0 +1,10 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_gateway_ensure",
+  "engine": "ansible",
+  "completion_version": 1,
+  "completion": "runtime_verified_at_execution",
+  "result_facts": "none",
+  "absence": "unsupported",
+  "simulate": "no_native_readiness"
+}
