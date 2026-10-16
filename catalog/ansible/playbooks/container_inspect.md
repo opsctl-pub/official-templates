@@ -35,6 +35,15 @@ ordinary image inspection.
 
 ## Plain Results
 
+The adjacent [version1 declaration](container_inspect.contract.json) checks four
+ordinary-image examples through the unchanged `image_runtime` decoder: ready
+present, present but not ready, absent, and incomplete with null readiness.
+Predecessor observation remains independent and nullable. Global/override source
+validation and accept/save reobservation check compatibility at the exact fetched
+revision, not installation, adoption, attachment release or native readiness.
+This declaration excludes `verification_kind`, `deployment_verification` and private
+HTTP verification; it adds no runtime fields or new decoder/readiness semantics.
+
 Every ordinary image inspection emits one `TEMPLATE_OUTPUT_JSON={"image_runtime":...}`:
 
 | Field | Meaning |
