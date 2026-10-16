@@ -283,6 +283,18 @@ Paths and native layout belong to the public procedure, not the backend input.
 The official defaults are gateway container `traefik` and watched directory
 `/etc/traefik/dynamic/opsctl`; overrides may use their own layout.
 
+The adjacent [route-converge declaration](traefik_route_converge.contract.json)
+defines version1 with four closed envelopes: succeeded present/absent, restored
+route facts plus `apply/route_apply_failed`, and error-only
+`restore/restoration_failed`. Global source Validate/Accept checks existing route
+and error decoders at the exact fetched revision; it does not execute CAS, qualify
+serving or authorize mutation. Configured presence is not serving evidence.
+Error-bearing examples never qualify success;
+restoration failure invents no route facts. Preconditions may refuse without any
+output, and simulate supplies no readiness. This declaration does not establish
+compatibility for other routing items or expand organization override eligibility;
+`traefik_route_converge` is not eligible through the current org override catalog.
+
 `traefik_backend_canary` adds `action=observe|converge_present|converge_absent`,
 `promotion_id`, `gateway_id`, `target_node_id`, `target_revision_id`, one admitted
 temporary `route_hosts` entry, `canary_router` naming intent, `route_port` and

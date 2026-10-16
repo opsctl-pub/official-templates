@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_route_converge",
+  "engine": "ansible",
+  "result_version": 1,
+  "examples": [
+    {
+      "case": "succeeded_present",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "present",
+          "hosts": ["app.example.test"],
+          "route_port": 18473,
+          "https": false,
+          "redirect_http_to_https": false,
+          "middlewares": [],
+          "backends": ["http://127.0.0.1:18473"],
+          "router_name": "example-route@file"
+        }
+      }
+    },
+    {
+      "case": "succeeded_absent",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "absent",
+          "hosts": [],
+          "route_port": null,
+          "https": null,
+          "redirect_http_to_https": null,
+          "middlewares": [],
+          "backends": [],
+          "router_name": null
+        }
+      }
+    },
+    {
+      "case": "restored_with_error",
+      "outputs": {
+        "deployment_route_observation": {
+          "outcome": "succeeded",
+          "observed_at": "2026-10-16T00:00:00Z",
+          "presence": "present",
+          "hosts": ["app.example.test"],
+          "route_port": 18473,
+          "https": false,
+          "redirect_http_to_https": false,
+          "middlewares": [],
+          "backends": ["http://127.0.0.1:18473"],
+          "router_name": "example-route@file"
+        },
+        "procedure_error": {
+          "phase": "apply",
+          "code": "route_apply_failed"
+        }
+      }
+    },
+    {
+      "case": "restoration_failed",
+      "outputs": {
+        "procedure_error": {
+          "phase": "restore",
+          "code": "restoration_failed"
+        }
+      }
+    }
+  ]
+}
