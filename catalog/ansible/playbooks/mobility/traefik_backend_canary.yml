@@ -9,6 +9,10 @@
     canary_host: "{{ route_hosts[0] }}"
     canary_service: "{{ canary_router }}"
   pre_tasks:
+    - name: Skip Traefik backend canary in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
     - name: Validate canary identity before mutation
       ansible.builtin.assert:
         that:
