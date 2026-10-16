@@ -68,6 +68,14 @@ No volume/network/bind data or image is deleted for managed-resource deployment.
 
 ## Results
 
+The adjacent [version1 declaration](container_deploy.contract.json) supplies three
+closed safe `image_runtime` examples: ready with an observed container, complete
+but not ready, and incomplete with null readiness. Global/override source
+validation and accept/save revalidation check them against the existing result
+decoder at the exact fetched revision. This checks declared compatibility, not
+native execution, installation, attachment authority or application health.
+No new runtime fields, diagnostic protocol or additive-field policy is introduced.
+
 Existing progress/health output remains. Every ordinary-image deployment emits
 `TEMPLATE_OUTPUT_JSON={"image_runtime":...}` before refusing incomplete/not-ready
 observations, including workloads without managed resources (empty resource
