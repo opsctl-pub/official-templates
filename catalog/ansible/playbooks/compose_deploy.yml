@@ -651,6 +651,7 @@
             loop_var: birth_volume
             label: native volume
           register: compose_birth_creation
+          changed_when: false
 
         - name: Reinspect birth identities before any Compose apply
           community.docker.docker_volume_info:
@@ -663,7 +664,15 @@
 
         - name: Preserve successful native creation effects before qualification
           ansible.builtin.set_fact:
-            compose_changed: "{{ compose_changed or compose_birth_creation.changed | default(false) }}"
+            compose_changed: >-
+              {%- set created = namespace(value=compose_changed) -%}
+              {%- for result in compose_birth_inspection.results -%}
+              {%- if result.exists and result.volume.Labels.get('io.opsctl.compose.birth') ==
+                result.birth_volume.value.marker -%}
+              {%- set created.value = true -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ created.value }}
 
         - name: Refuse raced names without relabeling or deleting them
           ansible.builtin.assert:
@@ -772,6 +781,17 @@
 
         - name: Retain failed versus unavailable procedure truth
           ansible.builtin.set_fact:
+            compose_changed: >-
+              {%- set created = namespace(value=compose_changed) -%}
+              {%- for fact in compose_observed_volumes -%}
+              {%- for birth in compose_birth_volumes.values() -%}
+              {%- if fact.name == birth.name and fact.birth_marker == birth.marker and
+                fact.origin == 'created' and fact.presence == 'present' -%}
+              {%- set created.value = true -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {%- endfor -%}
+              {{ created.value }}
             compose_outcome: "{{ 'failed' if compose_observation_complete else 'unknown' }}"
             compose_reason: "{{ compose_failure_reason if compose_observation_complete else compose_reason }}"
       always:
