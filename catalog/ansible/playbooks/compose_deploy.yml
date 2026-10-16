@@ -561,7 +561,22 @@
                 that:
                   - compose_observation_complete
                   - (compose_empty_volume_keys | default([])) | intersect((compose_reuse_volumes | default({})).keys() | list) | length == 0
-                  - (compose_empty_volume_keys | default([])) | union((compose_reuse_volumes | default({})).keys() | list) | sort == compose_native_config.get('volumes', {}).keys() | list | sort
+                  - compose_managed_volume_keys | default([]) | length <= 64
+                  - compose_managed_volume_keys | default([]) | unique | length == compose_managed_volume_keys | default([]) | length
+                  - (compose_managed_volume_keys | default([])) | intersect((compose_empty_volume_keys | default([])) + ((compose_reuse_volumes | default({})).keys() | list)) | length == 0
+                  - (compose_empty_volume_keys | default([])) | union((compose_reuse_volumes | default({})).keys() | list) | union(compose_managed_volume_keys | default([])) | sort == compose_native_config.get('volumes', {}).keys() | list | sort
+
+            - name: Require each managed logical key to remain an exact qualified external volume
+              ansible.builtin.assert:
+                that:
+                  - compose_native_config.volumes[managed_key].external | default(false)
+                  - managed_matches | length == 1
+              vars:
+                managed_matches: "{{ compose_managed_volumes | default([]) | selectattr('name', 'equalto', compose_native_config.volumes[managed_key].name) | list }}"
+              loop: "{{ compose_managed_volume_keys | default([]) }}"
+              loop_control:
+                loop_var: managed_key
+                label: managed logical volume
 
             - name: Require absent or exact known native volume
               ansible.builtin.assert:

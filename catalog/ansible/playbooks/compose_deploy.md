@@ -49,6 +49,7 @@ or authorize stale execution; commit, content or name equality alone is not trus
 | `compose_known_volumes` | `[]`; up to 64 objects | Recorded `{name,created_at,birth_marker,origin}`; timestamp/marker nullable, same origins. Missing marker is keep-only, without backfill. |
 | `compose_managed_override_file` | null | Exact `compose_source_directory + '/compose-managed-volumes.yaml'`; qualified external-volume `!override`, separate from originals and applied last. |
 | `compose_managed_volumes` | `[]`; up to 64 objects | Existing `{name,created_at,labels}` managed identities; exact local driver/options/labels/incarnation and no foreign consumers are verified, never created or deleted. |
+| `compose_managed_volume_keys` | `[]`; up to 64 keys | Current managed logical keys, disjoint from empty/reuse; each resolves to exactly one qualified external identity. |
 
 Files/env selections must resolve to supplied paths. Supplied paths are regular
 files, not symlinks/special files. Workspace ancestors and destinations are checked
