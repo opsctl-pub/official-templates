@@ -14,8 +14,8 @@ source files, registry Secret, generated Compose model or private protocol.
 | `compose_services` | required | Up to 32 captured `{name,replicas,condition,allow_completion:false}`; total replicas<=128; same conditions as deploy. |
 | `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs eligible for exact removal. |
 | `compose_known_networks` | required list, may be empty | Up to 64 recorded `{id,name,origin:created|reused|external|unknown}`. Unresolved observed ownership refuses mutation. |
-| `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,origin}`, nullable timestamp; unknown incarnation remains incomplete, not deletion permission. |
-| `compose_delete_volumes` | `[]` | Up to 64 unique explicit `{name,created_at}` selections; exact original created incarnation only. |
+| `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,birth_marker,origin}`; nullable timestamp/marker means keep-only. |
+| `compose_delete_volumes` | `[]` | Up to 64 unique explicit `{name,created_at,birth_marker}` selections; original created identity only. |
 
 Observe current project members and recorded incarnations/users before effects.
 Exact inspected local built-ins `none`/`null` and `host`/`host` are external when
@@ -35,7 +35,7 @@ bind data and images. Foreign users on retained reused/external networks do not
 block removal of the recorded containers; deletion-specific user exclusivity
 applies only to qualified created networks. Incarnation checks still cover all
 recorded networks. Selected volumes require original creation ownership, exact
-timestamp, Compose ownership labels, ordinary local backing and no foreign
+timestamp and opaque 64-lowercase-hex birth marker, Compose ownership labels, ordinary local backing and no foreign
 container users (including stopped containers). Reobserve after workload removal,
 then use only `docker volume rm -- <selected-name>` without force. External,
 reused, unknown-incarnation and nonlocal volumes are never eligible. Already
@@ -43,6 +43,8 @@ absent selected incarnations preserve their recorded timestamp for exact replay.
 No unselected data is deleted; retaining it does not protect Server-local data
 against later Server deletion. Native observe/remove is not atomic against a
 privileged concurrent host actor; the daemon still refuses in-use deletion.
+The marker is identity metadata, not authority; a privileged actor can deliberately copy it.
+Historical or preexisting unmarked volumes remain keep-only, without backfill.
 There is no down, blanket volume removal, prune, prefix sweep or
 rollback. Already absent identities are idempotent observed absence. Failure after
 some effects retains safe partial facts, not an automatic retry or success claim.
@@ -62,7 +64,7 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes fixed failure.
 | `services` | `{name,desired_replicas,condition,state,instances}`; captured desired services can be missing after successful removal. |
 | `unexpected_containers` | Project extras, never implicitly removed. |
 | `networks` | `{id,name,origin,presence:present|absent|unknown}`; absence retains recorded ID. |
-| `volumes` | `{name,created_at,origin,presence,delete_eligible,deletion_reason}`; absent entries retain recorded timestamps. Eligibility is an observation, not consent; a fixed reason explains unavailable deletion. |
+| `volumes` | `{name,created_at,birth_marker,origin,presence,delete_eligible,deletion_reason}`; absent entries retain recorded timestamps/markers. Eligibility is an observation, not consent; a fixed reason explains unavailable deletion. |
 | `removed_containers` | Full IDs actually reobserved absent, not just successfully stopped. |
 
 Instance fields are `{id,name,replica,image_ref,image_id,image_digest,state,health,

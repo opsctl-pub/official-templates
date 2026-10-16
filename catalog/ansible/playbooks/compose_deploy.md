@@ -6,6 +6,15 @@ revision flow. Logical Operation type remains `deploy_container`. Org overrides
 use these public variables and facts; no private API, receipt or protocol is needed.
 Inventory, SSH access and privilege escalation use the existing Ansible contract.
 
+Before native apply, only absent declared nonexternal named volumes with ordinary
+local backing and no driver options receive a new opaque birth marker. Native
+names and authored labels are preserved; reserved `io.opsctl.compose.birth`
+authored-label collisions refuse. Existing volumes are never relabeled/adopted.
+Creation is followed by exact marker inspection before Compose up; raced names
+refuse without deletion. Partial creations remain reported effects, never rolled
+back. Original files are unchanged. Privileged marker copying and the native
+observe/remove race are not prevented by this identity metadata.
+
 ## Managed Behavior Declaration
 
 The adjacent [closed declaration](compose_deploy.contract.json) binds strict
@@ -37,7 +46,7 @@ or authorize stale execution; commit, content or name equality alone is not trus
 | `compose_wait_timeout` | 300; integer 1-1800 seconds | Backend readiness setting; observations separated by up to five seconds. |
 | `compose_known_containers` | `[]`; up to 128 full IDs | Recorded installed/partial instances; only these pre-existing project members permit mutation. |
 | `compose_known_networks` | `[]`; up to 64 objects | Recorded `{id,name,origin}`; origin `created|reused|external|unknown`. |
-| `compose_known_volumes` | `[]`; up to 64 objects | Recorded `{name,created_at,origin}`; timestamp nullable, same origins. Unknown timestamp conveys no deletion authority. |
+| `compose_known_volumes` | `[]`; up to 64 objects | Recorded `{name,created_at,birth_marker,origin}`; timestamp/marker nullable, same origins. Missing marker is keep-only, without backfill. |
 
 Files/env selections must resolve to supplied paths. Supplied paths are regular
 files, not symlinks/special files. Workspace ancestors and destinations are checked
@@ -144,7 +153,7 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes any fixed fail
 | `services` | `{name,desired_replicas,condition,state,instances}` for every selected service. State `running|healthy|starting|completed|scaled_down|stopped|failed|missing|unknown|drifted`. |
 | `unexpected_containers` | Actual project instances outside recorded/selected membership. |
 | `networks` | `{id,name,origin,presence}`; absence retains recorded ID; presence `present|absent|unknown`. |
-| `volumes` | `{name,created_at,origin,presence,delete_eligible,deletion_reason}`, including anonymous mounts. Timestamp nullable; all are retained. Native deletion eligibility requires exact original creation, local backing/ownership and no foreign users; unavailable observations explain refusal, never imply consent. |
+| `volumes` | `{name,created_at,birth_marker,origin,presence,delete_eligible,deletion_reason}`, including anonymous mounts. Marker is nullable or exactly 64 lowercase hex characters; absent facts retain recorded identity. Eligibility requires original creation/marker, local backing/ownership and no foreign users; unavailable observations explain refusal, never imply consent. |
 | `removed_containers` | Recorded full IDs actually reobserved absent, never inferred from stop success. |
 
 Every instance includes `{id,name,replica,image_ref,image_id,image_digest,state,

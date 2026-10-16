@@ -226,13 +226,21 @@
           {%- set external.value = true -%}{%- endif -%}
           {%- endfor -%}
           {%- set timestamp = result.volume.CreatedAt | default(none) if result.exists else none -%}
+          {%- set labels = result.volume.Labels | default({}, true) if result.exists else {} -%}
+          {%- set raw_marker = labels.get('io.opsctl.compose.birth', '') -%}
+          {%- set marker = raw_marker if raw_marker is string and raw_marker is match('^[a-f0-9]{64}$') else none -%}
+          {%- set births = compose_birth_volumes | default({}) | dict2items |
+            selectattr('value.name', 'equalto', result.compose_volume_name) | list -%}
           {%- set origin = known[0].origin if known | length > 0 and
-            (not result.exists or (timestamp is not none and known[0].created_at == timestamp)) else
-            ('external' if external.value else ('created' if prior | length > 0 and prior[0].presence == 'absent' else
+            (not result.exists or (timestamp is not none and known[0].created_at == timestamp and
+              known[0].birth_marker | default(none) == marker)) else
+            ('external' if external.value else ('created' if births | length == 1 and
+              marker == births[0].value.marker and prior | length > 0 and prior[0].presence == 'absent' else
             ('reused' if timestamp is not none and prior | length > 0 and prior[0].presence == 'present' and
               prior[0].created_at == timestamp else 'unknown'))) -%}
           {%- set presence = 'absent' if not result.exists else
-            ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp) else 'present') -%}
+            ('unknown' if known | length > 0 and (known[0].created_at is none or known[0].created_at != timestamp or
+              known[0].birth_marker | default(none) != marker) else 'present') -%}
           {%- set user_rows = compose_volume_users.results | selectattr('compose_volume_name', 'equalto', result.compose_volume_name) | list -%}
           {%- set users = user_rows[0].containers if user_rows | length == 1 else [] -%}
           {%- set allowed = (compose_known_containers | default([])) +
@@ -241,7 +249,7 @@
           {%- set labels = result.volume.Labels | default({}, true) if result.exists else {} -%}
           {%- set reason = 'The volume is absent.' if not result.exists else
             ('This volume was not created by the original workload.' if origin != 'created' else
-            ('The original volume incarnation is unavailable.' if timestamp is none or presence != 'present' else
+            ('The original volume incarnation is unavailable.' if timestamp is none or marker is none or presence != 'present' else
             ('The volume is not an ordinary local native backing.' if result.volume.Driver | default('') != 'local' or
               result.volume.Scope | default('') != 'local' or result.volume.Options | default({}, true) | length != 0 else
             ('Original workload ownership is unavailable.' if labels.get('com.docker.compose.project') != compose_project_name or
@@ -249,8 +257,10 @@
             ('Current volume consumers are unavailable.' if user_rows | length != 1 or users | length > 128 else
             ('Other containers use this volume.' if users | map(attribute='Id') | difference(allowed) | length > 0 else none)))))) -%}
           {%- set recorded_time = timestamp if result.exists else (known[0].created_at if known | length == 1 else none) -%}
+          {%- set recorded_marker = marker if result.exists else (known[0].birth_marker | default(none) if known | length == 1 else none) -%}
           {%- set volumes.values = volumes.values + [{'name': result.compose_volume_name, 'created_at': recorded_time,
-            'origin': origin, 'presence': presence, 'delete_eligible': reason is none, 'deletion_reason': reason}] -%}
+            'birth_marker': recorded_marker, 'origin': origin, 'presence': presence,
+            'delete_eligible': reason is none, 'deletion_reason': reason}] -%}
           {%- endfor -%}
           {{ volumes.values }}
 

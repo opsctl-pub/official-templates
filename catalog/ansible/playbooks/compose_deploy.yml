@@ -18,6 +18,7 @@
         compose_allow_new_instances: false
         compose_operational_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         compose_auth_identity: null
+        compose_birth_volumes: {}
       no_log: true
 
     - name: Publish preparation progress
@@ -604,6 +605,76 @@
             compose_phase: compose:apply
             compose_reason: compose_apply_failed
 
+        - name: Reject authored collisions with the reserved volume birth label
+          ansible.builtin.assert:
+            that:
+              - "'io.opsctl.compose.birth' not in (birth_volume.value.labels | default({}, true))"
+          loop: "{{ compose_native_config.get('volumes', {}) | dict2items }}"
+          loop_control:
+            loop_var: birth_volume
+            label: native volume
+
+        - name: Select only absent declared ordinary local volumes for birth
+          ansible.builtin.set_fact:
+            compose_birth_volumes: >-
+              {{ compose_birth_volumes | combine({birth_volume.key: {
+                'name': birth_volume.value.name, 'marker': lookup('ansible.builtin.password',
+                  '/dev/null length=64 chars=hexdigits') | lower,
+                'labels': birth_volume.value.labels | default({}, true)}}) }}
+          vars:
+            existing: "{{ compose_volume_info.results | selectattr('compose_volume_name', 'equalto', birth_volume.value.name) | list }}"
+          when:
+            - not birth_volume.value.external | default(false)
+            - birth_volume.value.driver | default('local', true) == 'local'
+            - not birth_volume.value.driver_opts | default({}, true)
+            - existing | length == 1 and not existing[0].exists
+          loop: "{{ compose_native_config.get('volumes', {}) | dict2items }}"
+          loop_control:
+            loop_var: birth_volume
+            label: native volume
+
+        - name: Create only selected absent native volumes without adopting existing names
+          ansible.builtin.command:
+            argv: >-
+              {%- set args = namespace(values=['docker', 'volume', 'create', '--driver', 'local']) -%}
+              {%- set labels = birth_volume.value.labels | combine({
+                'com.docker.compose.project': compose_project_name,
+                'com.docker.compose.volume': birth_volume.key,
+                'io.opsctl.compose.birth': birth_volume.value.marker}) -%}
+              {%- for key, value in labels.items() -%}
+              {%- set args.values = args.values + ['--label', key + '=' + value | string] -%}
+              {%- endfor -%}
+              {{ args.values + [birth_volume.value.name] }}
+            expand_argument_vars: false
+          loop: "{{ compose_birth_volumes | dict2items }}"
+          loop_control:
+            loop_var: birth_volume
+            label: native volume
+          register: compose_birth_creation
+
+        - name: Reinspect birth identities before any Compose apply
+          community.docker.docker_volume_info:
+            name: "{{ birth_volume.value.name }}"
+          loop: "{{ compose_birth_volumes | dict2items }}"
+          loop_control:
+            loop_var: birth_volume
+            label: native volume
+          register: compose_birth_inspection
+
+        - name: Preserve successful native creation effects before qualification
+          ansible.builtin.set_fact:
+            compose_changed: "{{ compose_changed or compose_birth_creation.changed | default(false) }}"
+
+        - name: Refuse raced names without relabeling or deleting them
+          ansible.builtin.assert:
+            that:
+              - birth_result.exists
+              - birth_result.volume.Labels.get('io.opsctl.compose.birth') == birth_result.birth_volume.value.marker
+          loop: "{{ compose_birth_inspection.results }}"
+          loop_control:
+            loop_var: birth_result
+            label: native volume
+
         - name: Publish native apply progress
           ansible.builtin.debug:
             msg: 'OPERATION_STEP={"name":"compose:apply","status":"running","metadata":{"display_name":"Apply native Compose project"}}'
@@ -691,7 +762,8 @@
               {{ paths.values }}
             compose_changed: >-
               {{ compose_changed or compose_file_copies.changed | default(false) or
-                compose_created_directories.changed | default(false) or compose_native_apply.changed | default(false) }}
+                compose_created_directories.changed | default(false) or compose_native_apply.changed | default(false) or
+                compose_birth_creation.changed | default(false) }}
             compose_allow_new_instances: "{{ compose_native_apply is defined }}"
             compose_failure_reason: "{{ compose_reason }}"
 

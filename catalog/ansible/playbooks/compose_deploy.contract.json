@@ -4,6 +4,6 @@
   "engine": "ansible",
   "managed_behavior": {
     "id": "opsctl.compose_deploy",
-    "revision": 1
+    "revision": 2
   }
 }

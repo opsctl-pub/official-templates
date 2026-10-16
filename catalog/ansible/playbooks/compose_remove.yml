@@ -64,9 +64,12 @@
             that:
               - selected_volume.name is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
               - selected_volume.created_at is string and selected_volume.created_at | length > 0
+              - selected_volume.birth_marker is match('^[a-f0-9]{64}$')
               - original | length == 1 and original[0].origin == 'created'
               - original[0].created_at == selected_volume.created_at
+              - original[0].birth_marker | default(none) == selected_volume.birth_marker
               - observed | length == 1 and observed[0].created_at == selected_volume.created_at
+              - observed[0].birth_marker == selected_volume.birth_marker
               - observed[0].presence == 'absent' or observed[0].delete_eligible
           vars:
             original: "{{ compose_known_volumes | default([]) | selectattr('name', 'equalto', selected_volume.name) | list }}"
@@ -167,6 +170,7 @@
             that:
               - compose_observation_complete
               - observed | length == 1 and observed[0].created_at == selected_volume.created_at
+              - observed[0].birth_marker == selected_volume.birth_marker
               - observed[0].presence == 'absent' or observed[0].delete_eligible
           vars:
             observed: "{{ compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) | list }}"
@@ -221,6 +225,7 @@
             that:
               - observed | length == 1
               - observed[0].presence == 'absent' and observed[0].created_at == selected_volume.created_at
+              - observed[0].birth_marker == selected_volume.birth_marker
           vars:
             observed: "{{ compose_observed_volumes | selectattr('name', 'equalto', selected_volume.name) | list }}"
           loop: "{{ compose_delete_volumes | default([]) }}"
