@@ -1,0 +1,23 @@
+http:
+  routers:
+    {{ canary_router }}:
+      rule: 'Host(`{{ canary_host }}`)'
+      entryPoints:
+        - web
+      service: {{ canary_service }}
+      middlewares:
+        - {{ canary_router }}-private
+      observability:
+        accessLogs: true
+  middlewares:
+    {{ canary_router }}-private:
+      ipAllowList:
+        sourceRange:
+          - 127.0.0.1/32
+          - '::1/128'
+  services:
+    {{ canary_service }}:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: {{ canary_backend_url | to_json }}

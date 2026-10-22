@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_custom_certificate_unbind",
+  "engine": "ansible",
+  "documentation": "traefik_custom_certificate_unbind.md"
+}

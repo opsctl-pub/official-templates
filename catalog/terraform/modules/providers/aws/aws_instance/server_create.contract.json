@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "engine": "opentofu",
+  "ssh_bootstrap": {
+    "input": "ssh_port",
+    "configuration": "first_boot",
+    "profiles": [{"distribution": "ubuntu", "versions": ["22.04", "24.04"]}]
+  }
+}

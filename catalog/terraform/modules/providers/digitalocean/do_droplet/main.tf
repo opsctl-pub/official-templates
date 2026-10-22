@@ -1,0 +1,146 @@
+terraform {
+  required_version = ">= 1.0"
+
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"
+      version = "~> 2.0"
+    }
+  }
+}
+
+# Provider configuration - token comes from DIGITALOCEAN_TOKEN environment variable
+provider "digitalocean" {
+  # Token is automatically read from DIGITALOCEAN_TOKEN env var
+}
+
+# Look up existing SSH key by name (only for provisioning)
+data "digitalocean_ssh_key" "existing" {
+  count = !var.destroy && var.ssh_key_id == "" && var.ssh_key_name != "" ? 1 : 0
+  name  = var.ssh_key_name
+}
+
+# Create the droplet (only when not destroying)
+resource "digitalocean_droplet" "server" {
+  count = var.destroy ? 0 : 1
+
+  name   = var.name
+  region = var.region
+  size   = var.size
+  image  = var.image
+
+  # Enable monitoring and backups based on variables
+  monitoring = var.enable_monitoring
+  backups    = var.enable_backups
+  ipv6       = var.enable_ipv6
+  vpc_uuid   = var.vpc_uuid != "" ? var.vpc_uuid : null
+
+  # Add SSH keys if provided
+  ssh_keys = var.ssh_key_id != "" ? [var.ssh_key_id] : (
+    var.ssh_key_name != "" ? [data.digitalocean_ssh_key.existing[0].id] : []
+  )
+
+  # User data for cloud-init (optional)
+  user_data = var.ssh_port == 22 ? (var.user_data != "" ? var.user_data : null) : templatefile(
+    "${path.module}/../../../ssh/cloud-init.yaml.tftpl", { ssh_port = var.ssh_port }
+  )
+
+  # Tags
+  tags = var.tags
+
+  lifecycle {
+    precondition {
+      condition = var.ssh_port == 22 || (
+        var.user_data == "" && contains(["ubuntu-22.04", "ubuntu-24.04"], var.ssh_bootstrap_profile)
+      )
+      error_message = "Nondefault SSH requires a qualified image and no custom user_data."
+    }
+
+    precondition {
+      condition     = var.name != "" && var.region != "" && var.size != "" && var.image != ""
+      error_message = "name, region, size, and image are required when destroy=false"
+    }
+  }
+}
+
+resource "digitalocean_firewall" "server" {
+  count = var.destroy ? 0 : 1
+
+  name        = "${var.name}-fw"
+  droplet_ids = [digitalocean_droplet.server[0].id]
+
+  dynamic "inbound_rule" {
+    for_each = var.ingress_rules
+    content {
+      protocol         = inbound_rule.value.protocol
+      port_range       = tostring(inbound_rule.value.port)
+      source_addresses = ["0.0.0.0/0"]
+    }
+  }
+
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "icmp"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+}
+
+# For destroy operations, import the existing droplet
+resource "digitalocean_droplet" "this" {
+  count = var.destroy ? 1 : 0
+
+  # Minimal required fields for import
+  # These values don't matter as we're destroying
+  name   = "destroying"
+  region = "nyc3"
+  size   = "s-1vcpu-1gb"
+  image  = "ubuntu-24-04-x64"
+
+  lifecycle {
+    precondition {
+      condition     = var.droplet_id != ""
+      error_message = "droplet_id is required when destroy=true"
+    }
+  }
+}
+
+resource "digitalocean_firewall" "destroy" {
+  count = var.destroy && var.destroy_firewall ? 1 : 0
+
+  name       = "opsctl-destroy-firewall"
+  depends_on = [digitalocean_droplet.this]
+
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.firewall_id != ""
+      error_message = "firewall_id is required when destroy_firewall=true"
+    }
+  }
+}
+
+# Create a project and assign the droplet (optional, only for provisioning)
+resource "digitalocean_project" "default" {
+  count       = !var.destroy && var.project_name != "" ? 1 : 0
+  name        = var.project_name
+  description = var.project_description
+  purpose     = var.project_purpose
+  environment = var.project_environment
+  resources   = [digitalocean_droplet.server[0].urn]
+}

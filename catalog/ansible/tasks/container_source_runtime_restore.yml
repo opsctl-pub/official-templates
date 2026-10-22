@@ -1,0 +1,147 @@
+---
+- name: Restore the validated source runtime and verify its health
+  block:
+    - name: Remove the failed replacement before restoring the original source
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, rm, -f, "{{ source_replacement_original.name }}"]
+      failed_when: false
+      changed_when: true
+
+    - name: Initialize the exact source create arguments
+      ansible.builtin.set_fact:
+        source_restore_create_argv: "{{ ['docker', 'create', '--name', source_replacement_original.name] }}"
+
+    - name: Preserve original restart, network, workdir, user and entrypoint
+      ansible.builtin.set_fact:
+        source_restore_create_argv: "{{ source_restore_create_argv + item.arguments }}"
+      loop:
+        - enabled: "{{ restart_name and restart_name != 'no' }}"
+          arguments: "{{ ['--restart', restart_name] }}"
+        - enabled: "{{ restore_host.get('NetworkMode') and restore_host.NetworkMode != 'default' }}"
+          arguments: "{{ ['--network', restore_host.get('NetworkMode')] }}"
+        - enabled: "{{ (restore_config.get('WorkingDir') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--workdir', restore_config.get('WorkingDir')] }}"
+        - enabled: "{{ (restore_config.get('User') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--user', restore_config.get('User')] }}"
+        - enabled: "{{ restore_config.get('Entrypoint') | default([], true) | length > 0 }}"
+          arguments: "{{ ['--entrypoint', (restore_config.get('Entrypoint') | default([none], true))[0]] }}"
+      when: item.enabled | bool
+
+    - name: Preserve original string environment entries
+      ansible.builtin.set_fact:
+        source_restore_create_argv: "{{ source_restore_create_argv + ['--env', item] }}"
+      loop: "{{ restore_config.get('Env') | default([], true) }}"
+      when: item is string
+
+    - name: Preserve sorted original labels
+      ansible.builtin.set_fact:
+        source_restore_create_argv: "{{ source_restore_create_argv + ['--label', item.key ~ '=' ~ item.value] }}"
+      loop: "{{ restore_config.get('Labels') | default({}, true) | dict2items | sort(attribute='key', case_sensitive=true) }}"
+
+    - name: Preserve original string bind mounts
+      ansible.builtin.set_fact:
+        source_restore_create_argv: "{{ source_restore_create_argv + ['--volume', item] }}"
+      loop: "{{ restore_host.get('Binds') | default([], true) }}"
+      when: item is string
+
+    - name: Retain only original port binding lists
+      ansible.builtin.set_fact:
+        source_restore_port_lists: >-
+          {{ restore_host.get('PortBindings') | default({}, true) | dict2items
+             | selectattr('value', 'sequence') | rejectattr('value', 'string')
+             | rejectattr('value', 'mapping') | list }}
+
+    - name: Preserve original published ports with IPv6 brackets
+      ansible.builtin.set_fact:
+        source_restore_create_argv: >-
+          {{ source_restore_create_argv + ['--publish',
+             (('[' ~ host_ip ~ ']' if ':' in host_ip and not host_ip.startswith('[') else host_ip) ~ ':' if host_ip else '')
+             ~ (item.1.get('HostPort') | default('', true) | string) ~ ':' ~ item.0.key] }}
+      vars:
+        host_ip: "{{ item.1.get('HostIp') | default('', true) | string }}"
+      loop: "{{ source_restore_port_lists | subelements('value') }}"
+      when: item.1 is mapping
+
+    - name: Require the original source image
+      ansible.builtin.assert:
+        that:
+          - restore_config.get('Image') is string and restore_config.Image | length > 0
+        fail_msg: source_replacement_restore_image_invalid
+
+    - name: Recreate the original source configuration
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: >-
+          {{ source_restore_create_argv + [restore_config.Image]
+             + (restore_config.Cmd | map('string') | list if restore_config.get('Cmd') is sequence
+                and restore_config.get('Cmd') is not string and restore_config.get('Cmd') is not mapping
+                else [restore_config.Cmd] if restore_config.get('Cmd') is string and restore_config.Cmd else []) }}
+      changed_when: true
+
+    - name: Start the restored source runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, start, "{{ source_replacement_original.name }}"]
+      changed_when: true
+
+    - name: Inspect the actual restored source
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ source_replacement_original.name }}"]
+      register: source_replacement_restore_result
+      changed_when: false
+
+    - name: Require exact restored source configuration
+      ansible.builtin.assert:
+        that: current_config.get(item) == restore_config.get(item)
+        fail_msg: source_replacement_restore_config_mismatch
+      vars:
+        current_config: "{{ (source_replacement_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
+      loop: [Image, Cmd, Entrypoint, Env, WorkingDir, User, Labels, ExposedPorts, Volumes]
+
+    - name: Require exact restored published ports
+      ansible.builtin.assert:
+        that: current_host.get('PortBindings') | default({}, true) == restore_host.get('PortBindings') | default({}, true)
+        fail_msg: source_replacement_restore_bindings_mismatch
+      vars:
+        current_host: "{{ (source_replacement_restore_result.stdout | from_json)[0].HostConfig | default({}, true) }}"
+
+    - name: Require exact restored bind mounts
+      ansible.builtin.assert:
+        that: current_host.get('Binds') | default([], true) == restore_host.get('Binds') | default([], true)
+        fail_msg: source_replacement_restore_mounts_mismatch
+      vars:
+        current_host: "{{ (source_replacement_restore_result.stdout | from_json)[0].HostConfig | default({}, true) }}"
+
+    - name: Require the restored source to be running
+      ansible.builtin.assert:
+        that: (current.get('State') or {}).get('Running') | bool
+        fail_msg: source_replacement_restore_not_running
+      vars:
+        current: "{{ (source_replacement_restore_result.stdout | from_json)[0] }}"
+
+    - name: Verify restored source health through the existing confined helper
+      block:
+        - name: Probe the restored source container HTTP endpoint
+          ansible.builtin.script:
+            cmd: >-
+              ../scripts/container_http_health.py
+              --container {{ source_replacement_original.name | quote }}
+              --organization {{ (restore_config.get('Labels') or {}).get('com.opsctl.org_id') | default('', true) | quote }}
+              --deployment {{ (restore_config.get('Labels') or {}).get('com.opsctl.deployment_id') | default('', true) | quote }}
+              --revision {{ (restore_config.get('Labels') or {}).get('com.opsctl.revision_id') | default('', true) | quote }}
+              --port {{ source_replacement.get('container_port') | string | quote }}
+              --path {{ app_health_container_path | default('/health') | quote }}
+            executable: python3
+          changed_when: false
+          timeout: 35
+      rescue:
+        - name: Refuse restoration when source health is not verified
+          ansible.builtin.fail:
+            msg: source_replacement_restore_health_failed
+  vars:
+    restore_config: "{{ source_replacement_original.config | default({}, true) }}"
+    restore_host: "{{ source_replacement_original.host_config | default({}, true) }}"
+    restart_name: "{{ (restore_host.get('RestartPolicy') or {}).get('Name') }}"
+  no_log: true

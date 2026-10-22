@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "server_ssh_host_key_enroll",
+  "engine": "ansible",
+  "documentation": "server_ssh_host_key_enroll.md"
+}

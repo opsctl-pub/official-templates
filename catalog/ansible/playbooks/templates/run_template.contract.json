@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "run_template",
+  "engine": "ansible",
+  "documentation": "run_template.md"
+}

@@ -1,0 +1,160 @@
+---
+- name: Converge canonical managed Traefik reverse proxy
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: "traefik"
+    traefik_image: "traefik@sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0"
+    traefik_dynamic_dir: "/etc/traefik/dynamic/opsctl"
+    traefik_acme_dir: "/var/lib/traefik"
+    dns_challenge_token_file: "{{ traefik_acme_dir }}/broker-secrets/token-{{ dns_challenge_token_revision_id | default('unavailable') }}"
+    traefik_certificate_dir: "/etc/traefik/certificates/opsctl"
+    traefik_acme_state_dir: "/var/lib/opsctl/automatic-certificates"
+    acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    traefik_gateway_target_major: 3
+    traefik_gateway_target_version: "3.7.13"
+  pre_tasks:
+    - name: Skip Traefik proxy when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: Report Traefik proxy configuration started
+      shell: |
+        printf 'OPERATION_STEP={"name":"traefik:start","status":"running","metadata":{"display_name":"Configure Traefik proxy"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Converge managed Traefik proxy
+      block:
+        - name: Initialize dashboard retirement phase
+          ansible.builtin.set_fact:
+            traefik_dashboard_retirement_started: false
+            traefik_dashboard_selection_admitted: false
+
+        - name: Observe the Server dashboard selection before setup mutation
+          ansible.builtin.include_tasks: ../../../tasks/traefik_custom_certificate_observation.yml
+          vars:
+            certificate_selection_only: true
+            certificate_probe_hosts: false
+          when: traefik_dashboard_enabled | default(false)
+
+        - name: Require known absent or automatic Server selection
+          ansible.builtin.assert:
+            that:
+              - certificate_subject.type == 'server'
+              - certificate_action == 'issue'
+              - certificate_selection_observed
+              - >-
+                certificate_selection_snapshot.presence == 'absent' or
+                (certificate_selection_snapshot.presence == 'present' and
+                 certificate_selection_snapshot.source == 'automatic')
+            fail_msg: Dashboard certificate selection is unavailable or not automatic
+          when: traefik_dashboard_enabled | default(false)
+          no_log: true
+
+        - name: Capture the actual dashboard selection for generic issuance comparison
+          ansible.builtin.set_fact:
+            expected_certificate:
+              presence: "{{ certificate_selection_snapshot.presence }}"
+              source: "{{ certificate_selection_snapshot.source }}"
+              material_id: "{{ certificate_selection_snapshot.material_id }}"
+              revision_id: "{{ certificate_selection_snapshot.revision_id }}"
+              leaf_fingerprint_sha256: "{{ certificate_selection_snapshot.leaf_fingerprint_sha256 }}"
+            traefik_dashboard_selection_admitted: true
+          when: traefik_dashboard_enabled | default(false)
+          no_log: true
+
+        - name: Install broker credential for explicit DNS-01 profile
+          ansible.builtin.include_tasks: ../../../tasks/traefik_gateway_dns_challenge_secret.yml
+          when:
+            - traefik_dashboard_enabled | default(false)
+            - challenge | default('http-01') == 'dns-01'
+
+        - name: Build Traefik command arguments
+          include_tasks: ../../../tasks/traefik_gateway_command.yml
+          vars:
+            traefik_gateway_dashboard_enabled: "{{ traefik_dashboard_enabled | default(false) }}"
+
+        - name: Build non-routing Traefik setup identity
+          set_fact:
+            traefik_gateway_policy_labels:
+              com.opsctl.setup_operation_id: "{{ operation_id | string }}"
+
+        - name: Converge qualified authenticated dashboard file
+          ansible.builtin.include_tasks: ../../../tasks/traefik_gateway_dashboard.yml
+
+        - name: Converge canonical Traefik runtime layout
+          include_tasks: ../../../tasks/traefik_gateway_runtime_layout.yml
+          vars:
+            traefik_gateway_force_recreate: false
+            traefik_gateway_sensitive: >-
+              {{
+                ((traefik_dashboard_enabled | default(false))
+                and (traefik_dashboard_auth | default('') | length > 0))
+                or (challenge | default('http-01')) == 'dns-01'
+              }}
+
+        - name: Enter qualified dashboard retirement after disabled runtime verification
+          ansible.builtin.set_fact:
+            traefik_dashboard_retirement_started: true
+          when: not (traefik_dashboard_enabled | default(false)) and (certificate_dashboard_retirement | default(false))
+
+        - name: Retire the disabled Server dashboard selection
+          ansible.builtin.include_tasks: ../../../tasks/traefik_server_dashboard_retirement.yml
+          when: not (traefik_dashboard_enabled | default(false)) and (certificate_dashboard_retirement | default(false))
+
+        - name: Issue and enroll the Server dashboard certificate
+          ansible.builtin.include_tasks: ../../../tasks/traefik_automatic_certificate.yml
+          when: traefik_dashboard_enabled | default(false)
+
+        - name: Report Traefik proxy checks passed
+          shell: |
+            printf 'OPERATION_STEP={"name":"traefik:ready","status":"completed","metadata":{"display_name":"Verify Traefik proxy"}}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Report Traefik proxy configuration completed
+          shell: |
+            printf 'OPERATION_STEP={"name":"traefik:complete","status":"completed","metadata":{"display_name":"Traefik proxy ready"}}\n'
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Publish unknown full observation on pre-effect dashboard refusal
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'certificate_observation':
+                certificate_observation |
+                combine({'outcome': 'failed'}), 'procedure_error':
+                {'phase': 'validate', 'code': 'certificate_state_changed'}
+                if certificate_selection_observed | default(false) else
+                {'phase': 'observe', 'code': 'certificate_serving_unverified'}} | to_json }}
+          when:
+            - traefik_dashboard_enabled | default(false)
+            - not (traefik_dashboard_selection_admitted | default(false))
+
+        - name: Restore prior managed runtime after later setup failure
+          ansible.builtin.include_tasks: ../../../tasks/traefik_gateway_runtime_restore.yml
+          when:
+            - (traefik_replacement_started | default(false)) or (traefik_dashboard_changed | default(false))
+            - not (traefik_runtime_restored | default(false))
+            - not (traefik_dashboard_retirement_started | default(false))
+
+        - name: Report Traefik proxy configuration failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"traefik:failure","status":"failed","metadata":{"display_name":"Traefik proxy failed"}}\n'
+          args:
+            executable: /bin/sh
+
+        - name: Clean unreferenced broker credential after failure
+          ansible.builtin.include_tasks: ../../../tasks/traefik_gateway_dns_challenge_cleanup.yml
+          when:
+            - traefik_dashboard_enabled | default(false)
+            - challenge | default('http-01') == 'dns-01'
+
+        - name: Fail Traefik proxy converge
+          fail:
+            msg: >-
+              {{ 'Dashboard retirement failed after disabled runtime verification; selected state requires observation'
+              if (traefik_dashboard_retirement_started | default(false))
+              else 'Traefik proxy converge failed; certificate selection/enrollment may have changed and requires observation' }}

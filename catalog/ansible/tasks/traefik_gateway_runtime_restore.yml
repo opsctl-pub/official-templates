@@ -1,0 +1,280 @@
+---
+- name: Restore only the captured owned dashboard file
+  block:
+    - name: Inspect dashboard restoration path without following links
+      ansible.builtin.stat:
+        path: "{{ traefik_dashboard_snapshot.path }}"
+        follow: false
+      register: traefik_dashboard_restore_stat
+
+    - name: Refuse unsafe dashboard restoration path
+      ansible.builtin.assert:
+        that:
+          - not traefik_dashboard_restore_stat.stat.exists or (traefik_dashboard_restore_stat.stat.isreg and not traefik_dashboard_restore_stat.stat.islnk)
+          - not traefik_dashboard_restore_stat.stat.exists or (traefik_dashboard_restore_stat.stat.uid == 0 and traefik_dashboard_restore_stat.stat.mode == '0600')
+          - not traefik_dashboard_restore_stat.stat.exists or traefik_dashboard_restore_stat.stat.size <= 65536
+        fail_msg: "Dashboard restoration ownership changed"
+
+    - name: Read current dashboard restoration bytes
+      ansible.builtin.slurp:
+        src: "{{ traefik_dashboard_snapshot.path }}"
+      register: traefik_dashboard_restore_bytes
+      when: traefik_dashboard_restore_stat.stat.exists
+
+    - name: Refuse restoration over a different dashboard generation
+      ansible.builtin.assert:
+        that:
+          - >-
+            (traefik_dashboard_restore_bytes.content if traefik_dashboard_restore_stat.stat.exists else none)
+            in [traefik_dashboard_snapshot.prior, traefik_dashboard_snapshot.desired]
+        fail_msg: "Dashboard route changed before restoration"
+
+    - name: Restore prior private dashboard bytes atomically
+      ansible.builtin.copy:
+        content: "{{ traefik_dashboard_snapshot.prior | b64decode }}"
+        dest: "{{ traefik_dashboard_snapshot.path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        unsafe_writes: false
+      when: traefik_dashboard_snapshot.prior is not none
+
+    - name: Restore original dashboard absence
+      ansible.builtin.file:
+        path: "{{ traefik_dashboard_snapshot.path }}"
+        state: absent
+      when: traefik_dashboard_snapshot.prior is none
+
+    - name: Mark captured dashboard restoration complete
+      ansible.builtin.set_fact:
+        traefik_dashboard_changed: false
+  when: traefik_dashboard_snapshot is defined and (traefik_dashboard_changed | default(false))
+  no_log: true
+
+- name: Inspect runtime before restoration
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name }}"
+  register: traefik_restore_info
+  when: traefik_replacement_started | default(false)
+  no_log: true
+
+- name: Read exact current restoration identity
+  set_fact:
+    traefik_restore_current: "{{ traefik_restore_info.container | default(none) }}"
+  when: traefik_replacement_started | default(false)
+  no_log: true
+
+- name: Refuse restoration over another runtime owner
+  assert:
+    that:
+      - >-
+        traefik_restore_current is none
+        or (traefik_prior_runtime_present and traefik_restore_current.Id == traefik_prior_runtime.Id)
+        or (
+          traefik_restore_current.Config.Image == traefik_image
+          and traefik_restore_current.Id == traefik_replacement_details.Id
+          and (traefik_restore_current.Config.Labels | combine(traefik_managed_labels)) == traefik_restore_current.Config.Labels
+          and traefik_restore_current.Config.Cmd == traefik_command_args
+          and traefik_restore_current.HostConfig.NetworkMode == 'host'
+          and traefik_restore_current.Mounts == traefik_replacement_details.Mounts
+        )
+    fail_msg: "Traefik restoration refused: current runtime ownership changed; partial effect requires observation"
+  when: traefik_replacement_started | default(false)
+  no_log: true
+
+- name: Restore exact prior Traefik runtime
+  block:
+    - name: Recheck exact runtime identity immediately before restoration
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ restore_name }}"]
+      register: traefik_restore_recheck
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a changed restoration generation
+      ansible.builtin.assert:
+        that:
+          - current.get('Id') == (traefik_restore_current | default({}, true)).get('Id')
+        fail_msg: runtime_changed_before_restore
+      vars:
+        current: "{{ (traefik_restore_recheck.stdout | from_json)[0] if traefik_restore_recheck.rc == 0 else {} }}"
+
+    - name: Remove the failed replacement before reconstructing the prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, rm, -f, "{{ restore_name }}"]
+      failed_when: false
+      changed_when: true
+
+    - name: Initialize exact prior runtime create arguments
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ ['docker', 'create', '--name', restore_name] }}"
+
+    - name: Preserve prior restart, network, workdir, user and entrypoint
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + item.arguments }}"
+      loop:
+        - enabled: "{{ restart_name != 'no' }}"
+          arguments: "{{ ['--restart', restart_name ~ (':' ~ restart_retries | string if restart_name == 'on-failure' and restart_retries else '')] }}"
+        - enabled: "{{ restore_host.get('NetworkMode') and restore_host.NetworkMode != 'default' }}"
+          arguments: "{{ ['--network', restore_host.get('NetworkMode')] }}"
+        - enabled: "{{ (restore_config.get('WorkingDir') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--workdir', restore_config.get('WorkingDir')] }}"
+        - enabled: "{{ (restore_config.get('User') | default('', true) | length) > 0 }}"
+          arguments: "{{ ['--user', restore_config.get('User')] }}"
+        - enabled: "{{ restore_config.get('Entrypoint') | default([], true) | length > 0 }}"
+          arguments: "{{ ['--entrypoint', (restore_config.get('Entrypoint') | default([none], true))[0]] }}"
+      when: item.enabled | bool
+
+    - name: Preserve prior environment values
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--env', item] }}"
+      loop: "{{ restore_config.get('Env') | default([], true) }}"
+
+    - name: Preserve sorted prior labels
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--label', item.key ~ '=' ~ item.value] }}"
+      loop: "{{ restore_config.get('Labels') | default({}, true) | dict2items | sort(attribute='key', case_sensitive=true) }}"
+
+    - name: Preserve prior bind mounts
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: "{{ traefik_restore_create_argv + ['--volume', item] }}"
+      loop: "{{ restore_host.get('Binds') | default([], true) }}"
+
+    - name: Require valid prior port binding lists
+      ansible.builtin.assert:
+        that:
+          - item.value is sequence and item.value is not string and item.value is not mapping
+          - "'/' in item.key"
+        fail_msg: prior_port_bindings_invalid
+      loop: "{{ restore_host.get('PortBindings') | default({}, true) | dict2items }}"
+
+    - name: Preserve sorted prior ports with IPv6 brackets
+      ansible.builtin.set_fact:
+        traefik_restore_create_argv: >-
+          {{ traefik_restore_create_argv + ['--publish',
+             (('[' ~ host_ip ~ ']' if ':' in host_ip and not host_ip.startswith('[') else host_ip) ~ ':' if host_ip else '')
+             ~ (item.1.get('HostPort') | default('', true) | string) ~ ':' ~ item.0.key] }}
+      vars:
+        host_ip: "{{ item.1.get('HostIp') | default('', true) | string }}"
+      loop: "{{ restore_host.get('PortBindings') | default({}, true) | dict2items | sort(attribute='key', case_sensitive=true) | subelements('value') }}"
+
+    - name: Require the exact prior image
+      ansible.builtin.assert:
+        that:
+          - restore_config.get('Image') is string and restore_config.Image | length > 0
+        fail_msg: prior_image_invalid
+
+    - name: Recreate the exact prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: >-
+          {{ traefik_restore_create_argv + [restore_config.Image]
+             + (restore_config.Cmd | map('string') | list if restore_config.get('Cmd') is sequence
+                and restore_config.get('Cmd') is not string and restore_config.get('Cmd') is not mapping
+                else [restore_config.Cmd] if restore_config.get('Cmd') is string and restore_config.Cmd else []) }}
+      changed_when: true
+
+    - name: Start the prior runtime when its saved state requires it
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, start, "{{ restore_name }}"]
+      changed_when: true
+      when: restore_status in ['running', 'paused', 'exited']
+
+    - name: Restore the saved paused or exited state
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: "{{ ['docker', 'pause' if restore_status == 'paused' else 'stop', restore_name] }}"
+      changed_when: true
+      when: restore_status in ['paused', 'exited']
+
+    - name: Inspect the reconstructed prior runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ restore_name }}"]
+      register: traefik_restore_result
+      changed_when: false
+
+    - name: Verify exact prior runtime configuration and state
+      ansible.builtin.assert:
+        that:
+          - current_config.get(item) == restore_config.get(item)
+        fail_msg: prior_runtime_restore_mismatch
+      vars:
+        current_config: "{{ (traefik_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
+      loop: [Image, Cmd, Entrypoint, Labels, Env, User, WorkingDir]
+
+    - name: Verify exact prior host configuration
+      ansible.builtin.assert:
+        that:
+          - current_host.get('NetworkMode') == restore_host.get('NetworkMode')
+          - current_host.get('RestartPolicy') == restore_host.get('RestartPolicy')
+          - current_host.get('Binds') | default([], true) | sort(case_sensitive=true) == restore_host.get('Binds') | default([], true) | sort(case_sensitive=true)
+          - current_host.get('PortBindings') | default({}, true) == restore_host.get('PortBindings') | default({}, true)
+          - current.get('State', {}).get('Status') == restore_status
+        fail_msg: prior_runtime_restore_mismatch
+      vars:
+        current: "{{ (traefik_restore_result.stdout | from_json)[0] }}"
+        current_host: "{{ current.HostConfig | default({}, true) }}"
+  vars:
+    restore_name: "{{ traefik_prior_runtime.get('Name', '').lstrip('/') or traefik_container_name }}"
+    restore_config: "{{ traefik_prior_runtime.Config | default({}, true) }}"
+    restore_host: "{{ traefik_prior_runtime.HostConfig | default({}, true) }}"
+    restore_status: "{{ (traefik_prior_runtime.State | default({}, true)).get('Status') }}"
+    restart_name: "{{ (restore_host.RestartPolicy | default({}, true)).get('Name') | default('no', true) }}"
+    restart_retries: "{{ (restore_host.RestartPolicy | default({}, true)).get('MaximumRetryCount') }}"
+  when:
+    - traefik_replacement_started | default(false)
+    - traefik_prior_runtime_present
+    - traefik_restore_current is none or traefik_restore_current.Id != traefik_prior_runtime.Id
+  no_log: true
+
+- name: Remove failed fresh Traefik replacement
+  block:
+    - name: Recheck exact runtime identity immediately before fresh cleanup
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ traefik_container_name }}"]
+      register: traefik_fresh_recheck
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a changed fresh runtime generation
+      ansible.builtin.assert:
+        that:
+          - current.get('Id') == (traefik_restore_current | default({}, true)).get('Id')
+        fail_msg: runtime_changed_before_cleanup
+      vars:
+        current: "{{ (traefik_fresh_recheck.stdout | from_json)[0] if traefik_fresh_recheck.rc == 0 else {} }}"
+
+    - name: Remove only the observed failed fresh runtime
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, rm, -f, "{{ traefik_container_name }}"]
+      changed_when: true
+      when: traefik_fresh_recheck.rc == 0
+
+    - name: Require the failed fresh runtime to be absent
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: [docker, inspect, "{{ traefik_container_name }}"]
+      register: traefik_fresh_cleanup_result
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse remaining failed fresh runtime presence
+      ansible.builtin.assert:
+        that: traefik_fresh_cleanup_result.rc != 0
+        fail_msg: failed_fresh_traefik_still_present
+  when:
+    - traefik_replacement_started | default(false)
+    - not traefik_prior_runtime_present
+  no_log: true
+
+- name: Mark exact runtime restoration complete
+  set_fact:
+    traefik_runtime_restored: true
+  when: traefik_replacement_started | default(false)
+  no_log: true

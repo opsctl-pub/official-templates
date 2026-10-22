@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "do_droplet",
+  "engine": "opentofu",
+  "documentation": "README.md"
+}

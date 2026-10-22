@@ -1,0 +1,97 @@
+---
+- name: Validate approved gateway exclusion inputs
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Skip gateway exclusion in simulation
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+
+    - name: Require exact nonempty serving counterpart and captured route
+      ansible.builtin.assert:
+        that:
+          - phase is defined
+          - phase in ['converge', 'gateway']
+          - retiring_backend is string
+          - remaining_backends is sequence
+          - remaining_backends is not string
+          - remaining_backends | length > 0
+          - remaining_backends | length <= 64
+          - remaining_backends | unique | list | length == remaining_backends | length
+          - retiring_backend not in remaining_backends
+          - expected_route is mapping
+          - expected_route.presence == 'present'
+          - phase != 'converge' or retiring_backend in expected_route.backends
+          - phase != 'converge' or (expected_route.backends | difference([retiring_backend]) | sort) == (remaining_backends | sort)
+          - phase != 'converge' or route_state == 'present'
+          - phase != 'converge' or (traefik_backends | map(attribute='url') | list | sort) == (remaining_backends | sort)
+        fail_msg: Routing procedure inputs are invalid. Refresh the review.
+      no_log: true
+
+- import_playbook: traefik_route_converge.yml
+  when: phase == 'converge' and not (simulate | default(false))
+
+- name: Observe actual gateway exclusion without claiming runtime drain
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_container_name: traefik
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+    route_file_path: "{{ traefik_dynamic_dir }}/deployment-{{ deployment_id }}.yml"
+    route_key: "deployment-{{ deployment_id }}"
+  tasks:
+    - name: Skip gateway observation in simulation
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+
+    - name: Qualify exact observed route and backend exclusion
+      block:
+        - name: Read actual configured native route
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../../../tasks/traefik_route_observation.yml"
+
+        - name: Require live configured serving counterparts and exclusion
+          ansible.builtin.assert:
+            that:
+              - route_observation.outcome == 'succeeded'
+              - route_observation.presence == 'present'
+              - route_observation.backends | sort == remaining_backends | sort
+              - retiring_backend not in route_observation.backends
+              - phase != 'gateway' or route_observation_base == expected_route
+              - phase != 'converge' or route_observation.hosts == (route_hosts | sort)
+              - phase != 'converge' or route_observation.route_port == route_port
+              - phase != 'converge' or route_observation.https == route_https
+              - phase != 'converge' or route_observation.redirect_http_to_https == redirect_http_to_https
+              - phase != 'converge' or route_observation.middlewares == (route_middlewares | default([]))
+            fail_msg: Server configuration changed. Refresh its observation before retrying.
+          no_log: true
+
+        - name: Return plain configured exclusion and complete native route facts
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {
+                'deployment_route_observation': route_observation,
+                'connection_drain': {'outcome': 'succeeded',
+                  'observed_at': route_observation.observed_at, 'phase': 'gateway',
+                  'state': 'clear', 'remaining_backends': route_observation.backends,
+                  'container_id': none, 'active_inbound_connections': none}} | to_json }}
+      rescue:
+        - name: Timestamp unknown gateway exclusion
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+          register: gateway_failure_time
+          changed_when: false
+
+        - name: Report unknown exclusion without native diagnostic leakage
+          ansible.builtin.debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'connection_drain': {
+                'outcome': 'incomplete', 'observed_at': gateway_failure_time.stdout,
+                'phase': 'gateway', 'state': 'unknown', 'remaining_backends': none,
+                'container_id': none, 'active_inbound_connections': none},
+                'procedure_error': {'phase': 'observe', 'code': 'route_observation_incomplete'}} | to_json }}
+
+        - name: Refuse unqualified gateway exclusion
+          ansible.builtin.fail:
+            msg: Route state could not be observed. Resolve connectivity or native configuration.

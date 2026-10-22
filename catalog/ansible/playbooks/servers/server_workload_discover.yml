@@ -1,0 +1,37 @@
+---
+- name: Read existing Docker workloads without adoption or mutation
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Require the private controller destination and bounded request
+      ansible.builtin.assert:
+        that:
+          - discovery_result_path is defined
+          - discovery_result_path is string
+          - discovery_result_path is match('^/')
+          - discovery_selection is mapping
+          - discovery_limits is mapping
+        fail_msg: Discovery requires bounded inputs and its private controller destination.
+      no_log: true
+
+    - name: Project Docker facts on the selected Server
+      ansible.builtin.script:
+        cmd: >-
+          ../../scripts/server_workload_discover.py
+          --selection {{ discovery_selection | to_json | quote }}
+          --limits {{ discovery_limits | to_json | quote }}
+        executable: python3
+      register: discovery_projection
+      changed_when: false
+      no_log: true
+
+    - name: Deliver only projected facts to the invocation-private channel
+      ansible.builtin.copy:
+        dest: "{{ discovery_result_path }}"
+        content: "{{ discovery_projection.stdout }}"
+        mode: '0600'
+      delegate_to: 127.0.0.1
+      connection: local
+      become: false
+      no_log: true

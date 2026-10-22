@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "server_workload_discover",
+  "engine": "ansible",
+  "documentation": "server_workload_discover.md"
+}

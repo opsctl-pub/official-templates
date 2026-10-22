@@ -1,0 +1,1208 @@
+---
+- name: Deploy container to target server
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('app') }}"
+    router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
+    health_path: "{{ app_health_path | default('/health') }}"
+    host_health_port: "{{ app_health_port | default((app_ports | default([]) | first) | default(none)) }}"
+    managed_image_resources: "{{ app_previous_container_id is defined or app_secret_file_incarnation is defined or app_secret_file_cleanup_incarnation is defined or (app_mounts | default([]) | length > 0) or (app_networks | default([]) | length > 0) or (app_observe_volumes | default([]) | length > 0) or (app_observe_networks | default([]) | length > 0) }}"
+    image_secret_mounts: []
+    exposure_mode: "{{ backend_exposure_mode | default('host') }}"
+    loopback_backend_enabled: "{{ exposure_mode == 'loopback' }}"
+    source_dual_backend_enabled: "{{ exposure_mode == 'loopback_wireguard' }}"
+    traefik_enabled: "{{ (app_traefik_enabled | default(false) | bool) and not loopback_backend_enabled }}"
+    traefik_hosts: "{{ app_traefik_hosts | default(([app_traefik_host] if (app_traefik_host is defined and (app_traefik_host | string | length) > 0) else []), true) }}"
+    traefik_rule: >-
+      {{ traefik_hosts | map('regex_replace', '^(.*)$', 'Host(`\1`)') | join(' || ') }}
+    wireguard_backend_enabled: "{{ exposure_mode == 'wireguard' }}"
+    backend_wireguard_ip: "{{ wireguard_ip | default('') }}"
+    backend_route_port: "{{ route_port | default(None, true) }}"
+    backend_container_port: "{{ container_port | default(None, true) }}"
+    effective_backend_container_port: "{{ backend_container_port if backend_container_port is not none else ((app_container_ports[0]) if (app_container_ports is defined and (app_container_ports | length > 0)) else backend_route_port) }}"
+    # Keep these conditional expressions on one line: folded YAML can add whitespace to their values.
+    health_mode: "{{ app_health_mode | default('auto') }}"
+    effective_health_mode: "{{ 'container' if (traefik_enabled and health_mode == 'auto') else ('traefik' if (health_mode == 'traefik' and traefik_enabled) else health_mode) }}"
+    container_health_port: "{{ app_health_container_port | default(None, true) }}"
+    health_container_path: "{{ app_health_container_path | default(health_path) }}"
+    health_url_local: "http://127.0.0.1:{{ host_health_port }}{{ health_path }}"
+    health_check_target: "{{ ('http://127.0.0.1:' ~ host_health_port ~ health_path) if effective_health_mode == 'host' else (('container://' ~ container_name ~ health_container_path) if effective_health_mode in ['container', 'traefik'] else '') }}"
+    published_ports: []
+    host_port_preflight_enabled: "{{ not managed_image_resources and ((not wireguard_backend_enabled and not traefik_enabled) or source_dual_backend_enabled) }}"
+    traefik_middlewares: "{{ app_traefik_middlewares | default([]) }}"
+    traefik_label_map: {}
+    opsctl_label_map:
+      "com.opsctl.managed": "true"
+      "com.opsctl.org_id": "{{ app_org_id }}"
+      "com.opsctl.project_id": "{{ app_project_id | default('', true) }}"
+      "com.opsctl.app": "{{ app_slug | default(container_name) }}"
+      "com.opsctl.deployment_id": "{{ app_deployment_id }}"
+    final_label_map: "{{ opsctl_label_map }}"
+    deploy_host_ports: []
+    health_strategy: "running"
+    source_replacement_removed: false
+    source_replacement_recheck_complete: false
+    source_replacement_recheck_failed: false
+    source_replacement_original: {}
+  pre_tasks:
+    - name: Validate managed runtime identity before mutation
+      assert:
+        that:
+          - app_managed is defined
+          - app_managed is boolean
+          - app_managed
+          - app_org_id is defined
+          - app_org_id is string
+          - app_org_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - app_deployment_id is defined
+          - app_deployment_id is string
+          - app_deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        fail_msg: "The organization or Deployment identity is invalid. Refresh the deployment review."
+
+    - name: Validate backend exposure mode before mutation
+      assert:
+        that:
+          - exposure_mode in ['host', 'wireguard', 'loopback', 'loopback_wireguard']
+        fail_msg: "backend_exposure_mode must be host, wireguard, loopback, or loopback_wireguard"
+
+    - name: Validate loopback backend mapping before mutation
+      assert:
+        that:
+          - backend_route_port is not none
+          - backend_container_port is not none
+          - (backend_route_port | int) > 0
+          - (backend_route_port | int) <= 65535
+          - (backend_container_port | int) > 0
+          - (backend_container_port | int) <= 65535
+        fail_msg: "route_port and container_port are required for backend_exposure_mode=loopback"
+      when: loopback_backend_enabled or source_dual_backend_enabled
+
+    - name: Validate native managed image inputs without legacy replacement
+      ansible.builtin.assert:
+        that:
+          - source_replacement is not defined
+          - not (replace_conflicts | default(false) | bool)
+          - app_previous_container_id | default(none) is none or app_previous_container_id is match('^[0-9a-f]{64}$')
+          - app_memory_bytes | default(none) is none or (app_memory_bytes is integer and app_memory_bytes > 0)
+          - app_health_exec | default(none) is none or (app_health_exec is sequence and app_health_exec is not string and app_health_exec | length > 0 and app_health_exec | length <= 128)
+          - app_mounts | default([]) | length <= 128
+          - app_networks | default([]) | length <= 64
+        fail_msg: Native managed image inputs are invalid.
+      when: managed_image_resources
+      no_log: true
+  tasks:
+    - name: Ensure container health port derived when missing
+      set_fact:
+        container_health_port: "{{ app_container_ports[0] }}"
+      when:
+        - container_health_port is none
+        - app_container_ports is defined
+        - (app_container_ports | length) > 0
+
+    - name: Validate WireGuard backend exposure inputs
+      assert:
+        that:
+          - backend_wireguard_ip | string | length > 0
+          - backend_route_port is not none
+          - effective_backend_container_port is not none
+        fail_msg: "wireguard_ip, route_port, and container_port are required for backend_exposure_mode=wireguard"
+      when: wireguard_backend_enabled
+
+    - name: Validate combined source backend exposure inputs
+      assert:
+        that:
+          - source_dual_backend_enabled
+          - backend_wireguard_ip | string | length > 0
+          - backend_route_port is not none
+          - effective_backend_container_port is not none
+        fail_msg: "loopback_wireguard exposure requires WireGuard IP, route port, and container port"
+      when: source_dual_backend_enabled
+
+    - name: Derive published ports for combined source backend exposure
+      set_fact:
+        published_ports:
+          - "127.0.0.1:{{ backend_route_port }}:{{ backend_container_port }}"
+          - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
+      when: source_dual_backend_enabled
+
+    - name: Derive published ports for WireGuard backend exposure
+      set_fact:
+        published_ports:
+          - "{{ backend_wireguard_ip }}:{{ backend_route_port }}:{{ effective_backend_container_port }}"
+      when:
+        - wireguard_backend_enabled
+        - not source_dual_backend_enabled
+
+    - name: Derive published port for loopback backend exposure
+      set_fact:
+        published_ports:
+          - "127.0.0.1:{{ backend_route_port }}:{{ backend_container_port }}"
+      when: loopback_backend_enabled
+
+    - name: Derive published ports for Traefik-routed deploy
+      set_fact:
+        published_ports: []
+      when:
+        - not wireguard_backend_enabled
+        - not loopback_backend_enabled
+        - not source_dual_backend_enabled
+        - traefik_enabled
+
+    - name: Derive published ports for direct host exposure
+      set_fact:
+        published_ports: >-
+          {{
+            (app_ports | zip(app_container_ports) | map('join', ':') | list)
+            if (app_container_ports is defined and (app_container_ports | length > 0))
+            else (app_ports | zip(app_ports) | map('join', ':') | list)
+          }}
+      when:
+        - not wireguard_backend_enabled
+        - not loopback_backend_enabled
+        - not source_dual_backend_enabled
+        - not traefik_enabled
+
+    - name: Report container deployment started
+      shell: |
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"running","metadata":{"display_name":"Deploy container","phase":"init"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Report Docker installation started
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"running","metadata":{"display_name":"Install Docker"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Install Docker packages (docker.io)
+      apt:
+        name:
+          - docker.io
+        state: present
+        update_cache: true
+
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Report Docker installation completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{"display_name":"Install Docker"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Capture host ports for baseline preflight
+      set_fact:
+        deploy_host_ports: >-
+          {{
+            [backend_route_port]
+            if (loopback_backend_enabled or source_dual_backend_enabled)
+            else (published_ports | map('regex_search', '^[^:]+') | list)
+          }}
+      when:
+        - host_port_preflight_enabled
+        - (published_ports | length) > 0
+
+    - name: Observe existing managed image backing before replacement
+      ansible.builtin.include_tasks:
+        file: ../../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: inspect
+      when: managed_image_resources
+
+    - name: Check the previous container or verify that it is absent
+      ansible.builtin.assert:
+        that:
+          - image_runtime.observation_complete
+          - >-
+            (image_runtime.container is none and
+             (app_previous_container_id | default(none) is none or image_runtime.previous_container_absent)) or
+            (image_runtime.container is not none and app_previous_container_id | default(none) is not none and
+             image_runtime.container.id == app_previous_container_id)
+          - image_runtime.volumes | rejectattr('presence', 'equalto', 'present') | list | length == 0
+          - image_runtime.networks | rejectattr('presence', 'equalto', 'present') | list | length == 0
+        fail_msg: Managed runtime or native backing changed. Refresh its observation before deployment.
+      when: managed_image_resources
+      no_log: true
+
+    - name: Require every mount to name an observed native volume
+      ansible.builtin.assert:
+        that:
+          - managed_mount.source in (image_runtime.volumes | map(attribute='name') | list)
+          - managed_mount.target is string and managed_mount.target.startswith('/')
+          - managed_mount.read_only is boolean
+          - >-
+            managed_mount.read_only or
+            (image_runtime.volumes | selectattr('name', 'equalto', managed_mount.source) | first).users |
+            rejectattr('id', 'equalto', app_previous_container_id | default('')) |
+            selectattr('state', 'equalto', 'running') | selectattr('read_only', 'equalto', false) | list | length == 0
+        fail_msg: Managed volume is unavailable or has another running writer.
+      loop: "{{ app_mounts | default([]) }}"
+      loop_control:
+        loop_var: managed_mount
+        label: managed mount
+      when: managed_image_resources
+      no_log: true
+
+    - name: Retain the exact predecessor file incarnation
+      ansible.builtin.set_fact:
+        image_previous_secret_incarnation: >-
+          {{ (image_container_info.container.Config.Labels | default({}, true)).get('com.opsctl.secret_files')
+            if image_container_info.exists else (app_secret_file_cleanup_incarnation | default(none)) }}
+      when: managed_image_resources
+      no_log: true
+
+    - name: Refuse changed file lifetime ownership before replacement
+      ansible.builtin.assert:
+        that:
+          - image_previous_secret_incarnation is none or image_previous_secret_incarnation is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - app_secret_file_cleanup_incarnation is not defined or app_secret_file_cleanup_incarnation == image_previous_secret_incarnation
+          - app_secret_file_incarnation is not defined or app_previous_container_id is defined
+        fail_msg: Workload secret file lifetime ownership changed.
+      when: managed_image_resources
+      no_log: true
+
+    - name: Require every requested network to match an observed native identity
+      ansible.builtin.assert:
+        that:
+          - >-
+            image_runtime.networks | selectattr('id', 'equalto', managed_network.id) |
+            selectattr('name', 'equalto', managed_network.name) | list | length == 1
+          - managed_network.aliases | default([]) is sequence and managed_network.aliases | default([]) is not string
+          - managed_network.aliases | default([]) | length <= 128
+        fail_msg: Managed network is unavailable or changed.
+      loop: "{{ app_networks | default([]) }}"
+      loop_control:
+        loop_var: managed_network
+        label: managed network
+      when: managed_image_resources
+      no_log: true
+
+    - name: Map only qualified native mounts and networks
+      ansible.builtin.set_fact:
+        image_native_mounts: >-
+          {%- set mounts = namespace(values=[]) -%}
+          {%- for mount in app_mounts | default([]) -%}
+          {%- set mounts.values = mounts.values + [{'type': 'volume', 'source': mount.source,
+            'target': mount.target, 'read_only': mount.read_only}] -%}
+          {%- endfor -%}
+          {{ mounts.values }}
+        image_native_networks: >-
+          {%- set networks = namespace(values=[]) -%}
+          {%- for network in app_networks | default([]) -%}
+          {%- set networks.values = networks.values + [{'name': network.name, 'aliases': network.aliases | default([])}] -%}
+          {%- endfor -%}
+          {{ networks.values }}
+      no_log: true
+
+    - name: Report port checks started
+      shell: |
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"running","metadata":{"display_name":"Check ports","ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Detect host port conflicts
+      block:
+        - name: Observe published ports for running containers
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - docker
+              - ps
+              - --format
+              - '{% raw %}{{if .Names}}{{.Names}}{{else}}{{.ID}}{{end}}\t{{.Ports}}{% endraw %}'
+          register: port_conflicts_result
+          changed_when: false
+
+        - name: Build conflict entries from the requested published ports
+          block: &container_port_conflict_tasks
+            - name: Initialize this port observation
+              ansible.builtin.set_fact:
+                container_port_scan_entries: []
+                container_port_scan_owned: false
+
+            - name: Retain matching host ports in observation order
+              ansible.builtin.set_fact:
+                container_port_scan_entries: "{{ container_port_scan_entries + [{'name': row[0], 'ports': matching_ports}] }}"
+              vars:
+                row: "{{ item.split('\t', 1) }}"
+                listening_ports: "{{ (row[1] | default('')) | regex_findall(':([0-9]+)->') | map('int') | list }}"
+                matching_ports: "{{ deploy_host_ports | select('in', listening_ports) | unique(case_sensitive=true) | sort(case_sensitive=true) | list }}"
+              loop: "{{ port_scan_stdout.splitlines() }}"
+              when:
+                - row[0] | length > 0
+                - matching_ports | length > 0
+
+            - name: Recheck ownership of a conflicting target container
+              block:
+                - name: Inspect the target before excluding its own published ports
+                  ansible.builtin.command:
+                    expand_argument_vars: false
+                    argv: [docker, inspect, "{{ container_name }}"]
+                  register: container_port_scan_target
+                  changed_when: false
+                  no_log: true
+
+                - name: Qualify the target's managed organization, application and optional Project
+                  ansible.builtin.set_fact:
+                    container_port_scan_owned: >-
+                      {{ labels.get('com.opsctl.managed') == 'true'
+                         and labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+                         and labels.get('com.opsctl.app') == (app_slug | default(container_name))
+                         and (not (app_project_id | default(''))
+                              or labels.get('com.opsctl.project_id') == app_project_id) }}
+                  vars:
+                    labels: "{{ ((container_port_scan_target.stdout | from_json)[0].Config | default({}, true)).get('Labels') | default({}, true) }}"
+                  no_log: true
+              rescue:
+                - name: Keep the target conflict when ownership cannot be established
+                  ansible.builtin.set_fact:
+                    container_port_scan_owned: false
+              when:
+                - port_scan_exclude_owned
+                - container_name in (container_port_scan_entries | map(attribute='name') | list)
+
+            - name: Exclude only a qualified owned target
+              ansible.builtin.set_fact:
+                container_port_scan_entries: "{{ container_port_scan_entries | rejectattr('name', 'equalto', container_name) | list }}"
+              when: container_port_scan_owned
+          vars:
+            port_scan_stdout: "{{ port_conflicts_result.stdout }}"
+            port_scan_exclude_owned: "{{ not (source_replacement | default(none)) }}"
+
+        - name: Retain the native conflict list for the existing result consumer
+          ansible.builtin.set_fact:
+            port_conflicts_result: "{{ port_conflicts_result | combine({'stdout': container_port_scan_entries | to_json}) }}"
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Parse port conflict results
+      set_fact:
+        port_conflict_entries: "{{ port_conflicts_result.stdout | default('[]') | from_json }}"
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Initialize post-conflict list
+      set_fact:
+        port_conflict_entries_post: "{{ [] if (source_replacement is defined) else (port_conflict_entries | default([])) }}"
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Record conflicting container names
+      set_fact:
+        port_conflict_names: "{{ port_conflict_entries | map(attribute='name') | list }}"
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+
+    - name: Fail on port conflicts without override
+      block:
+        - name: Report port checks failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"display_name":"Check ports","ports":%s,"conflicts":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_names | default([]) | to_json }}'
+          args:
+            executable: /bin/sh
+        - name: Abort due to port conflict
+          fail:
+            msg: "port_conflict"
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - (
+            source_replacement is not defined
+            or not (replace_conflicts | default(false) | bool)
+          )
+        - (
+            loopback_backend_enabled
+            or source_dual_backend_enabled
+            or not (replace_conflicts | default(false) | bool)
+          )
+
+    - name: Determine removable conflict containers
+      block:
+        - name: Initialize the removable conflict observation
+          ansible.builtin.set_fact:
+            removable_conflict_payload: []
+            removable_conflict_names: []
+
+        - name: Inspect only the conflicting container names
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: "{{ ['docker', 'inspect'] + conflict_names }}"
+          vars:
+            conflict_names: "{{ port_conflict_entries | selectattr('name', 'defined') | map(attribute='name') | select | list }}"
+          register: removable_conflict_inspection
+          changed_when: false
+          no_log: true
+          when: conflict_names | length > 0
+
+        - name: Decode the observed conflicting containers
+          block:
+            - name: Read conflicting container metadata
+              ansible.builtin.set_fact:
+                removable_conflict_payload: "{{ removable_conflict_inspection.stdout | from_json }}"
+              no_log: true
+          rescue:
+            - name: Retain no removable containers after malformed inspection JSON
+              ansible.builtin.set_fact:
+                removable_conflict_payload: []
+          when: removable_conflict_inspection is not skipped
+
+        - name: Retain only managed conflicts in the requested organization and optional Project
+          ansible.builtin.set_fact:
+            removable_conflict_names: "{{ removable_conflict_names + [item.get('Name', '').lstrip('/')] }}"
+          vars:
+            labels: "{{ item.get('Config', {}).get('Labels') | default({}, true) }}"
+          loop: "{{ removable_conflict_payload }}"
+          when:
+            - labels.get('com.opsctl.managed') == 'true'
+            - labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+            - not (app_project_id | default('')) or labels.get('com.opsctl.project_id') == app_project_id
+            - item.get('Name', '').lstrip('/') | length > 0
+          no_log: true
+
+        - name: Retain the native removable conflict result
+          ansible.builtin.set_fact:
+            removable_conflicts: "{{ {'rc': 0, 'stdout': removable_conflict_names | sort(case_sensitive=true) | to_json} }}"
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is not defined
+
+    - name: Parse removable container list
+      set_fact:
+        removable_containers: "{{ removable_conflicts.stdout | default('[]') | from_json }}"
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is not defined
+
+    - name: Validate exact source replacement container
+      block:
+        - name: Require the complete source replacement identity
+          ansible.builtin.assert:
+            that:
+              - source_replacement is mapping
+              - source_replacement.keys() | sort(case_sensitive=true) == required_replacement_fields | sort(case_sensitive=true)
+            fail_msg: source_replacement_identity_invalid
+          vars:
+            required_replacement_fields:
+              - intent
+              - container_name
+              - app_slug
+              - org_id
+              - project_id
+              - deployment_id
+              - image
+              - current_exposure_modes
+              - exposure_mode
+              - wireguard_ip
+              - route_port
+              - container_port
+              - replace_conflicts
+
+        - name: Require exact replacement intent
+          ansible.builtin.assert:
+            that: source_replacement.intent == 'replace_exact_source_container'
+            fail_msg: source_replacement_intent_invalid
+
+        - name: Require the strict replacement flag
+          ansible.builtin.assert:
+            that: source_replacement.replace_conflicts is sameas true
+            fail_msg: source_replacement_flag_invalid
+
+        - name: Require canonical source replacement UUIDs
+          ansible.builtin.assert:
+            that: item is string and item | length == 36 and item is match(canonical_uuid)
+            fail_msg: source_replacement_identity_invalid
+          vars:
+            canonical_uuid: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          loop: "{{ [source_replacement.org_id, source_replacement.deployment_id] + ([source_replacement.project_id] if source_replacement.project_id is not none else []) }}"
+
+        - name: Require exactly the selected conflicting source container
+          ansible.builtin.assert:
+            that:
+              - port_conflict_entries | length == 1
+              - port_conflict_entries[0].get('name') == source_replacement.container_name
+            fail_msg: source_replacement_conflict_set_invalid
+
+        - name: Inspect the exact source replacement container
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, inspect, "{{ source_replacement.container_name }}"]
+          register: source_replacement_inspection
+          changed_when: false
+
+        - name: Decode the exact source replacement inspection
+          block:
+            - name: Read the original source runtime
+              ansible.builtin.set_fact:
+                source_replacement_runtime: "{{ (source_replacement_inspection.stdout | from_json)[0] }}"
+          rescue:
+            - name: Refuse an invalid source inspection
+              ansible.builtin.fail:
+                msg: source_replacement_inspect_invalid
+
+        - name: Require an OpsCtl-owned source
+          ansible.builtin.assert:
+            that: replacement_labels.get('com.opsctl.managed') == 'true'
+            fail_msg: source_replacement_not_opsctl_owned
+
+        - name: Refuse a different deployment label
+          ansible.builtin.assert:
+            that:
+              - replacement_labels.get('com.opsctl.deployment_id') in [none, '', source_replacement.deployment_id]
+            fail_msg: source_replacement_deployment_mismatch
+
+        - name: Require exact source organization, application and applicable Project
+          ansible.builtin.assert:
+            that:
+              - replacement_labels.get('com.opsctl.org_id') == source_replacement.org_id
+              - replacement_labels.get('com.opsctl.app') == source_replacement.app_slug
+              - >-
+                replacement_labels.get('com.opsctl.deployment_id') == source_replacement.deployment_id
+                or (replacement_labels.get('com.opsctl.project_id') or none) == source_replacement.project_id
+            fail_msg: source_replacement_identity_mismatch
+
+        - name: Require the exact source image
+          ansible.builtin.assert:
+            that: replacement_config.get('Image') == source_replacement.image
+            fail_msg: source_replacement_image_mismatch
+
+        - name: Require the supported original exposure modes
+          ansible.builtin.assert:
+            that: source_replacement.current_exposure_modes == ['loopback', 'loopback_wireguard']
+            fail_msg: source_replacement_current_exposure_modes_invalid
+
+        - name: Require the exact requested replacement exposure
+          ansible.builtin.assert:
+            that: source_replacement.exposure_mode == 'loopback_wireguard'
+            fail_msg: source_replacement_exposure_invalid
+
+        - name: Require a mapping of actual source ports
+          ansible.builtin.assert:
+            that: replacement_ports is mapping
+            fail_msg: source_replacement_bindings_invalid
+
+        - name: Require only the expected TCP container port and binding lists
+          ansible.builtin.assert:
+            that:
+              - item.key == (source_replacement.container_port | string) ~ '/tcp'
+              - item.value is sequence and item.value is not string and item.value is not mapping
+            fail_msg: source_replacement_bindings_invalid
+          loop: "{{ replacement_ports | dict2items }}"
+
+        - name: Require actual nonempty host addresses and valid integer ports
+          ansible.builtin.assert:
+            that:
+              - item.1 is mapping
+              - item.1.get('HostIp') is string and item.1.HostIp | trim | length > 0
+              - item.1.get('HostPort') | string | trim is match('^[+-]?\\d+$')
+              - item.1.get('HostPort') | int >= 1
+              - item.1.get('HostPort') | int <= 65535
+            fail_msg: source_replacement_bindings_invalid
+          loop: "{{ replacement_ports | dict2items | subelements('value') }}"
+
+        - name: Initialize exact source binding comparison
+          ansible.builtin.set_fact:
+            source_replacement_actual_bindings: []
+
+        - name: Retain actual source bindings without inferring interfaces
+          ansible.builtin.set_fact:
+            source_replacement_actual_bindings: >-
+              {{ source_replacement_actual_bindings + [item.1.HostIp ~ ':'
+                 ~ (item.1.HostPort | int | string) ~ ':' ~ (source_replacement.container_port | string)] }}
+          loop: "{{ replacement_ports | dict2items | subelements('value') }}"
+
+        - name: Require exactly the allowed loopback or dual source bindings
+          ansible.builtin.assert:
+            that:
+              - source_replacement_actual_bindings | unique(case_sensitive=true) | sort(case_sensitive=true) | list in [[loopback_binding], [loopback_binding, wireguard_binding] | unique(case_sensitive=true) | sort(case_sensitive=true) | list]
+            fail_msg: source_replacement_bindings_mismatch
+          vars:
+            loopback_binding: "{{ '127.0.0.1:' ~ source_replacement.route_port ~ ':' ~ source_replacement.container_port }}"
+            wireguard_binding: "{{ source_replacement.wireguard_ip ~ ':' ~ source_replacement.route_port ~ ':' ~ source_replacement.container_port }}"
+
+        - name: Retain the validated exact source and original configuration
+          ansible.builtin.set_fact:
+            source_replacement_validation: >-
+              {{ {'rc': 0, 'stdout': {'containers': [source_replacement.container_name],
+                 'original': {'name': source_replacement.container_name, 'config': replacement_config,
+                              'host_config': source_replacement_runtime.get('HostConfig') or {}}} | to_json} }}
+      vars:
+        replacement_config: "{{ source_replacement_runtime.get('Config') | default({}, true) }}"
+        replacement_labels: "{{ replacement_config.get('Labels') | default({}, true) }}"
+        replacement_ports: "{{ (source_replacement_runtime.get('NetworkSettings') | default({}, true)).get('Ports') | default({}, true) }}"
+      no_log: true
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is defined
+
+    - name: Parse exact source replacement container list
+      set_fact:
+        removable_containers: "{{ (source_replacement_validation.stdout | default('{}') | from_json).containers }}"
+        source_replacement_original: "{{ (source_replacement_validation.stdout | default('{}') | from_json).original }}"
+        source_replacement_verified: true
+      no_log: true
+      when:
+        - host_port_preflight_enabled
+        - (port_conflict_entries | length) > 0
+        - replace_conflicts | default(false) | bool
+        - source_replacement is defined
+
+    - name: Prepare image through the shared authentication and platform boundary
+      ansible.builtin.include_tasks: ../../tasks/container_image_prepare.yml
+
+    - name: Mark source replacement transaction active
+      set_fact:
+        source_replacement_removed: true
+      when:
+        - source_replacement_verified | default(false) | bool
+
+    - name: Remove conflicting container "{{ item }}"
+      command: docker rm -f {{ item }}
+      loop: "{{ removable_containers | default([]) }}"
+      when:
+        - host_port_preflight_enabled
+        - replace_conflicts | default(false) | bool
+        - (removable_containers | default([]) | length) > 0
+
+    - name: Report conflicting containers removed
+      shell: |
+        printf 'OPERATION_STEP={"name":"replace:complete","status":"completed","metadata":{"display_name":"Remove conflicting containers","removed":%s}}\n' '{{ removable_containers | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - host_port_preflight_enabled
+        - replace_conflicts | default(false) | bool
+        - (removable_containers | default([]) | length) > 0
+
+    - name: Re-check host port conflicts after removal
+      block:
+        - name: Observe published ports after conflict removal
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - docker
+              - ps
+              - --format
+              - '{% raw %}{{if .Names}}{{.Names}}{{else}}{{.ID}}{{end}}\t{{.Ports}}{% endraw %}'
+          register: port_conflicts_retry_result
+          changed_when: false
+          failed_when:
+            - port_conflicts_retry_result.rc != 0
+            - not (source_replacement_verified | default(false) | bool)
+
+        - name: Build fresh post-removal conflict entries
+          block: *container_port_conflict_tasks
+          vars:
+            port_scan_stdout: "{{ port_conflicts_retry_result.stdout if port_conflicts_retry_result.rc == 0 else '' }}"
+            port_scan_exclude_owned: true
+
+        - name: Retain the post-removal native conflict result
+          ansible.builtin.set_fact:
+            port_conflicts_retry_result: "{{ port_conflicts_retry_result | combine({'stdout': container_port_scan_entries | to_json}) }}"
+      when:
+        - host_port_preflight_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries | length) > 0
+
+    - name: Parse post-removal conflicts
+      set_fact:
+        port_conflict_entries_post: >-
+          {{
+            (port_conflicts_retry_result.stdout | default('[]') | from_json)
+            if (port_conflicts_retry_result.rc | default(1) | int) == 0
+            else []
+          }}
+        source_replacement_recheck_complete: true
+        source_replacement_recheck_failed: "{{ (port_conflicts_retry_result.rc | default(1) | int) != 0 }}"
+      when:
+        - host_port_preflight_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries | default([]) | length) > 0
+        - (
+            source_replacement_verified | default(false) | bool
+            or (
+              not traefik_enabled
+              and not wireguard_backend_enabled
+              and not source_dual_backend_enabled
+            )
+          )
+
+    - name: Fail when post-removal conflict recheck fails
+      block:
+        - name: Abort after post-removal conflict recheck failure
+          fail:
+            msg: "post_removal_conflict_recheck_failed"
+      rescue:
+        - name: Restore source container after conflict recheck failure
+          ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
+          no_log: true
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
+      when:
+        - source_replacement_verified | default(false) | bool
+        - source_replacement_removed | default(false) | bool
+        - source_replacement_recheck_failed | default(false) | bool
+
+    - name: Fail when conflicts remain after override
+      block:
+        - name: Report remaining port conflicts after removal
+          shell: |
+            printf 'OPERATION_STEP={"name":"preflight:ports","status":"failed","metadata":{"display_name":"Check ports","ports":%s,"conflicts_remaining":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}' '{{ port_conflict_entries_post | map(attribute="name") | list | to_json }}'
+          args:
+            executable: /bin/sh
+        - name: Abort due to remaining port conflicts
+          fail:
+            msg: "port_conflict"
+      rescue:
+        - name: Restore source container after post-removal conflict failure
+          ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
+          no_log: true
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
+      when:
+        - host_port_preflight_enabled
+        - replace_conflicts | default(false) | bool
+        - (port_conflict_entries_post | default([]) | length) > 0
+
+    - name: Require source replacement post-removal recheck
+      block:
+        - name: Abort when source replacement recheck was not completed
+          fail:
+            msg: "post_removal_conflict_recheck_missing"
+      rescue:
+        - name: Restore source container after missing conflict recheck
+          ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
+          no_log: true
+        - name: Abort after source restoration
+          fail:
+            msg: "Source replacement transaction failed and was restored."
+      when:
+        - source_replacement_verified | default(false) | bool
+        - source_replacement_removed | default(false) | bool
+        - not (source_replacement_recheck_complete | default(false) | bool)
+
+    - name: Report port checks completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"preflight:ports","status":"completed","metadata":{"display_name":"Check ports","ports":%s}}\n' '{{ deploy_host_ports | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when:
+        - host_port_preflight_enabled
+        - (deploy_host_ports | length) > 0
+        - (
+            (port_conflict_entries | length == 0)
+            or
+            (
+              replace_conflicts | default(false) | bool
+              and (
+                (
+                  source_replacement_verified | default(false) | bool
+                  and source_replacement_recheck_complete | default(false) | bool
+                  and (port_conflict_entries_post | default([]) | length) == 0
+                )
+                or (
+                  not (source_replacement_verified | default(false) | bool)
+                  and (port_conflict_entries_post | default([]) | length) == 0
+                )
+              )
+            )
+          )
+
+    - name: Build Traefik labels for router "{{ router_name }}"
+      set_fact:
+        traefik_label_map: >-
+          {{
+            {
+              'traefik.enable': 'true',
+              ('traefik.http.routers.' ~ router_name ~ '.rule'): traefik_rule,
+              ('traefik.http.routers.' ~ router_name ~ '.entrypoints'): 'websecure'
+            }
+            | combine(
+                (app_traefik_https | default(true))
+                | ternary(
+                    {('traefik.http.routers.' ~ router_name ~ '.tls'): 'true'},
+                    {}
+                )
+            )
+            | combine(
+                (traefik_middlewares | length > 0)
+                | ternary(
+                    {('traefik.http.routers.' ~ router_name ~ '.middlewares'): (traefik_middlewares | join(','))},
+                    {}
+                )
+            )
+          }}
+      when: traefik_enabled
+
+    - name: Merge OpsControl and Traefik labels
+      set_fact:
+        final_label_map: "{{ opsctl_label_map | combine({'com.opsctl.revision_id': app_revision_id} if app_revision_id is defined else {}) | combine(traefik_label_map) }}"
+      when: traefik_enabled
+
+    - name: Apply baseline OpsControl labels
+      set_fact:
+        final_label_map: "{{ opsctl_label_map | combine({'com.opsctl.revision_id': app_revision_id} if app_revision_id is defined else {}) }}"
+      when: not traefik_enabled
+
+    - name: Report container preparation started
+      shell: |
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"running","metadata":{"display_name":"Prepare container","container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: Discover legacy OpsCtl-managed containers for deployment identity
+      block:
+        - name: Observe names of existing running and stopped containers
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, ps, -a, --format, '{% raw %}{{.Names}}{% endraw %}']
+          register: legacy_container_names
+          changed_when: false
+
+        - name: Initialize legacy deployment observation
+          ansible.builtin.set_fact:
+            legacy_container_payload: []
+            legacy_container_matches: []
+
+        - name: Inspect only the observed legacy candidate names
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: "{{ ['docker', 'inspect'] + legacy_container_names.stdout.splitlines() }}"
+          register: legacy_container_inspection
+          changed_when: false
+          no_log: true
+          when: legacy_container_names.stdout | trim | length > 0
+
+        - name: Decode the observed legacy container metadata
+          block:
+            - name: Read legacy candidate inspection facts
+              ansible.builtin.set_fact:
+                legacy_container_payload: "{{ legacy_container_inspection.stdout | from_json }}"
+              no_log: true
+          rescue:
+            - name: Retain no legacy matches after malformed inspection JSON
+              ansible.builtin.set_fact:
+                legacy_container_payload: []
+          when: legacy_container_inspection is not skipped
+
+        - name: Retain only managed organization, application and optional Project matches
+          ansible.builtin.set_fact:
+            legacy_container_matches: "{{ legacy_container_matches + [candidate_name] }}"
+          vars:
+            candidate_name: "{{ (item.get('Name') or '').lstrip('/') }}"
+            labels: "{{ (item.get('Config') or {}).get('Labels') or {} }}"
+          loop: "{{ legacy_container_payload }}"
+          when:
+            - labels.get('com.opsctl.managed') == 'true'
+            - labels.get('com.opsctl.org_id') == (app_org_id | default(''))
+            - labels.get('com.opsctl.app') == (app_slug | default(container_name))
+            - not (app_project_id | default('')) or labels.get('com.opsctl.project_id') == app_project_id
+            - candidate_name | length > 0
+            - candidate_name != container_name
+          no_log: true
+
+        - name: Retain the sorted unique legacy result
+          ansible.builtin.set_fact:
+            legacy_opsctl_containers_result: "{{ {'rc': 0, 'stdout': legacy_container_matches | unique(case_sensitive=true) | sort(case_sensitive=true) | to_json} }}"
+      when: not managed_image_resources
+
+    - name: Parse legacy OpsCtl containers list
+      set_fact:
+        legacy_opsctl_containers: "{{ legacy_opsctl_containers_result.stdout | default('[]') | from_json }}"
+      when: not managed_image_resources
+
+    - name: Remove legacy OpsCtl-managed container "{{ item }}"
+      command: docker rm -f "{{ item }}"
+      loop: "{{ legacy_opsctl_containers | default([]) }}"
+      when: not managed_image_resources and (legacy_opsctl_containers | default([]) | length) > 0
+
+    - name: Report previous managed containers removed
+      shell: |
+        printf 'OPERATION_STEP={"name":"replace:legacy_cleanup","status":"completed","metadata":{"display_name":"Remove legacy containers","removed":%s}}\n' '{{ legacy_opsctl_containers | default([]) | to_json }}'
+      args:
+        executable: /bin/sh
+      when: not managed_image_resources and (legacy_opsctl_containers | default([]) | length) > 0
+
+    - name: Stage exact readonly workload secret files
+      ansible.builtin.include_tasks:
+        file: ../../tasks/container_secret_files.yml
+        apply:
+          no_log: true
+      vars:
+        workload_secret_action: stage
+        workload_secret_incarnation: "{{ app_secret_file_incarnation }}"
+      when: app_secret_file_incarnation is defined
+
+    - name: Map only the staged file paths into readonly native mounts
+      ansible.builtin.set_fact:
+        image_secret_mounts: >-
+          {%- set mounts = namespace(values=[]) -%}
+          {%- for entry in workload_secret_manifest.files -%}
+          {%- set mounts.values = mounts.values + [{'type': 'bind',
+            'source': workload_secret_directory ~ '/' ~ entry.name,
+            'target': entry.target, 'read_only': true}] -%}
+          {%- endfor -%}
+          {{ mounts.values }}
+        final_label_map: "{{ final_label_map | combine({'com.opsctl.secret_files': app_secret_file_incarnation}) }}"
+      when: app_secret_file_incarnation is defined
+      no_log: true
+
+    - name: Refuse file targets overlapping existing native mounts
+      ansible.builtin.assert:
+        that:
+          - item.0.target != item.1.target and not item.0.target.startswith(item.1.target ~ '/') and not item.1.target.startswith(item.0.target ~ '/')
+        fail_msg: Workload secret file and managed mount destinations overlap.
+      loop: "{{ image_secret_mounts | product(image_native_mounts) | list }}"
+      no_log: true
+
+    - name: Start target container
+      block:
+        - name: Start container "{{ container_name }}"
+          community.docker.docker_container:
+            name: "{{ container_name }}"
+            image: "{{ app_image }}"
+            command: "{{ app_run_command | default(omit) }}"
+            state: started
+            recreate: true
+            restart_policy: unless-stopped
+            detach: true
+            pull: false
+            published_ports: "{{ published_ports }}"
+            env: "{{ app_env | default({}) }}"
+            labels: "{{ final_label_map }}"
+            mounts: "{{ image_native_mounts + image_secret_mounts }}"
+            networks: "{{ image_native_networks }}"
+            networks_cli_compatible: true
+            network_mode: "{{ 'bridge' if image_native_networks | length == 0 else omit }}"
+            memory: "{{ app_memory_bytes | default(omit, true) }}"
+            healthcheck: >-
+              {{ {'test': ['CMD'] + app_health_exec, 'interval': '5s', 'timeout': '5s', 'retries': 20}
+                if app_health_exec | default(none) is not none else omit }}
+          no_log: true
+      rescue:
+        - name: Preserve startup restoration and publish available failed-attempt facts
+          block:
+            - name: Restore source container after container startup failure
+              ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
+              no_log: true
+              when:
+                - source_replacement_verified | default(false) | bool
+                - source_replacement_removed | default(false) | bool
+
+            - name: Collect container startup diagnostics
+              include_tasks: ../../tasks/container_failure_diagnostics.yml
+
+            - name: Report container preparation failed
+              shell: |
+                printf 'OPERATION_STEP={"name":"container:prepare","status":"failed","metadata":{"display_name":"Prepare container","reason_code":"container_start_failed"}}\n'
+              args:
+                executable: /bin/sh
+          always:
+            - name: Observe the actual runtime after startup failure or restoration
+              ansible.builtin.include_tasks:
+                file: ../../tasks/container_observe.yml
+                apply:
+                  no_log: true
+              vars:
+                image_runtime_action: deploy
+
+            - name: Publish startup-failure runtime facts without changing failure outcome
+              ansible.builtin.debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
+
+        - name: Abort after container startup failure
+          fail:
+            msg: "Container startup failed."
+
+    - name: Report container preparation completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"container:prepare","status":"completed","metadata":{"display_name":"Prepare container","container_name":"%s","router_name":"%s","traefik_enabled":%s}}\n' "{{ container_name }}" "{{ router_name }}" "{{ 'true' if traefik_enabled else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: Probe Docker HEALTHCHECK capability for "{{ container_name }}"
+      shell: |
+        docker inspect --format '{% raw %}{{if .Config.Healthcheck}}yes{{else}}no{{end}}{% endraw %}' "{{ container_name }}"
+      args:
+        executable: /bin/sh
+      register: docker_health_support
+      changed_when: false
+      failed_when: false
+      when:
+        - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
+
+    - name: Determine health verification strategy
+      set_fact:
+        health_strategy: "{{ 'healthcheck' if ((docker_health_support.stdout | default('') | trim) == 'yes') else ('http' if effective_health_mode in ['host', 'container', 'traefik'] else 'running') }}"
+
+    - name: Report container health check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"health:check","status":"running","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
+      args:
+        executable: /bin/sh
+
+    - name: Verify target container health
+      block:
+        - name: Verify health endpoint at {{ health_url_local }}
+          uri:
+            url: "{{ health_url_local }}"
+            method: GET
+            status_code: 200
+            timeout: 20
+          register: health_result_host
+          retries: 10
+          delay: 3
+          until: health_result_host.status == 200
+          when: effective_health_mode == 'host'
+
+        - name: Wait for Docker HEALTHCHECK status on "{{ container_name }}"
+          shell: |
+            docker inspect --format '{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{end}}{% endraw %}' "{{ container_name }}"
+          args:
+            executable: /bin/sh
+          register: docker_health_status
+          retries: 20
+          delay: 3
+          until: docker_health_status.stdout.strip() == "healthy"
+          when:
+            - health_mode == 'auto' or effective_health_mode in ['container', 'traefik']
+            - (docker_health_support.stdout | default('') | trim) == "yes"
+
+        - name: Wait for container HTTP health on "{{ container_name }}:{{ container_health_port }}{{ health_container_path }}"
+          ansible.builtin.script:
+            cmd: >-
+              {{ (playbook_dir + '/../../scripts/container_http_health.py') | quote }}
+              --container {{ container_name | quote }}
+              --organization {{ app_org_id | quote }}
+              --deployment {{ app_deployment_id | quote }}
+              --revision {{ app_revision_id | default('', true) | quote }}
+              --port {{ container_health_port | string | quote }}
+              --path {{ health_container_path | quote }}
+            executable: python3
+          register: container_health_exec
+          changed_when: false
+          retries: 20
+          delay: 3
+          until: container_health_exec.rc == 0
+          when:
+            - effective_health_mode in ['container', 'traefik']
+            - (docker_health_support.stdout | default('') | trim) != "yes"
+
+        - name: Report container health check passed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:check","status":"completed","metadata":{"display_name":"Check container health","mode":"%s","target":"%s","strategy":"%s"}}\n' "{{ effective_health_mode }}" "{{ health_check_target }}" "{{ health_strategy }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Preserve health restoration and publish available failed-attempt facts
+          block:
+            - name: Restore source container after health validation failure
+              ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
+              no_log: true
+              when:
+                - source_replacement_verified | default(false) | bool
+                - source_replacement_removed | default(false) | bool
+
+            - name: Collect container health diagnostics
+              include_tasks: ../../tasks/container_failure_diagnostics.yml
+
+            - name: Report container health check failed
+              shell: |
+                printf 'OPERATION_STEP={"name":"health:check","status":"failed","metadata":{"display_name":"Check container health","reason_code":"container_health_failed"}}\n'
+              args:
+                executable: /bin/sh
+          always:
+            - name: Observe the actual runtime after health failure or restoration
+              ansible.builtin.include_tasks:
+                file: ../../tasks/container_observe.yml
+                apply:
+                  no_log: true
+              vars:
+                image_runtime_action: deploy
+
+            - name: Publish health-failure runtime facts without changing failure outcome
+              ansible.builtin.debug:
+                msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
+
+        - name: Abort after container health failure
+          fail:
+            msg: "Container health verification failed."
+
+    - name: Report container deployment completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"deploy:start","status":"completed","metadata":{"display_name":"Deploy container","container":"{{ container_name }}"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Observe every ordinary image runtime and any retained resources
+      ansible.builtin.include_tasks:
+        file: ../../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: deploy
+
+    - name: Publish plain image-runtime observation
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"
+
+    - name: Require complete image runtime observation
+      ansible.builtin.assert:
+        that:
+          - image_runtime.observation_complete
+          - image_runtime.ready
+        fail_msg: Image runtime observation is incomplete or not ready.
+
+    - name: Require the actual readonly file mount identities
+      ansible.builtin.assert:
+        that:
+          - >-
+            image_runtime.container.mounts | selectattr('type', 'equalto', 'bind') |
+            selectattr('source', 'equalto', item.source) | selectattr('target', 'equalto', item.target) |
+            selectattr('read_only', 'equalto', true) | list | length == 1
+        fail_msg: Workload secret file mount identity changed.
+      loop: "{{ image_secret_mounts }}"
+      no_log: true
+
+    - name: Require exact predecessor absence before retiring its files
+      ansible.builtin.assert:
+        that:
+          - app_previous_container_id | default(none) is not none
+          - image_runtime.previous_container_absent is sameas true
+        fail_msg: Workload secret predecessor absence is unavailable.
+      when:
+        - image_previous_secret_incarnation | default(none) is not none
+        - image_previous_secret_incarnation != app_secret_file_incarnation | default(none)
+
+    - name: Retire only the absent predecessor's confined files
+      ansible.builtin.include_tasks:
+        file: ../../tasks/container_secret_files.yml
+        apply:
+          no_log: true
+      vars:
+        workload_secret_action: cleanup
+        workload_secret_incarnation: "{{ image_previous_secret_incarnation }}"
+      when:
+        - image_previous_secret_incarnation | default(none) is not none
+        - image_previous_secret_incarnation != app_secret_file_incarnation | default(none)

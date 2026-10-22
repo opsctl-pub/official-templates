@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "ansible_health",
+  "engine": "ansible",
+  "documentation": "ansible_health.md"
+}

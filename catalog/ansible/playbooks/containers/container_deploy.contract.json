@@ -1,0 +1,63 @@
+{
+  "format_version": 1,
+  "item_id": "container_deploy",
+  "engine": "ansible",
+  "result_version": 1,
+  "workload_files": {"version": 1, "capability": "delivery_and_replacement_cleanup"},
+  "examples": [
+    {
+      "case": "ready",
+      "outputs": {
+        "image_runtime": {
+          "action": "deploy",
+          "observation_complete": true,
+          "ready": true,
+          "container": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "example-app",
+            "replica": null,
+            "image_ref": "registry.example/app:release",
+            "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "image_digest": null,
+            "state": "running",
+            "health": "none",
+            "exit_code": 0,
+            "ports": [],
+            "mounts": []
+          },
+          "previous_container_absent": null,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    },
+    {
+      "case": "complete_not_ready",
+      "outputs": {
+        "image_runtime": {
+          "action": "deploy",
+          "observation_complete": true,
+          "ready": false,
+          "container": null,
+          "previous_container_absent": null,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    },
+    {
+      "case": "incomplete_nullready",
+      "outputs": {
+        "image_runtime": {
+          "action": "deploy",
+          "observation_complete": false,
+          "ready": null,
+          "container": null,
+          "previous_container_absent": null,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    }
+  ]
+}

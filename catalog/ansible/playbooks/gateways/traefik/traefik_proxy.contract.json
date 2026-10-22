@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_proxy",
+  "engine": "ansible",
+  "documentation": "traefik_proxy.md"
+}

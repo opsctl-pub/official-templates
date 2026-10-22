@@ -1,0 +1,213 @@
+---
+- name: Skip baseline when running in simulate mode
+  meta: end_play
+  when: simulate | default(false)
+
+- name: Validate baseline profile
+  ansible.builtin.assert:
+    that:
+      - baseline_profile | default('declared_image') in ['declared_image', 'imported']
+    fail_msg: "Unsupported Docker baseline profile"
+
+- name: Observe imported host baseline facts
+  when: baseline_profile | default('declared_image') == 'imported'
+  block:
+    - name: Gather actual operating system and architecture
+      ansible.builtin.setup:
+        gather_subset:
+          - '!all'
+          - '!min'
+          - distribution
+          - platform
+      register: baseline_imported_facts
+
+    - name: Require a supported imported operating system and architecture
+      ansible.builtin.assert:
+        that:
+          - baseline_imported_facts.ansible_facts.ansible_distribution in ['Ubuntu', 'Amazon']
+          - baseline_imported_facts.ansible_facts.ansible_architecture == 'x86_64'
+        fail_msg: "The imported host has no supported Docker baseline"
+
+    - name: Select the existing baseline from observed host facts
+      ansible.builtin.set_fact:
+        baseline_image_key: >-
+          {{ 'ubuntu-' ~ baseline_imported_facts.ansible_facts.ansible_distribution_version
+             if baseline_imported_facts.ansible_facts.ansible_distribution == 'Ubuntu'
+             else 'amazon-linux-' ~ baseline_imported_facts.ansible_facts.ansible_distribution_major_version }}
+
+    - name: Require an existing imported baseline variable file
+      ansible.builtin.assert:
+        that:
+          - >-
+            (baseline_image_key ~ '.yml') in
+            (query('ansible.builtin.fileglob', role_path ~ '/vars/managed/*.yml')
+             | map('basename') | list)
+        fail_msg: "The imported host has no supported Docker baseline version"
+
+- name: Validate declared managed image metadata
+  assert:
+    that:
+      - image_distribution | default('') | length > 0
+      - image_version | default('') | length > 0
+      - image_architecture | default('') | length > 0
+    fail_msg: "baseline_docker requires image_distribution, image_version, and image_architecture"
+  when: baseline_profile | default('declared_image') == 'declared_image'
+
+- name: Resolve managed baseline key
+  set_fact:
+    baseline_image_key: >-
+      {{ image_distribution
+         | lower
+         | regex_replace('[^a-z0-9]+', '-')
+         | regex_replace('(^-|-$)', '') }}-{{ image_version }}
+  when: baseline_profile | default('declared_image') == 'declared_image'
+
+- name: Load managed image baseline variables
+  include_vars: "{{ role_path }}/vars/managed/{{ baseline_image_key }}.yml"
+
+- name: Verify managed architecture support
+  assert:
+    that:
+      - >-
+        ({'x86_64': 'amd64'}.get(baseline_imported_facts.ansible_facts.ansible_architecture, '')
+         if baseline_profile | default('declared_image') == 'imported'
+         else image_architecture) == baseline_managed_architecture
+    fail_msg: >-
+      {{ 'The imported host has no supported Docker architecture'
+         if baseline_profile | default('declared_image') == 'imported'
+         else 'baseline_docker does not support ' ~ image_distribution ~ ' ' ~ image_version ~ ' ' ~ image_architecture }}
+
+- name: Wait for SSH readiness phase
+  block:
+    - name: Report SSH availability check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:wait-ssh","status":"running","metadata":{"step_key":"baseline_wait_ssh","display_name":"Waiting for SSH"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Wait for SSH availability
+      wait_for_connection:
+        timeout: "{{ ssh_wait_timeout | default(60) }}"
+        sleep: 5
+        connect_timeout: 5
+
+    - name: Report SSH availability check passed
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:wait-ssh","status":"completed","metadata":{"step_key":"baseline_wait_ssh","display_name":"Waiting for SSH"}}\n'
+      args:
+        executable: /bin/sh
+  rescue:
+    - name: Report SSH availability check failed
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:wait-ssh","status":"failed","metadata":{"step_key":"baseline_wait_ssh","display_name":"Waiting for SSH"}}\n'
+      args:
+        executable: /bin/sh
+    - name: Fail SSH readiness phase
+      fail:
+        msg: SSH readiness wait failed
+
+- name: Wait for cloud-init readiness phase
+  block:
+    - name: Report cloud-init check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:cloud-init","status":"running","metadata":{"step_key":"baseline_cloud_init","display_name":"Waiting for cloud-init"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Wait for cloud-init completion if present
+      shell: |
+        test ! -d /var/lib/cloud || test -f /var/lib/cloud/instance/boot-finished
+      args:
+        executable: /bin/sh
+      register: cloud_init_ready
+      retries: 12
+      delay: 5
+      until: cloud_init_ready.rc == 0
+      changed_when: false
+
+    - name: Report cloud-init check passed
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:cloud-init","status":"completed","metadata":{"step_key":"baseline_cloud_init","display_name":"Waiting for cloud-init"}}\n'
+      args:
+        executable: /bin/sh
+  rescue:
+    - name: Report cloud-init check failed
+      shell: |
+        printf 'OPERATION_STEP={"name":"baseline:cloud-init","status":"failed","metadata":{"step_key":"baseline_cloud_init","display_name":"Waiting for cloud-init"}}\n'
+      args:
+        executable: /bin/sh
+    - name: Fail cloud-init readiness phase
+      fail:
+        msg: cloud-init readiness wait failed
+
+- name: Report Docker installation started
+  shell: |
+    printf 'OPERATION_STEP={"name":"docker:install","status":"running","metadata":{"step_key":"docker_install","display_name":"Install Docker"}}\n'
+  args:
+    executable: /bin/sh
+
+- name: Install Docker packages with apt
+  apt:
+    name: "{{ baseline_docker_packages }}"
+    state: present
+    update_cache: "{{ baseline_docker_update_cache | default(true) }}"
+  when: baseline_docker_package_manager == "apt"
+
+- name: Install Docker packages with dnf
+  dnf:
+    name: "{{ baseline_docker_packages }}"
+    state: present
+  when: baseline_docker_package_manager == "dnf"
+
+- name: Reject unsupported package manager
+  fail:
+    msg: "Unsupported baseline Docker package manager: {{ baseline_docker_package_manager }}"
+  when: baseline_docker_package_manager not in ["apt", "dnf"]
+
+- name: Start and enable Docker service
+  service:
+    name: "{{ baseline_docker_service_name }}"
+    state: started
+    enabled: true
+
+- name: Verify Docker daemon is responsive
+  command: docker info
+  register: docker_info_result
+  failed_when: docker_info_result.rc != 0
+
+- name: Prepare the managed Docker CLI plugin directory
+  ansible.builtin.file:
+    path: /usr/local/lib/docker/cli-plugins
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the checksum-pinned managed Compose plugin
+  ansible.builtin.get_url:
+    url: "https://github.com/docker/compose/releases/download/v{{ baseline_compose_version }}/docker-compose-linux-{{ baseline_compose_architecture }}"
+    dest: /usr/local/lib/docker/cli-plugins/docker-compose
+    checksum: "{{ baseline_compose_checksum }}"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Verify the exact managed Compose version
+  ansible.builtin.command: docker compose version --short
+  register: baseline_compose_result
+  changed_when: false
+  failed_when: >-
+    baseline_compose_result.rc != 0 or
+    (baseline_compose_result.stdout | trim | regex_replace('^v', '')) != baseline_compose_version
+
+- name: Report Docker installation completed
+  shell: |
+    printf 'OPERATION_STEP={"name":"docker:install","status":"completed","metadata":{"step_key":"docker_install","display_name":"Install Docker","certification_evidence":{"schema":"opsctl.managed-lifecycle/v1","assertions":{"package_manager":{{ baseline_docker_package_manager | to_json }},"packages_installed":true,"service_active":true,"daemon_responsive":true}}}}\n'
+  args:
+    executable: /bin/sh
+
+- name: Report Docker baseline completed
+  shell: |
+    printf 'OPERATION_STEP={"name":"baseline:complete","status":"completed","metadata":{"step_key":"baseline_complete","display_name":"Baseline complete"}}\n'
+  args:
+    executable: /bin/sh

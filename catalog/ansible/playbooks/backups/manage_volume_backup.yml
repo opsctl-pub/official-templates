@@ -1,0 +1,73 @@
+---
+- name: Encrypted offline file backup or fresh isolated restore
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: End simulation before any storage or native effects
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: Prepare invocation-private files
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: opsctl-backup-
+      register: backup_workspace
+      no_log: true
+
+    - name: Perform the readable backup method
+      block:
+        - name: Record prepare step
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"backup:prepare","status":"running","metadata":{"display_name":"Prepare encrypted file copy"}}'
+
+        - name: Copy only this Operation private delivery
+          ansible.builtin.copy:
+            src: "{{ backup.private_material_file }}"
+            dest: "{{ backup_workspace.path }}/backup-credentials.json"
+            mode: '0600'
+          no_log: true
+
+        - name: Freeze plain native intent without source rewriting
+          ansible.builtin.copy:
+            content: "{{ backup | to_json }}"
+            dest: "{{ backup_workspace.path }}/intent.json"
+            mode: '0600'
+          no_log: true
+
+        - name: Record prepare completion and method start
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"backup:prepare","status":"completed","metadata":{"display_name":"Prepare encrypted file copy"}}'
+
+        - name: Record method start
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"backup:copy","status":"running","metadata":{"display_name":"Copy and verify selected data"}}'
+
+        - name: Run the pinned file-copy procedure
+          ansible.builtin.script:
+            cmd: "{{ playbook_dir }}/../../scripts/volume_backup.py {{ backup_workspace.path | quote }}"
+            executable: python3
+          register: backup_native_result
+          failed_when: false
+          no_log: true
+
+        - name: Emit documented plain results including partial native effects
+          ansible.builtin.debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ backup_native_result.stdout | trim }}"
+
+        - name: Require successful method completion
+          ansible.builtin.assert:
+            that:
+              - backup_native_result.rc == 0
+              - (backup_native_result.stdout | from_json).volume_backup.outcome == 'succeeded'
+            fail_msg: Backup method did not establish verified completion; uncertain data remains reserved.
+
+        - name: Record actual completed method
+          ansible.builtin.debug:
+            msg: 'OPERATION_STEP={"name":"backup:copy","status":"completed","metadata":{"display_name":"Copy and verify selected data"}}'
+      always:
+        - name: Remove only this invocation private files
+          ansible.builtin.file:
+            path: "{{ backup_workspace.path }}"
+            state: absent
+          no_log: true

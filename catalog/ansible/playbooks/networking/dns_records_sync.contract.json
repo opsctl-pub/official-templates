@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "dns_records_sync",
+  "engine": "ansible",
+  "documentation": "dns_records_sync.md"
+}

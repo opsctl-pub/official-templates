@@ -1,0 +1,134 @@
+---
+- name: Initialize unavailable certificate facts
+  ansible.builtin.set_fact:
+    certificate_observation:
+      outcome: incomplete
+      observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      presence: unknown
+      source: null
+      material_id: null
+      revision_id: null
+      leaf_fingerprint_sha256: null
+      not_before: null
+      not_after: null
+      selected_hosts: []
+      binding_count: null
+      hosts: []
+      renewal: null
+    certificate_procedure_error: {phase: observe, code: certificate_serving_unverified}
+    certificate_selection_snapshot:
+      presence: unknown
+      source: null
+      material_id: null
+      revision_id: null
+      leaf_fingerprint_sha256: null
+    certificate_selection_observed: false
+  no_log: true
+
+- name: Observe the subject selection and optional actual SNI
+  block:
+    - name: Validate public observation subject and hosts
+      ansible.builtin.assert:
+        that:
+          - certificate_subject is mapping
+          - certificate_subject.keys() | sort == ['id', 'type']
+          - certificate_subject.type in ['deployment', 'server']
+          - certificate_subject.id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+          - route_hosts is sequence and route_hosts is not string
+          - route_hosts | length <= 100
+          - route_hosts == route_hosts | unique | sort
+          - not (simulate | default(false))
+
+    - name: Resolve template-owned native subject references
+      ansible.builtin.set_fact:
+        certificate_subject_key: "{{ certificate_subject.type }}-{{ certificate_subject.id }}"
+        certificate_selection_path: "{{ traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl') }}/certificate-{{ certificate_subject.type }}-{{ certificate_subject.id }}.yml"
+        certificate_timer_name: "{{ certificate_unit_prefix | default('opsctl-certificate-') }}{{ certificate_subject.type }}-{{ certificate_subject.id }}.timer"
+        certificate_service_name: "{{ certificate_unit_prefix | default('opsctl-certificate-') }}{{ certificate_subject.type }}-{{ certificate_subject.id }}.service"
+
+    - name: Observe actual gateway native runtime
+      community.docker.docker_container_info:
+        name: "{{ traefik_container_name | default('traefik') }}"
+      register: certificate_gateway
+      when: not (certificate_selection_only | default(false))
+
+    - name: Select complete uninstalled observation only for an absent runtime
+      ansible.builtin.set_fact:
+        certificate_uninstalled_gateway: >-
+          {{ certificate_allow_uninstalled_gateway | default(false) and
+             not (certificate_selection_only | default(false)) and
+             not certificate_gateway.exists }}
+
+    - name: Require the native file-provider gateway and certificate mount
+      ansible.builtin.assert:
+        that:
+          - certificate_gateway.exists
+          - certificate_gateway.container.State.Running
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.managed') == 'true'
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+          - certificate_gateway.container.Config.Labels.get('com.opsctl.org_id') == org_id
+          - "'--providers.file.directory=' ~ (traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl')) in certificate_gateway.container.Config.Cmd"
+          - certificate_gateway.container.Config.Cmd | select('match', '(?i)^--(?:certificatesresolvers|configfile|providers\.file\.filename)') | list | length == 0
+          - >-
+            certificate_gateway.container.Mounts |
+            selectattr('Destination', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
+            selectattr('Source', 'equalto', traefik_certificate_dir | default('/etc/traefik/certificates/opsctl')) |
+            selectattr('RW', 'equalto', false) | list | length == 1
+      when: not (certificate_selection_only | default(false)) and not certificate_uninstalled_gateway
+
+    - name: Read bounded selection leaf enrollment and requested SNI facts
+      ansible.builtin.script:
+        cmd: >-
+          ../scripts/certificate_facts.py
+          --selection {{ certificate_selection_path | quote }}
+          --root {{ traefik_certificate_dir | default('/etc/traefik/certificates/opsctl') | quote }}
+          --subject {{ certificate_subject | to_json | quote }}
+          --hosts {{ (route_hosts if certificate_probe_hosts | default(true) else []) | to_json | quote }}
+          --timer {{ certificate_timer_name | quote }}
+          --address {{ certificate_probe_address | default('127.0.0.1') | quote }}
+          --port {{ certificate_probe_port | default(443) }}
+          {{ '--selection-only' if certificate_selection_only | default(false) else '' }}
+          {{ '--uninstalled-gateway' if certificate_uninstalled_gateway else '' }}
+          --dynamic-root {{ traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl') | quote }}
+          --acme-root {{ traefik_acme_dir | default('/var/lib/traefik') | quote }}
+          --state-root {{ traefik_acme_state_dir | default('/var/lib/opsctl/automatic-certificates') | quote }}
+          --unit-prefix {{ certificate_unit_prefix | default('opsctl-certificate-') | quote }}
+          {{ ('--trust-pem ' ~ (trust_bundle_pem | quote)) if trust_bundle_pem | default(none) is not none else '' }}
+        executable: python3
+      register: certificate_native_observation
+      changed_when: false
+      failed_when: false
+
+    - name: Require bounded native facts before decoding
+      ansible.builtin.assert:
+        that:
+          - certificate_native_observation.stdout is string
+          - certificate_native_observation.stdout | length <= 131072
+
+    - name: Retain plain observed facts and closed failure
+      ansible.builtin.set_fact:
+        certificate_observation: "{{ (certificate_native_observation.stdout | from_json).certificate_observation }}"
+        certificate_procedure_error: >-
+          {{ (certificate_native_observation.stdout | from_json).procedure_error |
+            default(none if certificate_native_observation.rc == 0 else
+              {'phase': 'probe', 'code': 'certificate_serving_unverified'}) }}
+      when: not (certificate_selection_only | default(false))
+
+    - name: Require the exact selection-only snapshot shape
+      ansible.builtin.assert:
+        that:
+          - certificate_native_observation.stdout | from_json is mapping
+          - (certificate_native_observation.stdout | from_json).keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+      when: certificate_selection_only | default(false)
+
+    - name: Retain selection-only facts without claiming serving or enrollment
+      ansible.builtin.set_fact:
+        certificate_selection_snapshot: "{{ certificate_native_observation.stdout | from_json }}"
+        certificate_selection_observed: "{{ certificate_native_observation.rc == 0 }}"
+        certificate_procedure_error: "{{ none if certificate_native_observation.rc == 0 else {'phase': 'observe', 'code': 'certificate_serving_unverified'} }}"
+      when: certificate_selection_only | default(false)
+  rescue:
+    - name: Keep unavailable native observation distinct from absence
+      ansible.builtin.set_fact:
+        certificate_procedure_error: {phase: observe, code: certificate_serving_unverified}
+  no_log: true

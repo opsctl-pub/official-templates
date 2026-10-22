@@ -1,0 +1,27 @@
+---
+- name: Inspect deployment container and retained native resources
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    container_name: "{{ app_container_name | default('app') }}"
+  tasks:
+    - name: Observe an explicitly admitted private verification target
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/private_http_verification.yml"
+      when: verification_kind is defined
+
+    - name: Report container inspection started
+      ansible.builtin.debug:
+        msg: "OPERATION_STEP={{ {'name': 'inspect:start', 'status': 'running', 'metadata': {'display_name': 'Inspect container', 'container_name': container_name}} | to_json }}"
+
+    - name: Observe every ordinary image runtime without adopting label candidates
+      ansible.builtin.include_tasks:
+        file: ../../tasks/container_observe.yml
+        apply:
+          no_log: true
+      vars:
+        image_runtime_action: inspect
+
+    - name: Publish bounded native image and resource facts
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"

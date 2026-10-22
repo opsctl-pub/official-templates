@@ -1,0 +1,34 @@
+#cloud-config
+write_files:
+  - path: /etc/ssh/sshd_config.d/00-opsctl-port.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      Port ${ssh_port}
+  - path: /etc/systemd/system/ssh.socket.d/port.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Socket]
+      ListenStream=
+      ListenStream=0.0.0.0:${ssh_port}
+      ListenStream=[::]:${ssh_port}
+runcmd:
+  - - sh
+    - -ec
+    - |
+      install -d -m 0755 -o root -g root /run/sshd
+      /usr/sbin/sshd -t
+      ports=$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}')
+      test "$ports" = '${ssh_port}'
+      socket=false
+      if systemctl is-enabled --quiet ssh.socket || systemctl is-active --quiet ssh.socket; then
+        socket=true
+      fi
+      systemctl stop ssh.socket ssh.service
+      systemctl daemon-reload
+      if "$socket"; then
+        systemctl start ssh.socket
+      else
+        systemctl enable --now ssh.service
+      fi

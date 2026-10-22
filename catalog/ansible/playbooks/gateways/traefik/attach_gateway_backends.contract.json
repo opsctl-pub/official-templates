@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "attach_gateway_backends",
+  "engine": "ansible",
+  "documentation": "attach_gateway_backends.md"
+}

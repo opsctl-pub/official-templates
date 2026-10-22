@@ -1,0 +1,28 @@
+---
+- name: Observe one subject's selected and optionally served certificate
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require an explicit certificate probe mode
+      ansible.builtin.assert:
+        that:
+          - certificate_probe_hosts is defined
+          - certificate_probe_hosts is boolean
+        fail_msg: Certificate probe mode must be an explicit boolean.
+
+    - name: Read native certificate facts without mutation
+      ansible.builtin.include_tasks: ../../../tasks/traefik_custom_certificate_observation.yml
+      vars:
+        certificate_allow_uninstalled_gateway: "{{ not certificate_probe_hosts }}"
+
+    - name: Emit plain certificate facts
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+
+    - name: Refuse unavailable or unverified native facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: certificate_observation.outcome != 'succeeded'

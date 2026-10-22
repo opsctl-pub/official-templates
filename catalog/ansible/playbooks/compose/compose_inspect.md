@@ -1,0 +1,113 @@
+# Native Compose inspection
+
+`compose_inspect.yml` is the read-only `compose_inspect` Ansible item, with logical
+type `inspect_deployment`. Use its existing catalog registration or Automation
+Override and inventory/SSH connection. No source files,
+registry credentials, Compose apply, image pull, login, creation or deletion occur.
+
+## Inputs
+
+| Variable | Default | Origin/contract |
+|---|---|---|
+| `compose_project_name` | required | Captured native project name. |
+| `compose_workspace` | required | Admitted absolute captured-revision workspace; never removed. |
+| `nonsecret_files` | `[]` | At most32 unique canonical nonroot relative paths, each at most256 UTF-8 bytes; admitted nonsecret files only. |
+| `compose_services` | required | Up to 32 captured `{name,replicas,condition,allow_completion:false}`; replicas0-128/total128; condition `running|healthy|completed|scaled_down`. |
+| `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs; missing IDs are observed, not fabricated instances. |
+| `compose_known_networks` | `[]` | Up to 64 `{id,name,origin}`; origin `created|reused|external|unknown`. |
+| `compose_known_volumes` | `[]` | Up to 64 `{name,created_at,origin}`; nullable timestamp, same origins. |
+
+Central eligibility excludes authenticated env/secret roles and exact
+owner-delivered protected/generated/credential material, and requires
+immutable-original/consumed-delivery membership. The authorized caller selects
+`nonsecret_files` for digest disclosure; opaque originals are not sensitivity
+certified because custody has no content-sensitivity field. Dependency roles
+classify use only, not content sensitivity.
+
+Native project listing includes stopped instances. Inspect each current/recorded
+ID, resource incarnation and image through info modules. Readiness covers all
+replicas and inherited health, strict completed dependency exit-zero and captured
+standalone completion alternative. Extras are visible drift, not adopted ownership.
+No original file replay is necessary. Unknown/replaced resource incarnations remain
+incomplete. Stopped/unhealthy/missing work is a successful complete inspection with
+ready=false, not a failed read.
+
+## Results
+
+One final `TEMPLATE_OUTPUT_JSON={"compose":...}` has the following full field set;
+the detailed neutral instance vocabulary is in [deployment](compose_deploy.md#results).
+
+| Field | Meaning |
+|---|---|
+| `action`, `project_name`, `project_directory` | `inspect`, actual name, `.` for identity-only inspection. |
+| `observed_at` | UTC RFC3339 or null on failed observation. |
+| `outcome`, `observation_complete`, `changed` | `succeeded|failed|unknown`, boolean completeness, always false for changed. |
+| `ready` | Complete readiness boolean, otherwise null. |
+| `phase`, `reason` | Producer uses `compose:observe|compose:complete`; null or bounded root diagnostic reason. |
+| `files_written`, `removed_containers` | Empty arrays; inspect performs no delivery/removal. |
+| `services` | `{name,desired_replicas,condition,state,instances}`; state `running|healthy|starting|completed|scaled_down|stopped|failed|missing|unknown|drifted`. |
+| `unexpected_containers` | Instances outside captured/selected project membership. |
+| `networks` | `{id,name,origin,presence:present|absent|unknown}`; absent recorded networks retain ID. |
+| `volumes` | `{name,created_at,origin,presence}` including mounted anonymous volumes; timestamp nullable. |
+| `selected_file_observations`, `selected_file_observation_complete` | Ordered selected disk metadata and independent coverage; empty selection is `[]`/false. |
+
+The [root-only result evolution rules](compose_deploy.md#public-result-evolution) apply:
+unknown root fields are discarded only after the full raw 256 KiB bound and explicit
+`procedure_error` presence refusal. Bounded new root diagnostic codes grant no
+success/coverage; exact complete/null-reason and all identity/truth guards remain.
+Nested additions, including selected-file reason changes, are unsupported. Raw
+markers/logs are not redacted by projection; secrets remain forbidden.
+
+Each selected row is exactly `{path,presence,size_bytes,mode,sha256,reason}`.
+Present rows report nonnegative byte size, four-octal filesystem mode (including
+special bits such as4755), lowercase SHA-256 and null reason. Qualified absence
+reports null metadata and `missing`. Unknown rows retain the path with null
+metadata and one of `unsafe_path`, `not_regular`, `changed_during_collection`,
+`permission_denied`, `read_failed`, `file_limit_exceeded`, `total_limit_exceeded`
+or `result_limit_exceeded`. Only all-qualified nonempty selection grants coverage.
+
+The named public helper traverses held no-follow directory descriptors and hashes
+only the opened regular-file descriptor. Final ancestor/entry/metadata checks
+refuse observed replacement or mutation, not all historical changes. Links never
+escape confinement; permission/read errors never become absence. Per-file reads
+are bounded at262144 bytes, all reads at1048576 bytes. Once that aggregate would
+be exceeded, remaining members stay unknown without more reads. No recursion,
+file contents, expected source digests or writes are involved. Ordinary Ansible
+script staging is not application file delivery.
+
+These facts do not establish loaded configuration, original custody or current
+execution authority. Workload completeness/readiness remains independent.
+Deploy/remove never invoke this collector or report its coverage, even when stale
+internal selected-file facts exist. Final envelopes use the same ASCII-escaped
+JSON for measurement and publication; overflow preserves every selected member
+in order as unknown/result_limit_exceeded while workload facts fall back to the
+existing incomplete result.
+
+All instance fields are `{id,name,replica,image_ref,image_id,image_digest,state,
+health,exit_code,ports,mounts}`. Replica/digest/exit_code may be null; ports contain
+`{host_ip,host_port,container_port,protocol:tcp|udp}`, mounts
+`{type:volume|bind|tmpfs|other,source,target,read_only}`. Digest is the unambiguous
+native repo digest; source is volume name/bind path/null. No env, health commands,
+labels, credentials, arbitrary errors or private proof fields are returned.
+
+Bounds are 256 KiB, 32 services, 128 total instances, 64 networks/volumes, 256
+ports/128 mounts per instance. Overflow explicitly emits incomplete/unknown.
+OPERATION_STEP reports prepare/observe/complete with actual status, not health
+success inferred from process exit. Available incomplete facts precede a fixed
+failure; backend cannot promote or release references from them.
+
+## Example
+
+```yaml
+compose_project_name: metrics
+compose_workspace: /var/lib/opsctl/compose/00000000-0000-0000-0000-000000000001/projects/metrics/workspace
+compose_services: [{name: prometheus, replicas: 1, condition: running}]
+compose_known_containers: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+```
+
+Full result for an exited/nonzero desired service; observation succeeds, readiness
+does not. Docker read failure instead returns unknown/null/false:
+
+```json
+{"compose":{"action":"inspect","project_name":"metrics","project_directory":".","observed_at":"2026-10-06T12:05:00Z","outcome":"succeeded","observation_complete":true,"changed":false,"ready":false,"phase":"compose:complete","reason":null,"files_written":[],"services":[{"name":"prometheus","desired_replicas":1,"condition":"running","state":"failed","instances":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"metrics-prometheus-1","replica":1,"image_ref":"prom/prometheus:v3.5.0","image_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","image_digest":null,"state":"exited","health":"none","exit_code":7,"ports":[],"mounts":[]}]}],"unexpected_containers":[],"networks":[],"volumes":[],"removed_containers":[],"selected_file_observations":[],"selected_file_observation_complete":false}}
+```

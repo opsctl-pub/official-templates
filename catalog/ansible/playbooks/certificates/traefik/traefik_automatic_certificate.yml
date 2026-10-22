@@ -1,0 +1,17 @@
+---
+- name: Issue retry or renew one subject through its native renewal unit
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    traefik_acme_state_dir: /var/lib/opsctl/automatic-certificates
+    traefik_acme_dir: /var/lib/traefik
+  pre_tasks:
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: Execute the readable subject procedure
+      ansible.builtin.include_tasks: ../../../tasks/traefik_automatic_certificate.yml

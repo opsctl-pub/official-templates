@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "manage_docker_resource",
+  "engine": "ansible",
+  "documentation": "manage_docker_resource.md"
+}

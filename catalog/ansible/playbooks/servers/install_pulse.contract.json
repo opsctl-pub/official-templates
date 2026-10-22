@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "install_pulse",
+  "engine": "ansible",
+  "documentation": "install_pulse.md"
+}

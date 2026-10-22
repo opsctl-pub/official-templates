@@ -1,0 +1,349 @@
+---
+- name: Prepare the exact reviewed image with bounded authentication custody
+  block:
+    - name: Reset image preparation facts for this exact image
+      ansible.builtin.set_fact:
+        auth_logout_required: false
+        auth_exit_code: 1
+        image_platform_comparison: {}
+        pull_result: {}
+      no_log: true
+
+    - name: Report registry credential check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"creds:check","status":"running","metadata":{"display_name":"Check registry credentials"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Load registry auth content
+      set_fact:
+        auth_content_raw: "{{ lookup('file', '/secrets/registry-auth.json', errors='ignore') | default('', true) | trim }}"
+      no_log: true
+
+    - name: Normalize registry auth when already parsed
+      set_fact:
+        auth: "{{ auth_content_raw }}"
+        auth_is_mapping: true
+      no_log: true
+      when:
+        - auth_content_raw is mapping
+
+    - name: Parse registry auth JSON when present
+      set_fact:
+        auth: "{{ auth_content_raw | from_json }}"
+        auth_is_mapping: true
+      no_log: true
+      when:
+        - auth_content_raw is string
+        - auth_content_raw | length > 0
+
+    - name: Normalize registry auth facts when absent
+      set_fact:
+        auth: {}
+        auth_is_mapping: false
+      when: auth_content_raw | length == 0
+
+    - name: Report registry credential check completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"creds:check","status":"completed","metadata":{"display_name":"Check registry credentials"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Report registry authentication started
+      shell: |
+        printf 'OPERATION_STEP={"name":"auth:start","status":"running","metadata":{"display_name":"Authenticate registry","host":"%s"}}\n' "{{ auth.host | default('') }}"
+      args:
+        executable: /bin/sh
+      when: auth_is_mapping | default(false)
+
+    - name: Docker login using reviewed registry token
+      shell: |
+        echo "{{ auth.token }}" | docker login "{{ auth.host }}" -u "{{ auth.username | default('oauth2') }}" --password-stdin >/dev/null 2>&1
+      args:
+        executable: /bin/sh
+      register: login_token_result
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is defined
+
+    - name: Docker login using reviewed registry username/password
+      shell: |
+        echo "{{ auth.password }}" | docker login "{{ auth.host }}" -u "{{ auth.username }}" --password-stdin >/dev/null 2>&1
+      args:
+        executable: /bin/sh
+      register: login_user_result
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is not defined
+        - auth.username is defined
+        - auth.password is defined
+
+    - name: Compute auth exit code from token login
+      set_fact:
+        auth_exit_code: "{{ login_token_result.rc | default(1) | int }}"
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is defined
+        - login_token_result is defined
+
+    - name: Compute auth exit code from username/password login
+      set_fact:
+        auth_exit_code: "{{ login_user_result.rc | default(1) | int }}"
+      when:
+        - auth_is_mapping | default(false)
+        - auth.token is not defined
+        - login_user_result is defined
+
+    - name: Report registry authentication result
+      shell: |
+        printf 'OPERATION_STEP={"name":"auth:start","status":"%s","metadata":{"display_name":"Authenticate registry","host":"%s","exit_code":%d}}\n' \
+        "{{ 'completed' if ((auth_exit_code | default(1)) | int) == 0 else 'failed' }}" \
+        "{{ auth.host | default('') }}" \
+        {{ (auth_exit_code | default(1)) | int }}
+      args:
+        executable: /bin/sh
+      when: auth_is_mapping | default(false)
+
+    - name: Mark registry login success
+      set_fact:
+        auth_logout_required: true
+      when:
+        - auth_is_mapping | default(false)
+        - ((auth_exit_code | default(1)) | int) == 0
+
+    - name: Fail when registry authentication unsuccessful
+      fail:
+        msg: "Registry authentication failed. Verify credentials and rate limits."
+      when:
+        - auth_is_mapping | default(false)
+        - ((auth_exit_code | default(1)) | int) != 0
+
+    - name: Report local image check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:check","status":"running","metadata":{"display_name":"Check container image","image":"{{ app_image }}"}}\n'
+      args:
+        executable: /bin/sh
+
+    - name: Inspect local image "{{ app_image }}"
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv:
+          - timeout
+          - --kill-after=2s
+          - 5s
+          - docker
+          - image
+          - inspect
+          - --format
+          - '{% raw %}{"os":{{json .Os}},"architecture":{{json .Architecture}},"variant":{{json .Variant}}}{% endraw %}'
+          - "{{ app_image }}"
+      register: inspect_result
+      failed_when: inspect_result.rc not in [0, 1]
+      changed_when: false
+      no_log: true
+
+    - name: Report local image check completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:check","status":"completed","metadata":{"display_name":"Check container image","image":"{{ app_image }}","exists":%s}}\n' \
+        "{{ 'true' if inspect_result.rc == 0 else 'false' }}"
+      args:
+        executable: /bin/sh
+
+    - name: Report image pull started
+      shell: |
+        printf 'OPERATION_STEP={"name":"image:pull","status":"running","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n'
+      args:
+        executable: /bin/sh
+      when: inspect_result.rc != 0
+
+    - name: Prepare compatible container image
+      block:
+        - name: Read actual Docker daemon platform
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - timeout
+              - --kill-after=2s
+              - 5s
+              - docker
+              - info
+              - --format
+              - '{% raw %}{"os":{{json .OSType}},"architecture":{{json .Architecture}}}{% endraw %}'
+          register: daemon_platform_result
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Pull image "{{ app_image }}" from registry
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, pull, "{{ app_image }}"]
+          register: pull_result
+          changed_when: true
+          failed_when: pull_result.rc != 0
+          no_log: true
+          when: inspect_result.rc != 0
+
+        - name: Inspect prepared image platform
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv:
+              - timeout
+              - --kill-after=2s
+              - 5s
+              - docker
+              - image
+              - inspect
+              - --format
+              - '{% raw %}{"os":{{json .Os}},"architecture":{{json .Architecture}},"variant":{{json .Variant}}}{% endraw %}'
+              - "{{ app_image }}"
+          register: image_platform_result
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Compare prepared image with actual Docker platform
+          block:
+            - name: Require successful bounded platform observations
+              ansible.builtin.assert:
+                that:
+                  - daemon_platform_result.rc | default(1) | string == '0'
+                  - image_platform_result.rc | default(1) | string == '0'
+                  - (daemon_platform_result.stdout | default('')).encode('utf-8') | length <= 4096
+                  - (image_platform_result.stdout | default('')).encode('utf-8') | length <= 4096
+
+            - name: Parse platform observations without coercing field types
+              ansible.builtin.set_fact:
+                observed_daemon_platform: "{{ daemon_platform_result.stdout | from_json }}"
+                observed_image_platform: "{{ image_platform_result.stdout | from_json }}"
+                normalized_image_platforms: {}
+
+            - name: Require closed flat platform objects and unique decoded JSON keys
+              ansible.builtin.assert:
+                that:
+                  - item.value is mapping
+                  - item.value.keys() | sort(case_sensitive=true) == item.fields | sort(case_sensitive=true)
+                  - item.value.values() | select('string') | list | length == item.fields | length
+                  - item.value.values() | map('length') | max <= 32
+                  - decoded_keys | length == item.fields | length
+                  - decoded_keys | unique(case_sensitive=true) | list | length == decoded_keys | length
+              vars:
+                json_string_token: '("(?:[^"\\]|\\.)*")\s*(:?)'
+                decoded_keys: >-
+                  {{ item.raw | regex_findall(json_string_token) | selectattr('1', 'equalto', ':')
+                     | map('first') | map('from_json') | list }}
+              loop:
+                - value: "{{ observed_daemon_platform }}"
+                  raw: "{{ daemon_platform_result.stdout }}"
+                  fields: [os, architecture]
+                - value: "{{ observed_image_platform }}"
+                  raw: "{{ image_platform_result.stdout }}"
+                  fields: [os, architecture, variant]
+
+            - name: Require supported Linux architecture and variant pairs
+              ansible.builtin.assert:
+                that:
+                  - item.os == 'linux'
+                  - architecture is not none
+                  - architecture != 'arm' or variant in ['v6', 'v7', 'v8']
+                  - architecture != 'arm64' or variant in [none, 'v8']
+                  - architecture != 'amd64' or variant in [none, 'v1']
+              vars:
+                raw_architecture: "{{ item.architecture | lower }}"
+                architecture: "{{ architecture_aliases.get(raw_architecture) }}"
+                variant: "{{ item.get('variant') or ('v7' if raw_architecture == 'armv7l' else none) }}"
+              loop: "{{ [observed_daemon_platform, observed_image_platform] }}"
+
+            - name: Normalize the actual server and image platforms
+              ansible.builtin.set_fact:
+                normalized_image_platforms: >-
+                  {{ normalized_image_platforms | combine({item.key: {
+                     'os': 'linux', 'architecture': architecture,
+                     'variant': variant if architecture == 'arm' else none}}) }}
+              vars:
+                raw_architecture: "{{ item.value.architecture | lower }}"
+                architecture: "{{ architecture_aliases[raw_architecture] }}"
+                variant: "{{ item.value.get('variant') or ('v7' if raw_architecture == 'armv7l' else none) }}"
+              loop:
+                - key: server
+                  value: "{{ observed_daemon_platform }}"
+                - key: image
+                  value: "{{ observed_image_platform }}"
+
+            - name: Retain closed platform comparison
+              ansible.builtin.set_fact:
+                image_platform_comparison: >-
+                  {{ normalized_image_platforms | combine({'code':
+                     'matched' if normalized_image_platforms.server == normalized_image_platforms.image
+                     else 'image_platform_mismatch'}) }}
+          rescue:
+            - name: Retain unavailable platform comparison after invalid observation
+              ansible.builtin.set_fact:
+                image_platform_comparison: {code: image_platform_unavailable}
+          vars:
+            architecture_aliases:
+              x86_64: amd64
+              amd64: amd64
+              aarch64: arm64
+              arm64: arm64
+              armv7l: arm
+              arm: arm
+          no_log: true
+
+        - name: Require compatible prepared image
+          assert:
+            that: image_platform_comparison.code == 'matched'
+            fail_msg: "{{ image_platform_comparison.code }}"
+
+        - name: Report image pull completed
+          shell: |
+            printf 'OPERATION_STEP={"name":"image:pull","status":"completed","metadata":{"display_name":"Pull container image","image":"{{ app_image }}"}}\n'
+          args:
+            executable: /bin/sh
+          when: inspect_result.rc != 0
+      rescue:
+        - name: Restore source container after image pull failure
+          ansible.builtin.include_tasks: container_source_runtime_restore.yml
+          no_log: true
+          when:
+            - source_replacement_verified | default(false) | bool
+            - source_replacement_removed | default(false) | bool
+        - name: Classify image preparation failure
+          set_fact:
+            image_preparation_error: >-
+              {{ image_platform_comparison.code
+                 if image_platform_comparison.code is defined
+                 else ('image_platform_unavailable'
+                       if ansible_failed_task.name in ['Read actual Docker daemon platform', 'Inspect prepared image platform', 'Compare prepared image with actual Docker platform', 'Retain closed platform comparison']
+                       else ('image_platform_mismatch'
+                       if ((pull_result.stderr | default(''))[:4096] | lower
+                           is search('no matching manifest for [a-z0-9_/.-]+ in the manifest list entries|no match for platform in manifest'))
+                       else 'image_pull_failed')) }}
+          no_log: true
+
+        - name: Report image preparation failed
+          shell: |
+            printf 'OPERATION_STEP=%s\n' '{{ {"name": "image:pull", "status": "failed", "metadata": {"display_name": "Prepare container image", "reason_code": image_preparation_error, "platform": image_platform_comparison | default({})}} | to_json }}'
+          args:
+            executable: /bin/sh
+
+        - name: Abort after container image pull failure
+          fail:
+            msg: "{{ image_preparation_error }}"
+      always:
+        - name: Docker logout after image preparation
+          ansible.builtin.command:
+            expand_argument_vars: false
+            argv: [docker, logout, "{{ auth.host }}"]
+          no_log: true
+          failed_when: false
+          when:
+            - auth_is_mapping | default(false)
+            - auth.host is defined
+            - auth_logout_required | default(false)

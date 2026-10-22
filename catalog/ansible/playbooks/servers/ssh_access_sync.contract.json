@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "ssh_access_sync",
+  "engine": "ansible",
+  "documentation": "ssh_access_sync.md"
+}

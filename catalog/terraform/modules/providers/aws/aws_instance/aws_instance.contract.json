@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "aws_instance",
+  "engine": "opentofu",
+  "documentation": "README.md"
+}

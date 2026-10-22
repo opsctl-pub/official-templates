@@ -1,0 +1,120 @@
+---
+- name: Synchronize managed DNS records through Cloudflare
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dns_changes: "{{ dns_changes | default([]) }}"
+    cloudflare_api_base: "https://api.cloudflare.com/client/v4"
+  pre_tasks:
+    - name: Skip DNS sync when running in simulate mode
+      meta: end_play
+      when: simulate | default(false)
+
+  tasks:
+    - name: Apply managed DNS record changes
+      block:
+        - name: Report DNS synchronization started
+          shell: |
+            printf 'OPERATION_STEP={"name":"dns_sync:start","status":"running","metadata":{"display_name":"Sync DNS records","provider":"%s","zone_name":"%s","change_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_changes | length }}"
+          args:
+            executable: /bin/sh
+
+        - name: Check Cloudflare credentials and zone
+          assert:
+            that:
+              - provider == "cloudflare"
+              - (lookup('env', 'CLOUDFLARE_API_TOKEN') | length) > 0
+              - provider_zone_id is defined
+              - (provider_zone_id | string | length) > 0
+            fail_msg: "dns_records_sync requires Cloudflare credentials and provider_zone_id"
+
+        - name: Validate managed A record changeset shape
+          assert:
+            that:
+              - (item.action | string) in ["create", "update", "delete", "adopt"]
+              - (item.record_type | string | upper) == "A"
+              - item.proxied is boolean
+              - not item.proxied or item.ttl == 1
+            fail_msg: "Managed Cloudflare A records require explicit proxy intent and automatic TTL when proxied"
+          loop: "{{ dns_changes }}"
+          loop_control:
+            label: "{{ item.hostname }}:{{ item.action }}"
+
+        - name: Validate exact DNS adoption identity shape
+          assert:
+            that:
+              - >-
+                (item.action | string) != 'adopt'
+                or (
+                  item.provider_record_id is defined
+                  and (item.provider_record_id | string | length) > 0
+                  and item.deployment_id is defined
+                  and (item.deployment_id | string | length) > 0
+                  and item.tracked_record_id is defined
+                  and item.tracked_record_id is none
+                  and (item.record_type | string | upper) == 'A'
+                  and not (item.proxied | default(false) | bool)
+                )
+            fail_msg: "DNS adoption plan identity is invalid"
+          loop: "{{ dns_changes }}"
+          loop_control:
+            label: "{{ item.hostname }}:{{ item.action }}"
+
+        - name: Validate confirmed external DNS delete shape
+          assert:
+            that:
+              - (compare_before_apply | default(false)) is boolean
+              - >-
+                not (compare_before_apply | default(false) | bool)
+                or (
+                  (item.action | string) == 'delete'
+                  and (item.record_type | string | upper) == 'A'
+                  and (item.tracked_record_id is not defined or item.tracked_record_id is none)
+                  and (item.provider_record_id is defined)
+                  and ((item.provider_record_id | string | length) > 0)
+                  and not (item.proxied | default(false) | bool)
+                )
+            fail_msg: "Confirmed external DNS delete plan is invalid"
+          loop: "{{ dns_changes }}"
+          loop_control:
+            label: "{{ item.hostname }}:{{ item.action }}"
+          when: compare_before_apply | default(false) | bool
+
+        - name: Initialize applied changes accumulator
+          set_fact:
+            dns_sync_applied_changes: []
+            dns_sync_authorization_denied: false
+
+        - name: Apply and record Cloudflare managed DNS changes in order
+          include_tasks: ../../tasks/dns_records_sync_change.yml
+          loop: "{{ dns_changes }}"
+          loop_control:
+            loop_var: dns_change
+            label: "{{ dns_change.hostname }}:{{ dns_change.action }}"
+
+        - name: Emit final structured DNS sync outputs
+          debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ {'applied_changes': dns_sync_applied_changes} | to_json }}
+
+        - name: Report DNS synchronization completed
+          shell: |
+            printf 'OPERATION_STEP={"name":"dns_sync:complete","status":"completed","metadata":{"display_name":"DNS records synced","provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ dns_sync_applied_changes | length }}"
+          args:
+            executable: /bin/sh
+      rescue:
+        - name: Emit partial structured DNS sync outputs after failure
+          debug:
+            msg: >-
+              TEMPLATE_OUTPUT_JSON={{ ({'applied_changes': dns_sync_applied_changes | default([])} | combine({'authorization_denied': true} if dns_sync_authorization_denied | default(false) | bool else {})) | to_json }}
+
+        - name: Report DNS synchronization failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"dns_sync:failure","status":"failed","metadata":{"display_name":"DNS sync failed","provider":"%s","zone_name":"%s","applied_count":%s}}\n' "{{ provider }}" "{{ zone_name }}" "{{ (dns_sync_applied_changes | default([])) | length }}"
+          args:
+            executable: /bin/sh
+
+        - name: Fail DNS sync operation
+          fail:
+            msg: "Managed DNS sync failed"

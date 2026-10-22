@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "baseline_docker",
+  "engine": "ansible",
+  "documentation": "baseline_docker.md"
+}

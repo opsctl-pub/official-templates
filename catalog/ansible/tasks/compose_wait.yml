@@ -1,0 +1,17 @@
+---
+- name: Observe one finite readiness iteration
+  ansible.builtin.include_tasks: compose_observe.yml
+  when: not (compose_ready | default(false)) and now(utc=true).timestamp() | int < compose_wait_deadline
+
+- name: Pause between bounded readiness observations
+  ansible.builtin.pause:
+    seconds: "{{ [5, [1, compose_wait_deadline - (now(utc=true).timestamp() | int)] | max] | min }}"
+  when:
+    - compose_observation_complete
+    - not compose_ready
+    - now(utc=true).timestamp() | int < compose_wait_deadline
+
+- name: Refuse unavailable readiness observation without retrying unknown state
+  ansible.builtin.assert:
+    that: compose_observation_complete
+    fail_msg: Compose native observation is incomplete.

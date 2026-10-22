@@ -1,0 +1,77 @@
+{
+  "format_version": 1,
+  "item_id": "container_remove",
+  "engine": "ansible",
+  "result_version": 1,
+  "workload_files": {"version": 1, "capability": "cleanup"},
+  "examples": [
+    {
+      "case": "recorded_absent",
+      "outputs": {
+        "image_runtime": {
+          "action": "remove",
+          "observation_complete": true,
+          "ready": null,
+          "container": null,
+          "previous_container_absent": true,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    },
+    {
+      "case": "absent_without_predecessor",
+      "outputs": {
+        "image_runtime": {
+          "action": "remove",
+          "observation_complete": true,
+          "ready": null,
+          "container": null,
+          "previous_container_absent": null,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    },
+    {
+      "case": "present_not_removed",
+      "outputs": {
+        "image_runtime": {
+          "action": "remove",
+          "observation_complete": true,
+          "ready": null,
+          "container": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "example-app",
+            "replica": null,
+            "image_ref": "registry.example/app:release",
+            "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "image_digest": null,
+            "state": "running",
+            "health": "none",
+            "exit_code": 0,
+            "ports": [],
+            "mounts": []
+          },
+          "previous_container_absent": false,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    },
+    {
+      "case": "incomplete_nullready",
+      "outputs": {
+        "image_runtime": {
+          "action": "remove",
+          "observation_complete": false,
+          "ready": null,
+          "container": null,
+          "previous_container_absent": null,
+          "volumes": [],
+          "networks": []
+        }
+      }
+    }
+  ]
+}

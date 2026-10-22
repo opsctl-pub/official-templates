@@ -1,0 +1,52 @@
+---
+- name: Enroll the registered Server public SSH host key locally
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Observe the recorded SSH endpoint without a login or private key
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - |
+            import ipaddress, json, subprocess, sys, tempfile
+            from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+            request = json.loads(sys.argv[1])
+            result = dict(operation_id=request['operation_id'], server_id=request['server_id'],
+                          outcome='unavailable', host_public_key=None, reason='observation_failed')
+            families = ['ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa']
+            try:
+                assert set(request) == {'operation_id', 'server_id', 'address', 'port'}
+                address = str(ipaddress.ip_address(request['address']))
+                port = request['port']
+                assert type(port) is int and 1 <= port <= 65535
+                with tempfile.TemporaryFile() as output:
+                    subprocess.run(['ssh-keyscan', '-p', str(port), '-T', '10', '-t', 'ed25519,ecdsa,rsa', address],
+                                   stdout=output, stderr=subprocess.DEVNULL, timeout=30, check=True)
+                    output.seek(0)
+                    data = output.read(32769)
+                rows = [line.split() for line in data.decode('ascii').splitlines() if not line.startswith('#')]
+                if len(data) > 32768 or len(rows) > 8:
+                    result['reason'] = 'candidate_limit'
+                else:
+                    keys = sorted({' '.join(row[1:]) for row in rows if len(row) == 3 and row[1] in families},
+                                  key=lambda key: (families.index(key.split()[0]), key))
+                    for key in keys:
+                        assert len(key) <= 4096
+                        load_ssh_public_key(key.encode('ascii'))
+                    if keys:
+                        result.update(outcome='observed', host_public_key=keys[0], reason='observed')
+                    else:
+                        result['reason'] = 'no_supported_host_key'
+            except FileNotFoundError:
+                result['reason'] = 'openssh_unavailable'
+            except (ValueError, AssertionError, OSError, subprocess.SubprocessError):
+                pass
+            print(json.dumps({'ssh_host_key_observation': result}, separators=(',', ':')))
+          - "{{ ssh_host_key_request | to_json }}"
+      register: enrollment
+      changed_when: false
+    - name: Publish only the public observation
+      ansible.builtin.debug:
+        msg: "TEMPLATE_OUTPUT_JSON={{ enrollment.stdout }}"

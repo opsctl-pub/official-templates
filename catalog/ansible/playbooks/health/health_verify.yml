@@ -1,0 +1,239 @@
+---
+- name: Verify health endpoint (official)
+  hosts: all
+  gather_facts: false
+  vars:
+    timeout_s: 60
+    resolved_health_mode: "{{ health_mode | default('http') }}"
+    resolved_health_target_kind: "{{ health_target_kind | default('loopback') }}"
+    resolved_expected_status: "{{ expected_status | default(200) | int }}"
+    resolved_health_validate_certs: "{{ health_validate_certs | default(true) }}"
+    resolved_health_url: >-
+      {{ health_url if resolved_health_target_kind == 'loopback' else
+         'http://' ~ health_host ~ ':' ~ (health_port | string) ~ health_path }}
+  tasks:
+    - name: Verify an explicitly bound private upstream request
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/private_http_verification.yml"
+      when: verification_kind is defined
+
+    - name: Validate health verification mode
+      assert:
+        that:
+          - resolved_health_mode in ['http', 'tcp_connect']
+        fail_msg: "health_mode must be http or tcp_connect"
+
+    - name: Verify health endpoint
+      block:
+        - name: Report HTTP health check started
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"http","url":"%s"}}\n' "{{ resolved_health_url }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'http'
+
+        - name: Validate direct HTTP assertion inputs
+          assert:
+            that:
+              - resolved_health_target_kind in ['loopback', 'wireguard']
+              - >-
+                (resolved_health_target_kind == 'wireguard') or
+                (resolved_health_url is match('^https?://127\\.0\\.0\\.1:[0-9]+/.*$'))
+              - resolved_expected_status >= 100
+              - resolved_expected_status <= 599
+              - resolved_health_validate_certs is boolean
+              - resolved_health_url is match('^https://') or resolved_health_validate_certs
+              - body_contains is not defined or (body_contains is string and body_contains | length > 0 and body_contains | length <= 1024)
+            fail_msg: "HTTP health endpoint settings are invalid"
+          when: resolved_health_mode == 'http'
+
+        - name: Validate WireGuard HTTP target
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import ipaddress
+                import sys
+                from urllib.parse import urlsplit
+
+                host, port_raw, path, url = sys.argv[1:5]
+                try:
+                    address = ipaddress.ip_address(host)
+                    port = int(port_raw)
+                    if str(address) != host or not 1 <= port <= 65535:
+                        raise ValueError
+                    if (
+                        not path.startswith('/')
+                        or path.startswith('//')
+                        or any(character.isspace() for character in path)
+                        or '\\' in path
+                        or '?' in path
+                        or '#' in path
+                    ):
+                        raise ValueError
+                    expected_host = f'[{host}]' if ':' in host else host
+                    expected_url = f'http://{expected_host}:{port}{path}'
+                    parsed = urlsplit(url)
+                    if (
+                        url != expected_url
+                        or parsed.scheme != 'http'
+                        or parsed.hostname != host
+                        or parsed.port != port
+                        or parsed.path != path
+                        or parsed.username is not None
+                        or parsed.password is not None
+                        or parsed.query
+                        or parsed.fragment
+                    ):
+                        raise ValueError
+                except (TypeError, ValueError, IndexError):
+                    raise SystemExit(1)
+              - "{{ health_host }}"
+              - "{{ health_port }}"
+              - "{{ health_path }}"
+              - "{{ health_url }}"
+          args:
+            chdir: /tmp
+          changed_when: false
+          when: resolved_health_mode == 'http' and resolved_health_target_kind == 'wireguard'
+          failed_when: _wireguard_health_target.rc != 0
+          register: _wireguard_health_target
+
+        - name: Check HTTP health endpoint
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import json
+                import ssl
+                import sys
+                import urllib.error
+                import urllib.request
+
+                class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+
+                url, expected_raw, needle, headers_raw, validate_raw = sys.argv[1:6]
+                expected = int(expected_raw)
+                validate_certs = validate_raw == "true"
+                result = {
+                    "body_match": needle == "",
+                    "error_code": "connection_failed",
+                    "status": 0,
+                }
+                try:
+                    headers = json.loads(headers_raw)
+                    if not isinstance(headers, dict):
+                        raise ValueError("health headers must be an object")
+                    request = urllib.request.Request(url, headers=headers)
+                    handlers = [NoRedirectHandler()]
+                    if url.startswith("https://") and not validate_certs:
+                        ssl_context = ssl.create_default_context()
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+                        handlers.append(
+                            urllib.request.HTTPSHandler(
+                                context=ssl_context
+                            )
+                        )
+                    opener = urllib.request.build_opener(*handlers)
+                    try:
+                        response = opener.open(request, timeout=6)
+                    except urllib.error.HTTPError as error:
+                        response = error
+                    with response:
+                        result["status"] = response.getcode()
+                        body = response.read(65537)
+                    if len(body) > 65536:
+                        result["error_code"] = "response_too_large"
+                        print(json.dumps(result, separators=(",", ":")))
+                        raise SystemExit(4)
+                    result["body_match"] = (
+                        needle == ""
+                        or needle in body.decode("utf-8", errors="replace")
+                    )
+                    if result["status"] != expected:
+                        result["error_code"] = "status_mismatch"
+                        print(json.dumps(result, separators=(",", ":")))
+                        raise SystemExit(2)
+                    if not result["body_match"]:
+                        result["error_code"] = "content_mismatch"
+                        print(json.dumps(result, separators=(",", ":")))
+                        raise SystemExit(3)
+                    result["error_code"] = "none"
+                    print(json.dumps(result, separators=(",", ":")))
+                except Exception:
+                    print(json.dumps(result, separators=(",", ":")))
+                    raise SystemExit(5)
+              - "{{ resolved_health_url }}"
+              - "{{ resolved_expected_status }}"
+              - "{{ body_contains | default('') }}"
+              - "{{ health_headers | default({}) | to_json }}"
+              - "{{ resolved_health_validate_certs | bool | lower }}"
+          register: _resp
+          changed_when: false
+          no_log: true
+          retries: 10
+          delay: 3
+          until: _resp.rc == 0
+          when: resolved_health_mode == 'http'
+
+        - name: Read HTTP health result
+          ansible.builtin.set_fact:
+            _health_result: "{{ _resp.stdout | from_json }}"
+          when: resolved_health_mode == 'http'
+
+        - name: Report HTTP health check passed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"display_name":"Health check passed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'http'
+
+        - name: Report TCP connection check started
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:start","status":"running","metadata":{"display_name":"Check health","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'tcp_connect'
+
+        - name: Check TCP connectivity
+          wait_for:
+            host: "{{ health_host }}"
+            port: "{{ health_port }}"
+            state: started
+            timeout: "{{ timeout_s | int }}"
+            connect_timeout: 5
+          when: resolved_health_mode == 'tcp_connect'
+
+        - name: Report TCP connection check passed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"display_name":"Health check passed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'tcp_connect'
+      rescue:
+        - name: Read failed HTTP health result
+          ansible.builtin.set_fact:
+            _health_result: "{{ _resp.stdout | default('{\"status\":0,\"body_match\":false,\"error_code\":\"probe_failed\"}') | from_json }}"
+          when: resolved_health_mode == 'http'
+
+        - name: Report HTTP health check failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'http'
+
+        - name: Report TCP connection check failed
+          shell: |
+            printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"tcp_connect","host":"%s","port":"%s"}}\n' "{{ health_host }}" "{{ health_port }}"
+          args:
+            executable: /bin/sh
+          when: resolved_health_mode == 'tcp_connect'
+
+        - name: Fail health verification
+          fail:
+            msg: "Health verification failed"

@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_automatic_certificate",
+  "engine": "ansible",
+  "documentation": "traefik_automatic_certificate.md"
+}

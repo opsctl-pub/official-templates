@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "observe_traefik_certificate",
+  "engine": "ansible",
+  "documentation": "observe_traefik_certificate.md"
+}

@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "compose_inspect",
+  "engine": "ansible",
+  "documentation": "compose_inspect.md"
+}

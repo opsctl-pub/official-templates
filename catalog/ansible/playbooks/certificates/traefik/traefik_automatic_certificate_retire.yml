@@ -1,0 +1,21 @@
+---
+- name: Retire only the subject's automatic selection and enrollment
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    traefik_dynamic_dir: /etc/traefik/dynamic/opsctl
+    traefik_certificate_dir: /etc/traefik/certificates/opsctl
+    certificate_allow_uninstalled_gateway: >-
+      {{ expected_certificate | default(none) ==
+         {'presence': 'absent', 'source': none, 'material_id': none,
+          'revision_id': none, 'leaf_fingerprint_sha256': none} }}
+  pre_tasks:
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+  tasks:
+    - name: Retire the authorized automatic subject without touching other sources
+      ansible.builtin.include_tasks: ../../../tasks/traefik_server_dashboard_retirement.yml
+      vars:
+        certificate_dashboard_retirement: false

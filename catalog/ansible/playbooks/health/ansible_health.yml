@@ -1,0 +1,16 @@
+---
+- name: Check Ansible inside the Runner
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Report Runner Ansible check started
+      shell: |
+        printf 'OPERATION_STEP={"name":"ansible:health:start","status":"running","metadata":{"display_name":"Check Ansible health","engine":"ansible"}}\n'
+
+    - name: Report successful Ansible execution
+      debug:
+        msg: "Ansible ran successfully inside the Runner."
+
+    - name: Report Runner Ansible check completed
+      shell: |
+        printf 'OPERATION_STEP={"name":"ansible:health:done","status":"completed","metadata":{"display_name":"Ansible health check complete","engine":"ansible","duration_ms":1}}\n'

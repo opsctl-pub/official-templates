@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "traefik_automatic_certificate_retire",
+  "engine": "ansible",
+  "documentation": "traefik_automatic_certificate_retire.md"
+}

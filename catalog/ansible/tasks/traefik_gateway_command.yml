@@ -1,0 +1,46 @@
+---
+- name: Validate managed Traefik command inputs
+  assert:
+    that:
+      - traefik_gateway_dashboard_enabled is boolean
+      - traefik_dynamic_dir is string
+      - traefik_dynamic_dir is match('^/[A-Za-z0-9_./-]+$')
+      - traefik_gateway_target_major == 3
+      - traefik_gateway_target_version == '3.7.13'
+    fail_msg: "Traefik gateway command inputs are invalid"
+
+- name: Build managed Traefik command arguments
+  set_fact:
+    traefik_command_args: >-
+      {{
+        [
+          '--providers.docker=true',
+          '--providers.docker.exposedbydefault=false',
+          '--providers.file.directory=' ~ traefik_dynamic_dir,
+          '--providers.file.watch=true',
+          '--core.defaultRuleSyntax=v3',
+          '--ping=true',
+          '--accesslog=true',
+          '--accesslog.format=json',
+          '--accesslog.fields.defaultmode=drop',
+          '--accesslog.fields.names.RouterName=keep',
+          '--accesslog.fields.names.ServiceURL=keep',
+          '--accesslog.fields.names.OriginStatus=keep',
+          '--accesslog.fields.names.DownstreamStatus=keep',
+          '--accesslog.fields.names.RequestHost=keep',
+          '--accesslog.fields.names.RequestMethod=keep',
+          '--accesslog.fields.names.RequestPath=keep',
+          '--accesslog.fields.names.TLSVersion=keep',
+          '--accesslog.fields.headers.defaultmode=drop',
+          '--accesslog.fields.headers.names.X-Opsctl-Request-Id=keep',
+          '--entrypoints.web.observability.accesslogs=false',
+          '--entrypoints.websecure.observability.accesslogs=false',
+          '--entrypoints.web.address=:80',
+          '--entrypoints.websecure.address=:443'
+        ]
+        + (
+          ['--api.dashboard=true']
+          if traefik_gateway_dashboard_enabled
+          else []
+        )
+      }}

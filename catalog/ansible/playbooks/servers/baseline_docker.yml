@@ -1,0 +1,9 @@
+---
+- name: Baseline Docker (install and verify)
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Run managed Docker baseline
+      import_role:
+        name: ../../roles/baseline_docker

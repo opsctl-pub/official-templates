@@ -1,0 +1,4 @@
+PULSE_API_URL={{ pulse_api_url | to_json }}
+PULSE_TOKEN={{ pulse_token | to_json }}
+PULSE_INTERVAL_SECONDS={{ pulse_interval_seconds | int }}
+PULSE_ENABLE_DOCKER={{ (pulse_enable_docker | bool) | ternary("true", "false") }}
