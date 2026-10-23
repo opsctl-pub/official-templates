@@ -10,6 +10,11 @@ and IPv6 default to false; `vpc_uuid` and `user_data` default to empty.
 `terraform` and `opsctl`. An optional nonempty `project_name` creates a provider
 project and assigns the Droplet; this is not an OpsCtl Project.
 
+`private_ingress_rules` defaults to `[]`. Each row has `protocol: "tcp"`, an
+integer `port` (1–65535), and `source_addresses` containing one qualified IPv4
+host `/32`. These are separate from public `ingress_rules`; the module never
+discovers peers, changes VPC ownership or implies workload connectivity.
+
 `ssh_port` defaults to 22. A different integer port (1–65535) requires a declared
 Ubuntu 22.04/24.04 bootstrap profile and empty custom user data. Destroy mode
 requires the recorded `droplet_id`; optional `destroy_firewall` defaults to false

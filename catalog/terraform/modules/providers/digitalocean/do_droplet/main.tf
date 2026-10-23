@@ -78,6 +78,15 @@ resource "digitalocean_firewall" "server" {
     }
   }
 
+  dynamic "inbound_rule" {
+    for_each = var.private_ingress_rules
+    content {
+      protocol         = inbound_rule.value.protocol
+      port_range       = tostring(inbound_rule.value.port)
+      source_addresses = inbound_rule.value.source_addresses
+    }
+  }
+
   outbound_rule {
     protocol              = "tcp"
     port_range            = "1-65535"

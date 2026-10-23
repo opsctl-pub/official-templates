@@ -102,6 +102,27 @@ variable "vpc_uuid" {
   default     = ""
 }
 
+variable "private_ingress_rules" {
+  description = "Explicit single-port TCP allowances from qualified private IPv4 peers"
+  type = list(object({
+    protocol         = string
+    port             = number
+    source_addresses = list(string)
+  }))
+  default = []
+
+  validation {
+    condition = length(var.private_ingress_rules) <= 32 && alltrue([
+      for rule in var.private_ingress_rules : rule.protocol == "tcp" &&
+      rule.port >= 1 && rule.port <= 65535 && floor(rule.port) == rule.port &&
+      length(rule.source_addresses) == 1 && alltrue([
+        for address in rule.source_addresses : can(cidrnetmask(address)) && endswith(address, "/32")
+      ])
+    ])
+    error_message = "Private ingress requires at most 32 single-port TCP rules with one IPv4 /32 source each."
+  }
+}
+
 variable "user_data" {
   description = "Cloud-init user data script (optional)"
   type        = string

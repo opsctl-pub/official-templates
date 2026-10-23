@@ -1,6 +1,11 @@
 {
   "format_version": 1,
   "engine": "opentofu",
+  "private_ingress": {
+    "input": "private_ingress_rules",
+    "source": "ipv4_host",
+    "protocols": ["tcp"]
+  },
   "ssh_bootstrap": {
     "input": "ssh_port",
     "configuration": "first_boot",
