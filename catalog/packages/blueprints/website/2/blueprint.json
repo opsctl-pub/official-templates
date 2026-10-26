@@ -1,0 +1,32 @@
+{
+  "apiVersion": "opsctl.com/v2",
+  "kind": "Blueprint",
+  "expressionProfile": "core/1",
+  "metadata": {"name": "website", "description": "One routed HTTP origin on an inherited Server."},
+  "inputs": {
+    "image": {"type": "string"},
+    "domain": {"type": "string"},
+    "http_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "environment": {"type": "map", "items": {"type": "string"}, "default": {}}
+  },
+  "targets": {"host": {"kind": "Server", "allow": ["existing"]}},
+  "defaultTarget": "host",
+  "resources": [
+    {
+      "apiVersion": "core.opsctl.com/v1",
+      "kind": "Service",
+      "name": "website",
+      "spec": {
+        "image": "${input.image}",
+        "env": "${input.environment}",
+        "ports": {"http": {"port": "${input.http_port}", "protocol": "http", "access": "private"}},
+        "routes": [{"host": "${input.domain}", "port": "http", "paths": ["/"]}]
+      }
+    }
+  ],
+  "outputs": {
+    "http_port": {"type": {"type": "integer"}, "value": "${input.http_port}"},
+    "protocol": {"type": {"type": "string"}, "value": "http"},
+    "domain": {"type": {"type": "string"}, "value": "${input.domain}"}
+  }
+}
