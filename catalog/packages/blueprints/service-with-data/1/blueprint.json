@@ -1,0 +1,66 @@
+{
+  "apiVersion": "opsctl.com/v2",
+  "kind": "Blueprint",
+  "metadata": {
+    "name": "service-with-data",
+    "description": "One private service with retained local data on an inherited Server."
+  },
+  "inputs": {
+    "image": {"type": "string"},
+    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "protocol": {"type": "enum", "values": ["http", "tcp"]},
+    "requested_bytes": {"type": "integer", "minimum": 1},
+    "mount_path": {"type": "string"},
+    "environment": {"type": "map", "items": {"type": "string"}, "default": {}}
+  },
+  "targets": {"host": {"kind": "Server", "allow": ["existing"]}},
+  "defaultTarget": "host",
+  "resources": [
+    {
+      "name": "private",
+      "kind": "Network",
+      "spec": {"profile": "core/local-network", "config": {"target": "${target.host}"}}
+    },
+    {
+      "name": "data",
+      "kind": "Volume",
+      "spec": {
+        "backing": {"profile": "core/local-disk", "target": "${target.host}", "config": {}},
+        "capacity": {"requested": "${input.requested_bytes}"},
+        "access": {"mode": "exclusive_writer", "exclusion": "core/controlled-host"},
+        "retention": {"onDestroy": "retain"}
+      },
+      "lifecycle": {"onOmit": "retain"}
+    },
+    {
+      "name": "app",
+      "kind": "Service",
+      "spec": {
+        "networks": {"private": "${resource.private.binding}"},
+        "containers": {"app": {
+          "image": "${input.image}",
+          "env": "${input.environment}",
+          "ports": {"service": {"port": "${input.port}", "protocol": "${input.protocol}", "access": "private"}},
+          "mounts": [{"volume": "${resource.data.binding}", "path": "${input.mount_path}", "mode": "rw"}]
+        }},
+        "endpoints": {"service": {"container": "app", "port": "service", "network": "private"}}
+      }
+    }
+  ],
+  "outputs": {
+    "network": {"type": {"type": "reference", "schema": "core/Network"}, "value": "${resource.private.binding}"},
+    "host": {"type": {"type": "string"}, "value": "${resource.app.endpoints.service.host}"},
+    "port": {"type": {"type": "integer"}, "value": "${input.port}"},
+    "protocol": {"type": {"type": "enum", "values": ["http", "tcp"]}, "value": "${input.protocol}"},
+    "mount_path": {"type": {"type": "string"}, "value": "${input.mount_path}"},
+    "data": {
+      "type": {"type": "record", "properties": {
+        "kind": {"type": "enum", "values": ["Volume"]},
+        "id": {"type": "string"},
+        "target_server_id": {"type": "string"},
+        "generation": {"type": "integer", "minimum": 1}
+      }, "required": ["kind", "id", "target_server_id", "generation"]},
+      "value": "${resource.data.binding}"
+    }
+  }
+}
