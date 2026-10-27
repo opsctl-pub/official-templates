@@ -1,0 +1,27 @@
+{
+  "apiVersion": "opsctl.com/v2",
+  "kind": "Blueprint",
+  "expressionProfile": "core/1",
+  "metadata": {"name": "starter-websites", "description": "Keyed routed websites on one selected Server destination."},
+  "accounts": {"compute": {}, "dns": {}},
+  "targets": {"host": {"kind": "Server", "allow": ["create", "existing"], "account": "compute", "runtime": {"profile": "core/linux-docker", "spec": {}}}},
+  "defaultTarget": "host",
+  "inputs": {"sites": {"type": "map", "items": {
+    "type": "record",
+    "properties": {
+      "image": {"type": "string"},
+      "http_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+      "domain": {"type": "string"},
+      "environment": {"type": "map", "items": {"type": "string"}}
+    },
+    "required": ["image", "http_port", "domain", "environment"]
+  }}},
+  "modules": {"sites": {"source": "official://website@2", "target": "host", "forEach": "${input.sites}", "inputs": {
+    "image": "${each.value.image}",
+    "http_port": "${each.value.http_port}",
+    "domain": "${each.value.domain}",
+    "environment": "${each.value.environment}"
+  }}},
+  "resources": [],
+  "outputs": {}
+}

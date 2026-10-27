@@ -1,0 +1,23 @@
+{
+  "apiVersion": "opsctl.com/v2",
+  "kind": "Blueprint",
+  "expressionProfile": "core/1",
+  "metadata": {"name": "starter-website", "description": "One routed website on one selected Server destination."},
+  "accounts": {"compute": {}, "dns": {}},
+  "targets": {"host": {"kind": "Server", "allow": ["create", "existing"], "account": "compute", "runtime": {"profile": "core/linux-docker", "spec": {}}}},
+  "defaultTarget": "host",
+  "inputs": {
+    "image": {"type": "string"},
+    "http_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "domain": {"type": "string"},
+    "environment": {"type": "map", "items": {"type": "string"}, "default": {}}
+  },
+  "modules": {"site": {"source": "official://website@2", "target": "host", "inputs": {
+    "image": "${input.image}",
+    "http_port": "${input.http_port}",
+    "domain": "${input.domain}",
+    "environment": "${input.environment}"
+  }}},
+  "resources": [],
+  "outputs": {}
+}

@@ -1,0 +1,35 @@
+{
+  "apiVersion": "opsctl.com/v2",
+  "kind": "Blueprint",
+  "expressionProfile": "core/1",
+  "metadata": {
+    "name": "backup",
+    "description": "Manual backup intent for an existing Volume and repository."
+  },
+  "inputs": {
+    "data": {"type": "reference", "schema": "core/Volume"},
+    "repository": {"type": "reference", "schema": "core/BackupDestination"}
+  },
+  "targets": {
+    "host": {"kind": "Server", "allow": ["existing"]}
+  },
+  "defaultTarget": "host",
+  "resources": [
+    {
+      "apiVersion": "core.opsctl.com/v1",
+      "name": "backup",
+      "kind": "BackupPolicy",
+      "spec": {
+        "subjects": ["${input.data}"],
+        "destination": "${input.repository}",
+        "method": {"profile": "restic_volume_copy_v1", "config": {}},
+        "consistency": "offline_file_copy_no_application_consistency_guarantee",
+        "retention": {"mode": "preserve"}
+      }
+    }
+  ],
+  "outputs": {
+    "policy_id": {"type": {"type": "string"}, "value": "${resource.backup.policy_id}"},
+    "policy_digest": {"type": {"type": "string"}, "value": "${resource.backup.policy_digest}"}
+  }
+}
