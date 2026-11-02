@@ -324,6 +324,7 @@
 
         - name: Copy frozen original bytes without template rendering or payload execution
           ansible.builtin.copy:
+            decrypt: false
             src: "{{ template_source_directory }}/{{ supplied_file.source }}"
             dest: "{{ template_delivery_workspace }}/{{ supplied_file.path }}"
             mode: "{{ supplied_file.mode }}"
