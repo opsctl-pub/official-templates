@@ -333,11 +333,56 @@
           when: compose_managed_override_file | default(none) is not none
           diff: false
 
-        - name: Retain exact original order followed by the qualified managed override
+        - name: Require the exact operation-mounted named settings override
+          ansible.builtin.assert:
+            that:
+              - compose_settings_override_file == compose_source_directory + '/compose-settings.yaml'
+              - (compose_settings_override_file | realpath).startswith((compose_source_directory | realpath) + '/')
+          when: compose_settings_override_file | default(none) is not none
+
+        - name: Observe the frozen named settings override before copying bytes
+          ansible.builtin.stat:
+            path: "{{ compose_settings_override_file }}"
+            follow: true
+            get_checksum: false
+            get_mime: false
+          delegate_to: 127.0.0.1
+          become: false
+          register: compose_settings_override_stat
+          when: compose_settings_override_file | default(none) is not none
+
+        - name: Require a bounded regular named settings override
+          ansible.builtin.assert:
+            that:
+              - compose_settings_override_stat.stat.isreg | default(false)
+              - compose_settings_override_stat.stat.size > 0
+              - compose_settings_override_stat.stat.size <= 262144
+          when: compose_settings_override_file | default(none) is not none
+
+        - name: Copy named settings without interpreting their literal bytes
+          ansible.builtin.copy:
+            src: "{{ compose_settings_override_file }}"
+            dest: "{{ compose_auth_directory.path }}/compose-settings.yaml"
+            mode: '0600'
+            decrypt: false
+            backup: false
+          diff: false
+          when: compose_settings_override_file | default(none) is not none
+
+        - name: Stage the exact selected readonly files in their owned incarnation
+          ansible.builtin.include_tasks: ../../tasks/container_secret_files.yml
+          vars:
+            workload_secret_action: stage
+            workload_secret_incarnation: "{{ compose_secret_file_incarnation }}"
+          when: compose_secret_file_incarnation | default(none) is not none
+
+        - name: Retain original order followed by managed volumes and named settings
           ansible.builtin.set_fact:
             compose_effective_files: >-
               {{ compose_files + ([compose_auth_directory.path + '/managed-volumes.yaml']
-                if compose_managed_override_file | default(none) is not none else []) }}
+                if compose_managed_override_file | default(none) is not none else []) +
+                ([compose_auth_directory.path + '/compose-settings.yaml']
+                if compose_settings_override_file | default(none) is not none else []) }}
 
         - name: Load only the delivered plain registry selection
           ansible.builtin.set_fact:
@@ -805,6 +850,17 @@
           ansible.builtin.debug:
             msg: 'OPERATION_STEP={"name":"compose:observe","status":"completed","metadata":{"display_name":"Observe Compose readiness"}}'
           no_log: false
+
+        - name: Retire prior file incarnations only after their native consumers are absent
+          ansible.builtin.include_tasks: ../../tasks/container_secret_files.yml
+          vars:
+            workload_secret_action: cleanup
+            workload_secret_incarnation: "{{ compose_retired_file_incarnation }}"
+          loop: "{{ compose_secret_file_cleanup_incarnations | default([]) }}"
+          loop_control:
+            loop_var: compose_retired_file_incarnation
+            label: retained file incarnation
+          when: compose_retired_file_incarnation != compose_secret_file_incarnation | default(none)
 
         - name: Record complete native deployment
           ansible.builtin.set_fact:

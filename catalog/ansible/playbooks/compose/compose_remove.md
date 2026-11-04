@@ -5,6 +5,11 @@ type `remove_container`. Use its existing catalog registration or Automation
 Override and normal inventory/SSH access. It needs no source files, registry
 Secret or generated Compose model.
 
+Retained settings staging requires this selected source's explicit
+`settings_delivery:{version:1,capability:cleanup}` declaration. Its adjacent
+documentation is still validated. An older undeclared source cannot perform file
+cleanup; ordinary removal without retained staging keeps its original contract.
+
 ## Inputs
 
 | Variable | Default | Origin/contract |
@@ -17,6 +22,7 @@ Secret or generated Compose model.
 | `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,birth_marker,origin}`; nullable timestamp/marker means keep-only. |
 | `compose_delete_volumes` | `[]` | Up to 64 unique explicit `{name,created_at,birth_marker}` selections; original created identity only. |
 | `compose_managed_volumes` | `[]` | Exact existing `{name,created_at,labels}` managed bindings; retain data, verify local identity and no foreign users. Only the managed Volume owner deletes these external backings. |
+| `compose_secret_file_cleanup_incarnations` | `[]` | Up to 128 exact retained Operation UUIDs, including admitted failed attempts; after workload absence, remove only their owned files if no native container still mounts the namespace. Requires admitted `app_org_id`, `app_deployment_id` and `server_id`. |
 
 Observe current project members and recorded incarnations/users before effects.
 Exact inspected local built-ins `none`/`null` and `host`/`host` are external when

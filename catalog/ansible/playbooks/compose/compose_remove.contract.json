@@ -2,5 +2,9 @@
   "format_version": 1,
   "item_id": "compose_remove",
   "engine": "ansible",
-  "documentation": "compose_remove.md"
+  "documentation": "compose_remove.md",
+  "settings_delivery": {
+    "version": 1,
+    "capability": "cleanup"
+  }
 }

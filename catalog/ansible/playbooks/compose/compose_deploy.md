@@ -24,6 +24,12 @@ retain it only when their meanings stay the same. Each run still uses its select
 immutable source. The declaration does not grant access, guarantee convergence
 or authorize a stale execution.
 
+Named settings and replacement of retained staging require the explicit
+`settings_delivery:{version:1,capability:delivery_and_replacement_cleanup}`
+declaration at the selected immutable source. The managed behavior revision is
+not a substitute. Sources without this member remain valid for literal delivery
+with no retained staging. Review also binds the declared removal source.
+
 ## Inputs
 
 | Variable | Default/type | Origin and meaning |
@@ -47,6 +53,15 @@ or authorize a stale execution.
 | `compose_managed_override_file` | null | Exact `compose_source_directory + '/compose-managed-volumes.yaml'`; an `!override` that marks the selected managed volumes as external, kept separate from the original files and applied last. |
 | `compose_managed_volumes` | `[]`; up to 64 objects | Existing `{name,created_at,labels}` managed identities; exact local driver/options/labels/incarnation and no foreign consumers are verified, never created or deleted. |
 | `compose_managed_volume_keys` | `[]`; up to 64 keys | Current managed logical keys, disjoint from empty/reuse; each resolves to exactly one managed external volume. |
+| `compose_settings_override_file` | null | Exact operation-mounted `compose-settings.yaml`, appended after managed volumes; selected per-service env and readonly mounts only. Original files remain unchanged. |
+| `compose_secret_file_incarnation` | null UUID | Current Operation owning staged files; version 2 of `workload-secret-files.json` binds each file to an admitted service. |
+| `compose_secret_file_cleanup_incarnations` | `[]`; up to 128 UUIDs | Retained exact incarnations to retire after apply, only when no native container mounts their confined namespace. Uncertainty retains files. |
+
+File staging/cleanup also requires the admitted `app_org_id`, `app_deployment_id`
+and `server_id` UUIDs. Version 2 adds `consumer:compose` and a `service` per file;
+the same target in different services is valid. Image version 1 remains unchanged.
+Each flat selected file is bounded to 65536 bytes, with 16 files and 131072 bytes
+total. Staging preserves empty/binary bytes and root-only numeric permissions.
 
 Files/env selections must resolve to supplied paths. Supplied paths are regular
 files, not symlinks/special files. Workspace ancestors and destinations are checked

@@ -125,6 +125,16 @@
               - compose_observed_instances | length == 0
               - compose_known_containers | default([]) | difference(compose_absent_containers) | length == 0
 
+        - name: Retire exact recorded file incarnations after native workload absence
+          ansible.builtin.include_tasks: ../../tasks/container_secret_files.yml
+          vars:
+            workload_secret_action: cleanup
+            workload_secret_incarnation: "{{ compose_retired_file_incarnation }}"
+          loop: "{{ compose_secret_file_cleanup_incarnations | default([]) }}"
+          loop_control:
+            loop_var: compose_retired_file_incarnation
+            label: retained file incarnation
+
         - name: Select in-use network refusal
           ansible.builtin.set_fact:
             compose_reason: compose_resource_in_use
