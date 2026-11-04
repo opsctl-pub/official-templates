@@ -238,6 +238,7 @@
             src: "{{ compose_source_directory }}/{{ supplied_file.source }}"
             dest: "{{ compose_workspace }}/{{ supplied_file.path }}"
             mode: "{{ supplied_file.mode }}"
+            decrypt: false
             force: true
             backup: false
             follow: false
