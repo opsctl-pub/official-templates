@@ -44,6 +44,43 @@
               - compose_wait_timeout | default(300) is integer
               - compose_wait_timeout | default(300) >= 1 and compose_wait_timeout | default(300) <= 1800
 
+        - name: Qualify managed Docker HTTP discovery before installation effects
+          when: compose_http_backend | default(none) is not none
+          no_log: true
+          block:
+            - name: Validate the closed admitted backend identity
+              ansible.builtin.assert:
+                that:
+                  - compose_http_backend is mapping
+                  - compose_http_backend.keys() | sort == ['deployment_id', 'name', 'network', 'organization_id', 'project_name', 'service', 'target_port']
+                  - compose_http_backend.name == 'deployment-' + compose_http_backend.deployment_id
+                  - compose_http_backend.deployment_id is match('^[0-9a-f-]{36}$')
+                  - compose_http_backend.organization_id is match('^[0-9a-f-]{36}$')
+                  - compose_http_backend.project_name == compose_project_name
+                  - compose_http_backend.service in (compose_services | map(attribute='name') | list)
+                  - compose_http_backend.network is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+                  - compose_http_backend.target_port is integer
+                  - compose_http_backend.target_port >= 1 and compose_http_backend.target_port <= 65535
+                  - compose_managed_override_file | default(none) is not none
+
+            - name: Derive the exact managed labels from admitted inputs
+              ansible.builtin.set_fact:
+                compose_http_labels: >-
+                  {%- set labels = namespace(value={}) -%}
+                  {%- for key, value in compose_http_backend.items() -%}
+                  {%- set labels.value = labels.value | combine({'io.opsctl.http.' + key: value | string}) -%}
+                  {%- endfor -%}
+                  {{ labels.value | combine({
+                    'io.opsctl.http.managed': 'true', 'traefik.enable': 'true',
+                    'traefik.docker.network': compose_http_backend.network,
+                    'traefik.http.services.' + compose_http_backend.name + '.loadbalancer.server.port': compose_http_backend.target_port | string,
+                    'traefik.http.services.' + compose_http_backend.name + '.loadbalancer.server.scheme': 'http'}) }}
+
+            - name: Qualify managed Docker discovery before installation
+              ansible.builtin.include_tasks: ../../tasks/traefik_docker_discovery_policy.yml
+              vars:
+                traefik_discovery_org_id: "{{ compose_http_backend.organization_id }}"
+
         - name: Require the exact optional operation-mounted interpolation file spelling
           ansible.builtin.assert:
             that:
@@ -529,6 +566,24 @@
           ansible.builtin.set_fact:
             compose_native_config: "{{ compose_native_config_output.stdout | from_json }}"
 
+        - name: Require the native configuration to preserve the admitted private backend
+          ansible.builtin.assert:
+            that:
+              - native_http_service.network_mode | default('') == ''
+              - native_http_service.networks | length == 1
+              - compose_native_config.networks[native_http_service.networks.keys() | first].name == compose_http_backend.network
+              - native_http_service.ports | default([]) | selectattr('target', 'equalto', compose_http_backend.target_port) | selectattr('protocol', 'equalto', 'tcp') | list | length == 0
+              - native_http_labels == compose_http_labels
+          vars:
+            native_http_service: "{{ compose_native_config.services[compose_http_backend.service] }}"
+            native_http_labels: >-
+              {%- set labels = namespace(value={}) -%}
+              {%- for key, value in native_http_service.labels.items() -%}
+              {%- if key.startswith('io.opsctl.http.') or key.startswith('traefik.') -%}
+              {%- set labels.value = labels.value | combine({key: value}) -%}
+              {%- endif -%}{%- endfor -%}{{ labels.value }}
+          when: compose_http_backend | default(none) is not none
+
         - name: Project only selected native service readiness intent
           ansible.builtin.set_fact:
             compose_native_intent: >-
@@ -846,6 +901,38 @@
             that:
               - compose_observation_complete
               - compose_ready
+
+        - name: Verify the actual selected Docker backend before reporting completion
+          when: compose_http_backend | default(none) is not none
+          no_log: true
+          block:
+            - name: Select all instances of the admitted Compose service
+              community.docker.docker_host_info:
+                containers: true
+                containers_all: true
+                containers_filters:
+                  label:
+                    - "com.docker.compose.project={{ compose_http_backend.project_name }}"
+                    - "com.docker.compose.service={{ compose_http_backend.service }}"
+              register: compose_http_instances
+
+            - name: Refuse missing or ambiguous backend instances
+              ansible.builtin.assert:
+                that: compose_http_instances.containers | length == 1
+
+            - name: Read actual backend labels and network attachment
+              community.docker.docker_container_info:
+                name: "{{ compose_http_instances.containers[0].Id }}"
+              register: compose_http_instance
+
+            - name: Require the exact private managed backend
+              ansible.builtin.assert:
+                that:
+                  - compose_http_instance.exists
+                  - compose_http_instance.container.State.Status == 'running'
+                  - compose_http_instance.container.Config.Labels | combine(compose_http_labels) == compose_http_instance.container.Config.Labels
+                  - compose_http_instance.container.NetworkSettings.Networks.keys() | list == [compose_http_backend.network]
+                  - not compose_http_instance.container.NetworkSettings.Ports.get((compose_http_backend.target_port | string) + '/tcp')
 
         - name: Publish completed native observation
           ansible.builtin.debug:

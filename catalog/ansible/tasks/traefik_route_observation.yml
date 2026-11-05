@@ -122,10 +122,14 @@
             if (
               route_config is mapping
               and route_config.http is mapping
-              and route_config.http.services is mapping
+              and route_config.http.get('services') is mapping
             )
             else none
           }}
+
+    - name: Identify the selected backend representation
+      set_fact:
+        route_is_docker: "{{ route_router is mapping and route_router.get('service') == route_key + '@docker' }}"
 
     - name: Identify managed HTTP redirect shape
       set_fact:
@@ -173,18 +177,18 @@
           - route_config is mapping
           - route_config.keys() | list == ['http']
           - route_config.http is mapping
-          - route_config.http.keys() | sort in [['routers', 'services'], ['middlewares', 'routers', 'services']]
+          - route_config.http.keys() | sort == (['routers'] + (['middlewares'] if route_redirect_present else []) + ([] if route_is_docker else ['services'])) | sort
           - route_config.http.routers is mapping
-          - route_config.http.services is mapping
+          - route_is_docker or (route_config.http.services is mapping)
           - route_config.http.routers.keys() | sort in [[route_key], [route_key, redirect_route_key] | sort]
-          - route_config.http.services.keys() | list == [route_key]
+          - route_is_docker or (route_config.http.services.keys() | list == [route_key])
           - route_router is mapping
           - (route_router.keys() | difference(['entryPoints', 'middlewares', 'observability', 'priority', 'rule', 'service', 'tls']) | length) == 0
           - (['entryPoints', 'priority', 'rule', 'service'] | difference(route_router.keys()) | length) == 0
           - ('observability' not in route_router) or (route_router.observability is mapping)
           - ('observability' not in route_router) or (route_router.observability.keys() | list == ['accessLogs'])
           - ('observability' not in route_router) or (route_router.observability.accessLogs is sameas true)
-          - route_router.service == route_key
+          - route_router.service == route_key + ('@docker' if route_is_docker else '')
           - route_router.rule is string
           - route_router.rule is match(route_v3_rule_pattern)
           - (observed_route_hosts | length) > 0
@@ -195,6 +199,16 @@
           - (route_router.entryPoints == ['websecure']) == ('tls' in route_router)
           - ('tls' not in route_router) or (route_router.tls is mapping)
           - ('tls' not in route_router) or (route_router.tls == {})
+          - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
+          - (observed_backend_urls | select('match', '^http://(?:[0-9.]+|\[[0-9a-f:]+\]):[1-9][0-9]{0,4}$') | list | length) == (observed_backend_urls | length)
+          - (route_router.middlewares | default([])) is sequence
+          - (route_router.middlewares | default([])) is not string
+        fail_msg: "Managed Traefik route is malformed"
+      no_log: true
+
+    - name: Validate exact fixed URL backend structure
+      assert:
+        that:
           - route_service is mapping
           - route_service.keys() | list == ['loadBalancer']
           - route_service.loadBalancer is mapping
@@ -203,12 +217,7 @@
           - route_service.loadBalancer.servers | length > 0
           - route_service.loadBalancer.servers[0] is mapping
           - route_service.loadBalancer.servers[0].keys() | list == ['url']
-          - (observed_backend_urls | unique | list | length) == (observed_backend_urls | length)
-          - (observed_backend_urls | select('match', '^http://(?:[0-9.]+|\[[0-9a-f:]+\]):[1-9][0-9]{0,4}$') | list | length) == (observed_backend_urls | length)
-          - (route_router.middlewares | default([])) is sequence
-          - (route_router.middlewares | default([])) is not string
-        fail_msg: "Managed Traefik route is malformed"
-      no_log: true
+      when: not route_is_docker
 
     - name: Validate explicit parsed backend ports
       assert:
@@ -224,7 +233,7 @@
     - name: Validate route without managed HTTP redirect
       assert:
         that:
-          - route_config.http.keys() | sort == ['routers', 'services']
+          - route_config.http.keys() | sort == (['routers'] + ([] if route_is_docker else ['services'])) | sort
           - route_config.http.routers.keys() | list == [route_key]
         fail_msg: "Managed Traefik route is malformed"
       when: not route_redirect_present
@@ -253,12 +262,17 @@
         route_observation_base:
           presence: present
           hosts: "{{ observed_route_hosts }}"
-          route_port: "{{ observed_backend_urls[0] | urlsplit('port') }}"
+          route_port: "{{ none if route_is_docker else observed_backend_urls[0] | urlsplit('port') }}"
           https: "{{ 'tls' in route_router }}"
           redirect_http_to_https: "{{ route_redirect_present }}"
           middlewares: "{{ route_router.middlewares | default([]) }}"
           backends: "{{ observed_backend_urls }}"
           router_name: "{{ route_key }}@file"
+
+    - name: Retain only the file service reference in the plain comparison snapshot
+      set_fact:
+        route_observation_base: "{{ route_observation_base | combine({'docker_service': route_router.service}) }}"
+      when: route_is_docker
   rescue:
     - name: Set unknown route observation
       set_fact:

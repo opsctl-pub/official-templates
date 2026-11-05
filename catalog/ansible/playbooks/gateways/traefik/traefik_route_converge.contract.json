@@ -11,13 +11,16 @@
           "outcome": "succeeded",
           "observed_at": "2026-10-16T00:00:00Z",
           "presence": "present",
-          "hosts": ["app.example.test"],
-          "route_port": 18473,
+          "hosts": [
+            "app.example.test"
+          ],
+          "route_port": null,
           "https": false,
           "redirect_http_to_https": false,
           "middlewares": [],
-          "backends": ["http://127.0.0.1:18473"],
-          "router_name": "example-route@file"
+          "backends": [],
+          "router_name": "deployment-11111111-1111-4111-8111-111111111111@file",
+          "docker_service": "deployment-11111111-1111-4111-8111-111111111111@docker"
         }
       }
     },
@@ -45,12 +48,16 @@
           "outcome": "succeeded",
           "observed_at": "2026-10-16T00:00:00Z",
           "presence": "present",
-          "hosts": ["app.example.test"],
+          "hosts": [
+            "app.example.test"
+          ],
           "route_port": 18473,
           "https": false,
           "redirect_http_to_https": false,
           "middlewares": [],
-          "backends": ["http://127.0.0.1:18473"],
+          "backends": [
+            "http://127.0.0.1:18473"
+          ],
           "router_name": "example-route@file"
         },
         "procedure_error": {

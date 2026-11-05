@@ -16,6 +16,8 @@
         [
           '--providers.docker=true',
           '--providers.docker.exposedbydefault=false',
+          '--providers.docker.constraints=Label(`io.opsctl.http.managed`, `true`)',
+          '--providers.docker.defaultRule=PathPrefix(`/`) && !PathPrefix(`/`)',
           '--providers.file.directory=' ~ traefik_dynamic_dir,
           '--providers.file.watch=true',
           '--core.defaultRuleSyntax=v3',

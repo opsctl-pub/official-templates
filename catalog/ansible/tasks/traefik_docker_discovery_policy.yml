@@ -1,0 +1,49 @@
+---
+- name: Inspect the actual managed Docker discovery runtime
+  community.docker.docker_container_info:
+    name: "{{ traefik_container_name | default('traefik') }}"
+  register: traefik_discovery_runtime
+  no_log: true
+
+- name: Require managed private Docker discovery policy
+  ansible.builtin.assert:
+    that:
+      - traefik_discovery_runtime.exists
+      - discovery.State.Status == 'running'
+      - discovery.HostConfig.NetworkMode == 'host'
+      - discovery.Config.Labels.get('com.opsctl.managed') == 'true'
+      - discovery.Config.Labels.get('com.opsctl.component') == 'traefik_gateway'
+      - discovery.Config.Labels.get('com.opsctl.org_id') == traefik_discovery_org_id
+      - policy | map(attribute='key') | unique | list | length == policy | length
+      - required_policy | difference(policy | map(attribute='flag') | list) | length == 0
+      - policy | selectattr('key', 'equalto', '--providers.docker.endpoint') | map(attribute='value') | list in [[], ['unix:///var/run/docker.sock']]
+      - policy | selectattr('key', 'equalto', '--providers.docker.watch') | map(attribute='value') | list in [[], ['true']]
+      - policy | selectattr('key', 'equalto', '--providers.docker.usebindportip') | map(attribute='value') | list in [[], ['false']]
+      - sockets | length == 1
+      - sockets[0].Type == 'bind'
+      - sockets[0].Source == '/var/run/docker.sock'
+      - sockets[0].RW is sameas false
+  vars:
+    discovery: "{{ traefik_discovery_runtime.container }}"
+    sockets: "{{ discovery.Mounts | selectattr('Destination', 'equalto', '/var/run/docker.sock') | list }}"
+    required_policy:
+      - '--providers.docker=true'
+      - '--providers.docker.exposedbydefault=false'
+      - '--providers.docker.constraints=Label(`io.opsctl.http.managed`, `true`)'
+      - '--providers.docker.defaultrule=PathPrefix(`/`) && !PathPrefix(`/`)'
+    policy: >-
+      {%- set parsed = namespace(rows=[]) -%}
+      {%- set boolean_keys = ['--providers.docker', '--providers.docker.exposedbydefault', '--providers.docker.watch', '--providers.docker.usebindportip'] -%}
+      {%- set keys = boolean_keys + ['--providers.docker.constraints', '--providers.docker.defaultrule', '--providers.docker.endpoint'] -%}
+      {%- for argument in discovery.Config.Cmd -%}
+      {%- set key, separator, value = argument.partition('=') -%}
+      {%- set key = key | lower -%}
+      {%- if key in keys -%}
+      {%- if not separator -%}
+      {%- set value = 'true' if key in boolean_keys else discovery.Config.Cmd[loop.index] | default('') -%}
+      {%- endif -%}
+      {%- set value = value | lower if key in boolean_keys else value -%}
+      {%- set parsed.rows = parsed.rows + [{'key': key, 'value': value, 'flag': key + '=' + value}] -%}
+      {%- endif -%}
+      {%- endfor -%}{{ parsed.rows }}
+  no_log: true

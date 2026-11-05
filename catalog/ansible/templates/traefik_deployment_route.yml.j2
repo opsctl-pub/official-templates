@@ -32,7 +32,7 @@ http:
         - {{ middleware }}
 {% endfor %}
 {% endif %}
-      service: deployment-{{ deployment_id }}
+      service: {{ docker_backend.name ~ '@docker' if docker_backend | default(none) is not none else 'deployment-' ~ deployment_id }}
 {% if redirect_http_to_https %}
   middlewares:
     deployment-{{ deployment_id }}-https-redirect:
@@ -40,6 +40,7 @@ http:
         scheme: https
         permanent: true
 {% endif %}
+{% if docker_backend | default(none) is none %}
   services:
     deployment-{{ deployment_id }}:
       loadBalancer:
@@ -48,3 +49,4 @@ http:
 {% for backend in traefik_backends | default(resolved_traefik_backends) %}
           - url: {{ backend.url | to_json }}
 {% endfor %}
+{% endif %}

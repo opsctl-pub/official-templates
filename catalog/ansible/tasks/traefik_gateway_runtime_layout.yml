@@ -456,6 +456,11 @@
     fail_msg: "Traefik did not converge to the canonical managed runtime"
   no_log: "{{ traefik_gateway_sensitive }}"
 
+- name: Qualify converged managed Docker discovery
+  ansible.builtin.include_tasks: traefik_docker_discovery_policy.yml
+  vars:
+    traefik_discovery_org_id: "{{ org_id | string }}"
+
 - name: Verify canonical Traefik native readiness
   command:
     argv:

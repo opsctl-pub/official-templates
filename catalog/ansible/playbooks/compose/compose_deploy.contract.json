@@ -8,6 +8,6 @@
   },
   "managed_behavior": {
     "id": "opsctl.compose_deploy",
-    "revision": 4
+    "revision": 5
   }
 }

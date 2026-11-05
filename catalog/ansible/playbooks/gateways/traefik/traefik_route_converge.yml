@@ -49,8 +49,9 @@
           - resolved_traefik_backends is sequence
           - resolved_traefik_backends is not string
           - (resolved_traefik_backends | length) <= 64
-          - (resolved_route_state == 'absent') or ((resolved_traefik_backends | length) > 0)
+          - (resolved_route_state == 'absent') or (((resolved_traefik_backends | length) > 0) != (docker_backend | default(none) is not none))
           - (resolved_route_state == 'present') or ((resolved_traefik_backends | length) == 0)
+          - (resolved_route_state == 'present') or (docker_backend | default(none) is none)
           - (resolved_traefik_backends | map(attribute='url') | list | unique | list | length) == (resolved_traefik_backends | length)
         fail_msg: "Traefik route identity is missing or malformed"
 
@@ -58,9 +59,25 @@
       assert:
         that:
           - expected_route is mapping
-          - expected_route.keys() | sort == ['backends', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port', 'router_name']
+          - expected_route.keys() | sort == (['backends', 'hosts', 'https', 'middlewares', 'presence', 'redirect_http_to_https', 'route_port', 'router_name'] + (['docker_service'] if expected_route.get('docker_service') is not none else [])) | sort
           - expected_route.presence in ['present', 'absent']
         fail_msg: "Traefik route comparison evidence is invalid"
+      no_log: true
+
+    - name: Validate the selected Docker backend before route mutation
+      assert:
+        that:
+          - docker_backend is mapping
+          - docker_backend.keys() | sort == ['deployment_id', 'name', 'network', 'organization_id', 'project_name', 'service', 'target_port']
+          - docker_backend.name == route_key
+          - docker_backend.deployment_id == deployment_id
+          - docker_backend.organization_id == org_id
+          - docker_backend.project_name is match('^[a-z0-9][a-z0-9_-]*$')
+          - docker_backend.service is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+          - docker_backend.network is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+          - docker_backend.target_port is integer
+          - docker_backend.target_port == route_port
+      when: docker_backend | default(none) is not none
       no_log: true
 
     - name: Validate normalized route hostnames before mutation
@@ -110,6 +127,92 @@
       include_tasks: "{{ playbook_dir }}/../../../tasks/traefik_route_observation.yml"
       vars:
         route_allow_uninstalled_gateway: "{{ expected_route.presence == 'absent' and resolved_route_state == 'absent' }}"
+
+    - name: Qualify the actual Docker backend before present route effects
+      when: resolved_route_state == 'present' and docker_backend | default(none) is not none
+      block:
+        - name: Qualify managed Docker discovery
+          include_tasks: "{{ playbook_dir }}/../../../tasks/traefik_docker_discovery_policy.yml"
+          vars:
+            traefik_discovery_org_id: "{{ org_id }}"
+
+        - name: List all containers carrying this backend ownership
+          community.docker.docker_host_info:
+            containers: true
+            containers_all: true
+            containers_filters:
+              label:
+                - "io.opsctl.http.name={{ route_key }}"
+                - "io.opsctl.http.organization_id={{ org_id }}"
+          register: route_docker_instances
+
+        - name: Refuse absent or ambiguous backend ownership
+          assert:
+            that: route_docker_instances.containers | length == 1
+
+        - name: Read the actual backend configuration
+          community.docker.docker_container_info:
+            name: "{{ route_docker_instances.containers[0].Id }}"
+          register: route_docker_instance
+
+        - name: Qualify native backend scope service and private network
+          assert:
+            that:
+              - route_docker_instance.exists
+              - route_docker_instance.container.State.Status == 'running'
+              - route_docker_labels.get('io.opsctl.http.managed') == 'true'
+              - route_docker_labels.get('io.opsctl.http.name') == route_key
+              - route_docker_labels.get('io.opsctl.http.organization_id') == org_id
+              - route_docker_labels.get('io.opsctl.http.deployment_id') == deployment_id
+              - route_docker_labels.get('io.opsctl.http.project_name', '') is match('^[a-z0-9][a-z0-9_-]*$')
+              - route_docker_labels.get('io.opsctl.http.project_name') == route_docker_labels.get('com.docker.compose.project')
+              - route_docker_labels.get('io.opsctl.http.service', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+              - route_docker_labels.get('io.opsctl.http.service') == route_docker_labels.get('com.docker.compose.service')
+              - route_docker_labels.get('io.opsctl.http.network', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+              - route_docker_instance.container.NetworkSettings.Networks.keys() | list == [route_docker_labels.get('io.opsctl.http.network')]
+              - route_docker_labels.get('io.opsctl.http.target_port', '') is match('^[1-9][0-9]{0,4}$')
+              - route_docker_labels['io.opsctl.http.target_port'] | int <= 65535
+              - not route_docker_instance.container.NetworkSettings.Ports.get(route_docker_labels['io.opsctl.http.target_port'] + '/tcp')
+          vars:
+            route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
+
+        - name: Project only the plain native backend identity
+          set_fact:
+            observed_docker_backend:
+              name: "{{ route_key }}"
+              organization_id: "{{ org_id }}"
+              deployment_id: "{{ deployment_id }}"
+              project_name: "{{ route_docker_labels['io.opsctl.http.project_name'] }}"
+              service: "{{ route_docker_labels['io.opsctl.http.service'] }}"
+              network: "{{ route_docker_labels['io.opsctl.http.network'] }}"
+              target_port: "{{ route_docker_labels['io.opsctl.http.target_port'] | int }}"
+          vars:
+            route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
+
+        - name: Require exact discovery labels with no implicit router authority
+          assert:
+            that: observed_http_labels == expected_http_labels
+          vars:
+            observed_http_labels: >-
+              {%- set labels = namespace(value={}) -%}
+              {%- for key, value in route_docker_instance.container.Config.Labels.items() -%}
+              {%- if key.startswith('io.opsctl.http.') or key.startswith('traefik.') -%}
+              {%- set labels.value = labels.value | combine({key: value}) -%}
+              {%- endif -%}{%- endfor -%}{{ labels.value }}
+            expected_http_labels: >-
+              {%- set labels = namespace(value={}) -%}
+              {%- for key, value in observed_docker_backend.items() -%}
+              {%- set labels.value = labels.value | combine({'io.opsctl.http.' + key: value | string}) -%}
+              {%- endfor -%}
+              {{ labels.value | combine({
+                'io.opsctl.http.managed': 'true', 'traefik.enable': 'true',
+                'traefik.docker.network': observed_docker_backend.network,
+                'traefik.http.services.' + route_key + '.loadbalancer.server.port': observed_docker_backend.target_port | string,
+                'traefik.http.services.' + route_key + '.loadbalancer.server.scheme': 'http'}) }}
+
+        - name: Compare the actual backend to the admitted identity
+          assert:
+            that: observed_docker_backend == docker_backend
 
     - name: Emit complete uninstalled route absence without mutation
       debug:
@@ -211,16 +314,16 @@
               - staged_route_config.keys() | list == ['http']
               - staged_route_config.http is mapping
               - staged_route_config.http.routers is mapping
-              - staged_route_config.http.services is mapping
+              - (docker_backend | default(none) is not none) or (staged_route_config.http.services is mapping)
+              - (docker_backend | default(none) is none) or ('services' not in staged_route_config.http)
               - ('deployment-' ~ deployment_id) in staged_route_config.http.routers
-              - ('deployment-' ~ deployment_id) in staged_route_config.http.services
-              - staged_route_config.http.routers['deployment-' ~ deployment_id].service == ('deployment-' ~ deployment_id)
-              - staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | length == (resolved_traefik_backends | length)
-              - (staged_route_config.http.services['deployment-' ~ deployment_id].loadBalancer.servers | map(attribute='url') | list) == (resolved_traefik_backends | map(attribute='url') | list)
+              - (docker_backend | default(none) is not none) or (('deployment-' ~ deployment_id) in staged_route_config.http.services)
+              - staged_route_config.http.routers['deployment-' ~ deployment_id].service == route_key + ('@docker' if docker_backend | default(none) is not none else '')
+              - (docker_backend | default(none) is not none) or (staged_route_config.http.services[route_key].loadBalancer.servers | length == (resolved_traefik_backends | length))
+              - (docker_backend | default(none) is not none) or ((staged_route_config.http.services[route_key].loadBalancer.servers | map(attribute='url') | list) == (resolved_traefik_backends | map(attribute='url') | list))
               - (not route_https) or staged_route_config.http.routers['deployment-' ~ deployment_id].tls == {}
               - route_https or ('tls' not in staged_route_config.http.routers['deployment-' ~ deployment_id])
-              - (not redirect_http_to_https) or (staged_route_config.http.keys() | sort == ['middlewares', 'routers', 'services'])
-              - redirect_http_to_https or (staged_route_config.http.keys() | sort == ['routers', 'services'])
+              - staged_route_config.http.keys() | sort == (['routers'] + (['middlewares'] if redirect_http_to_https else []) + (['services'] if docker_backend | default(none) is none else [])) | sort
               - (not redirect_http_to_https) or (staged_route_config.http.routers.keys() | sort == [('deployment-' ~ deployment_id), ('deployment-' ~ deployment_id ~ '-http-redirect')] | sort)
               - redirect_http_to_https or (staged_route_config.http.routers.keys() | list == [('deployment-' ~ deployment_id)])
               - (not redirect_http_to_https) or (staged_route_config.http.middlewares.keys() | list == [('deployment-' ~ deployment_id ~ '-https-redirect')])
@@ -255,7 +358,8 @@
               - route_observation.presence == resolved_route_state
               - route_observation.hosts == (resolved_route_hosts | sort)
               - route_observation.backends == (resolved_traefik_backends | map(attribute='url') | list)
-              - resolved_route_state == 'absent' or route_observation.route_port == route_port
+              - route_observation.get('docker_service') == (docker_backend.name + '@docker' if docker_backend | default(none) is not none else none)
+              - resolved_route_state == 'absent' or route_observation.route_port == (none if docker_backend | default(none) is not none else route_port)
               - resolved_route_state == 'absent' or route_observation.https == route_https
               - resolved_route_state == 'absent' or route_observation.redirect_http_to_https == redirect_http_to_https
               - resolved_route_state == 'absent' or route_observation.middlewares == resolved_route_middlewares
