@@ -43,6 +43,7 @@
               - compose_directories | default([]) | length <= 32
               - compose_wait_timeout | default(300) is integer
               - compose_wait_timeout | default(300) >= 1 and compose_wait_timeout | default(300) <= 1800
+              - compose_recreate | default(false) is boolean
 
         - name: Qualify managed Docker HTTP discovery before installation effects
           when: compose_http_backend | default(none) is not none
@@ -862,7 +863,7 @@
             state: present
             pull: policy
             build: never
-            recreate: auto
+            recreate: "{{ 'always' if compose_recreate | default(false) else 'auto' }}"
             renew_anon_volumes: false
             assume_yes: false
             wait: false

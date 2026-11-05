@@ -40,6 +40,7 @@ with no retained staging. Review also binds the declared removal source.
 | `compose_files` | required 1-16 ordered strings | Reviewed original Compose selections relative to project base. Parent components may resolve within workspace only. |
 | `compose_env_files` | `[]`; up to 16 ordered strings | Explicit ordered env selections replace the automatic default. With none selected, only a supplied authenticated project-base `.env` contributes. |
 | `compose_profiles` | `[]`; up to 32 strings | Reviewed native profile selections, unchanged. |
+| `compose_recreate` | `false`; boolean | Explicitly recreate unchanged containers when true; preserve native volumes and pull policy. |
 | `compose_source_directory` | required absolute controller path | Existing read-only file Secret mount, normally `/var/run/opsctl/file-secret`. |
 | `compose_interpolation_source_file` | null; exact absolute controller path | When supplied, exactly `compose_source_directory + '/compose-interpolation.env'`: the operation-staged protected env file, not a captured original or arbitrary path. |
 | `compose_supplied_files` | required 1-32 objects | `{source,path,mode}`: flat Secret key `source-00`, confined workspace-relative original destination, four-character octal mode. |
@@ -137,7 +138,7 @@ external-volume override; original files remain unchanged and no revision labels
 are injected. Backend attachment admission supports one service/instance per backing.
 
 Apply with `docker_compose_v2`: exact project_src/name/files/env/profiles,
-`state=present`, `pull=policy`, `build=never`, `recreate=auto`,
+`state=present`, `pull=policy`, `build=never`, `recreate=auto` (or `always` only for explicit `compose_recreate=true`),
 `renew_anon_volumes=false`, `assume_yes=false`, `wait=false`. Orphans are removed
 only after complete known-membership checks. Build-only/required-build services
 refuse; image-backed build metadata is retained without executing a build.
