@@ -14,6 +14,20 @@
   when: compose_instance_info.exists
   no_log: true
 
+- name: Require the current removal member's exact workspace service and non-oneoff identity
+  ansible.builtin.assert:
+    that:
+      - compose_instance_info.container.Config.Labels.get('com.docker.compose.project.working_dir') ==
+        ((compose_workspace + '/' + compose_project_directory) | normpath)
+      - compose_instance_info.container.Config.Labels.get('com.docker.compose.service') is string
+      - compose_instance_info.container.Config.Labels.get('com.docker.compose.service', '') | length > 0
+      - compose_instance_info.container.Config.Labels.get('com.docker.compose.service', '') | length <= 255
+      - compose_instance_info.container.Config.Labels.get('com.docker.compose.oneoff') == 'False'
+  when:
+    - compose_instance_info.exists
+    - compose_action == 'remove'
+  no_log: true
+
 - name: Observe the actual instance image without pulling
   community.docker.docker_image_info:
     name: "{{ compose_instance_info.container.Image }}"
@@ -90,10 +104,12 @@
       {{ compose_observed_instances + [{'instance': compose_instance,
         'service': compose_instance_info.container.Config.Labels.get('com.docker.compose.service', ''),
         'restart': compose_instance_info.container.HostConfig.RestartPolicy.Name | default('no'),
-        'unexpected': (compose_instance_id not in (compose_known_containers | default([])) and
+        'unexpected': ((compose_removal_targets is not none and compose_instance_id not in compose_removal_targets)
+          if compose_action == 'remove' else
+          (compose_instance_id not in (compose_known_containers | default([])) and
           not (compose_allow_new_instances | default(false))) or
           compose_instance_info.container.Config.Labels.get('com.docker.compose.service', '') not in
-          (compose_services | map(attribute='name') | list)}] }}
+          (compose_services | map(attribute='name') | list))}] }}
   when: compose_instance_info.exists
   no_log: true
 

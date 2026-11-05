@@ -3,6 +3,8 @@
   hosts: all
   gather_facts: false
   become: true
+  vars:
+    compose_project_directory: "."
   tasks:
     - name: Initialize data-retaining removal outcome
       ansible.builtin.set_fact:
@@ -12,6 +14,8 @@
         compose_reason: compose_prerequisite_unavailable
         compose_changed: false
         compose_removed_containers: []
+        compose_removal_targets: null
+        compose_removal_service_names: []
       no_log: true
 
     - name: Perform exact recorded Compose removal
@@ -21,6 +25,13 @@
             that:
               - compose_project_name is match('^[a-z0-9][a-z0-9_-]*$')
               - compose_workspace.startswith('/')
+              - compose_project_directory is string
+              - compose_project_directory | length > 0
+              - compose_project_directory | length <= 256
+              - not compose_project_directory.startswith('/')
+              - "'..' not in compose_project_directory.split('/')"
+              - >-
+                '\\' not in compose_project_directory
               - compose_known_containers | default([]) | length <= 128
               - compose_known_networks is defined
               - compose_known_networks | length <= 64
@@ -39,9 +50,23 @@
           ansible.builtin.assert:
             that:
               - compose_observation_complete
-              - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
+              - compose_unexpected_containers | length == 0
               - compose_observed_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
-              - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
+
+        - name: Freeze only fully inspected current owned workload identities
+          ansible.builtin.set_fact:
+            compose_removal_targets: "{{ compose_observed_instances | map(attribute='instance.id') | list }}"
+            compose_removal_service_names: "{{ compose_observed_instances | map(attribute='service') | unique | sort }}"
+
+        - name: Reobserve resource users against the frozen current membership
+          ansible.builtin.include_tasks: ../../tasks/compose_observe.yml
+
+        - name: Require the complete group to remain within the frozen removal targets
+          ansible.builtin.assert:
+            that:
+              - compose_observation_complete
+              - compose_unexpected_containers | length == 0
+              - compose_observed_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
 
         - name: Require created network identity and no foreign users before deletion effects
           ansible.builtin.assert:
@@ -50,7 +75,7 @@
               - >-
                 not native_network.exists or
                 (native_network.network.Containers | default({}, true)).keys() |
-                difference(compose_known_containers | default([])) | length == 0
+                difference(compose_removal_targets) | length == 0
           loop: "{{ compose_network_inventory }}"
           loop_control:
             loop_var: native_network
@@ -100,7 +125,7 @@
             state: absent
             keep_volumes: true
             stop_timeout: 10
-          loop: "{{ compose_known_containers | default([]) }}"
+          loop: "{{ compose_removal_targets }}"
           loop_control:
             loop_var: recorded_container_id
             label: recorded instance

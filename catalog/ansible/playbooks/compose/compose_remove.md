@@ -15,9 +15,10 @@ cleanup; ordinary removal without retained staging keeps its original contract.
 | Variable | Default | Origin/contract |
 |---|---|---|
 | `compose_project_name` | required | Recorded native project name. |
+| `compose_project_directory` | `.` | Recorded confined relative project directory beneath the workspace, never a caller-selected replacement. |
 | `compose_workspace` | required | Stable absolute backend Server/project workspace; retained, never recursively removed. |
-| `compose_services` | required | Up to 32 captured `{name,replicas,condition,allow_completion:false}`; total replicas<=128; same conditions as deploy. |
-| `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs eligible for exact removal. |
+| `compose_services` | required, may be empty | Retained wire field, not a removal service allowlist. Current service labels come from bounded full native inspection. |
+| `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs retained as identity hints and absence checks, not a membership whitelist. |
 | `compose_known_networks` | required list, may be empty | Up to 64 recorded `{id,name,origin:created|reused|external|unknown}`. Unresolved observed ownership refuses mutation. |
 | `compose_known_volumes` | `[]` | Up to 64 recorded `{name,created_at,birth_marker,origin}`; nullable timestamp/marker means keep-only. |
 | `compose_delete_volumes` | `[]` | Up to 64 unique explicit `{name,created_at,birth_marker}` selections; original created identity only. |
@@ -29,8 +30,13 @@ Exact inspected local built-ins `none`/`null` and `host`/`host` are external whe
 no origin is recorded or a matching full recorded ID has unknown origin. Original
 inputs stay unchanged; a recorded created origin is never replaced. Built-ins are
 retained, while missing/mismatched or other unresolved unknown networks refuse.
-Unknown project IDs or replaced resources refuse before mutation. Remove only
-recorded container IDs with `docker_container`, `keep_volumes=true`, normal stop
+Discover every current project instance using bounded full inspection. Require exact
+project and working-directory labels, a nonempty bounded service label and non-oneoff identity;
+a project label alone never proves ownership. Snapshot that verified current set before
+effects, including owned replacements from failed updates. Unknown/foreign members
+or changed resource incarnations refuse. Newly appearing members after the snapshot
+refuse without expanding the deletion loop. Remove only those frozen current IDs
+with `docker_container`, `keep_volumes=true`, normal stop
 timeout, no forced kill. Reobserve absence. Only recorded `created` networks with
 the same full ID and no users can be removed. Use `builtin.command` argv
 `[docker,network,rm,--,full_ID]`: pinned docker_network removal forcibly
@@ -62,14 +68,14 @@ Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes fixed failure.
 
 | Field | Meaning |
 |---|---|
-| `action`, `project_name`, `project_directory` | `remove`, native name, `.` for identity-only removal. |
+| `action`, `project_name`, `project_directory` | `remove`, native name, exact admitted recorded relative project directory. |
 | `observed_at` | UTC RFC3339 or null if observation failed. |
 | `outcome`, `observation_complete`, `changed` | `succeeded|failed|unknown`, complete facts boolean, actual effects boolean. |
 | `ready` | Always null; retained data presence is not failed absence. |
 | `phase`, `reason` | Actual prepare/remove/observe/complete phase, null or bounded root diagnostic reason. |
 | `files_written` | Empty. |
-| `services` | `{name,desired_replicas,condition,state,instances}`; captured desired services can be missing after successful removal. |
-| `unexpected_containers` | Project extras, never implicitly removed. |
+| `services` | Current discovered names with the Destroy goal `desired_replicas:0,condition:scaled_down`; actual instances remain visible until absent. Final empty groups retain the frozen pre-effect names. No original-install membership is required. |
+| `unexpected_containers` | Unqualified or newly appearing project members, never implicitly removed. |
 | `networks` | `{id,name,origin,presence:present|absent|unknown}`; absence retains recorded ID. |
 | `volumes` | `{name,created_at,birth_marker,origin,presence,delete_eligible,deletion_reason}`; absent entries retain recorded timestamps/markers. Eligibility is an observation, not consent; a fixed reason explains unavailable deletion. |
 | `removed_containers` | Full IDs actually reobserved absent, not just successfully stopped. |

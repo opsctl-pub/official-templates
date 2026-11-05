@@ -56,7 +56,8 @@
           - compose_services | map(attribute='replicas') | sum <= 128
           - compose_services | map(attribute='name') | unique | length == compose_services | length
           - compose_known_containers | default([]) | length <= 128
-          - (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([]))) | unique | length <= 128
+          - (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([])) +
+              (compose_removal_targets | default([], true) if compose_action == 'remove' else [])) | unique | length <= 128
           - compose_project_info.networks | length <= 64
 
     - name: Select native instance observation failure
@@ -68,16 +69,32 @@
         file: compose_observe_instance.yml
         apply:
           no_log: true
-      loop: "{{ (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([]))) | unique | sort }}"
+      loop: >-
+        {{ (compose_project_info.containers | map(attribute='Id') | list + (compose_known_containers | default([])) +
+          (compose_removal_targets | default([], true) if compose_action == 'remove' else [])) | unique | sort }}
       loop_control:
         loop_var: compose_instance_id
         label: native instance
+
+    - name: Bound current removal service labels independently of original desired membership
+      ansible.builtin.assert:
+        that: compose_observed_instances | map(attribute='service') | unique | length <= 32
+      when: compose_action == 'remove'
 
     - name: Classify every selected service using all replicas and native health
       ansible.builtin.set_fact:
         compose_observed_services: >-
           {%- set services = namespace(values=[]) -%}
-          {%- for service in compose_services -%}
+          {%- set selection = namespace(values=compose_services) -%}
+          {%- if compose_action == 'remove' -%}
+          {%- set selection.values = [] -%}
+          {%- set names = ((compose_removal_service_names | default([])) +
+            (compose_observed_instances | rejectattr('unexpected') | map(attribute='service') | list)) | unique | sort -%}
+          {%- for name in names -%}
+          {%- set selection.values = selection.values + [{'name': name, 'replicas': 0, 'condition': 'scaled_down'}] -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- for service in selection.values -%}
           {%- set rows = compose_observed_instances | selectattr('service', 'equalto', service.name) |
             rejectattr('unexpected') | list -%}
           {%- set good = namespace(count=0, completed=0, healthy=0, failed=0, stopped=0, starting=0) -%}
@@ -199,8 +216,9 @@
         users: "{{ compose_volume_users.results | selectattr('compose_volume_name', 'equalto', managed_volume.name) | list }}"
         allowed: >-
           {{ (compose_known_containers | default([])) +
-            (compose_observed_instances | map(attribute='instance.id') | list if
-              compose_action == 'deploy' and compose_allow_new_instances | default(false) else []) }}
+            (compose_observed_instances | rejectattr('unexpected') | map(attribute='instance.id') | list
+              if compose_action == 'remove' else (compose_observed_instances | map(attribute='instance.id') | list if
+              compose_action == 'deploy' and compose_allow_new_instances | default(false) else [])) }}
       loop: "{{ compose_managed_volumes | default([]) }}"
       loop_control:
         loop_var: managed_volume
@@ -270,8 +288,9 @@
           {%- set user_rows = compose_volume_users.results | selectattr('compose_volume_name', 'equalto', result.compose_volume_name) | list -%}
           {%- set users = user_rows[0].containers if user_rows | length == 1 else [] -%}
           {%- set allowed = (compose_known_containers | default([])) +
-            (compose_observed_instances | map(attribute='instance.id') | list if
-              compose_action == 'deploy' and compose_allow_new_instances | default(false) else []) -%}
+            (compose_observed_instances | rejectattr('unexpected') | map(attribute='instance.id') | list
+              if compose_action == 'remove' else (compose_observed_instances | map(attribute='instance.id') | list if
+              compose_action == 'deploy' and compose_allow_new_instances | default(false) else [])) -%}
           {%- set labels = result.volume.Labels | default({}, true) if result.exists else {} -%}
           {%- set reason = 'The volume is absent.' if not result.exists else
             ('This volume was not created by the original workload.' if origin != 'created' else
