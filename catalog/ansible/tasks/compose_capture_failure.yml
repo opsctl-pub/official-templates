@@ -1,0 +1,32 @@
+---
+- name: Retain only the first bounded native Compose failure
+  block:
+    - name: Project only bounded failed task message and return code
+      ansible.builtin.set_fact:
+        compose_first_failure: >-
+          {{ {'task': failed_name if failed_name is string and failed_name | length <= 256
+              else 'unavailable (not text or over 256 characters)',
+            'msg': failed_message if failed_message is string and failed_message | length <= 4096
+              else 'unavailable (not text or over 4096 characters)',
+            'rc': failed_rc if failed_rc is integer else 'unavailable'} |
+            combine({'stderr': failed_stderr} if failed_stderr is string and
+              failed_stderr | length <= 4096 else {}) }}
+      vars:
+        failed_name: "{{ ansible_failed_task.get('name') }}"
+        failed_message: "{{ ansible_failed_result.get('msg') }}"
+        failed_rc: "{{ ansible_failed_result.get('rc') }}"
+        failed_stderr: "{{ ansible_failed_result.get('stderr') }}"
+  rescue:
+    - name: Report unavailable diagnostic capture without private failure details
+      ansible.builtin.debug:
+        msg: Compose failure capture failed; original native diagnostics remain protected.
+      no_log: false
+
+    - name: Supply only fixed unavailable diagnostic fields
+      ansible.builtin.set_fact:
+        compose_first_failure:
+          task: unavailable
+          rc: unavailable
+          msg: Failure capture failed; original native diagnostics remain protected.
+  when: compose_first_failure | default(none) is none
+  no_log: true

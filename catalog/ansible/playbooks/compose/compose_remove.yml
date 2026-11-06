@@ -16,6 +16,7 @@
         compose_removed_containers: []
         compose_removal_targets: null
         compose_removal_service_names: []
+        compose_first_failure: null
       no_log: true
 
     - name: Perform exact recorded Compose removal
@@ -280,6 +281,9 @@
             compose_reason: null
             compose_phase: compose:complete
       rescue:
+        - name: Capture the original failure before observing partial removal
+          ansible.builtin.include_tasks: ../../tasks/compose_capture_failure.yml
+
         - name: Preserve partial removal truth without native diagnostic output
           ansible.builtin.set_fact:
             compose_failure_reason: "{{ compose_reason }}"

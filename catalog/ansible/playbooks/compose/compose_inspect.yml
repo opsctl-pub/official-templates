@@ -11,6 +11,7 @@
         compose_outcome: unknown
         compose_reason: null
         compose_changed: false
+        compose_first_failure: null
       no_log: true
 
     - name: Publish completed preparation progress

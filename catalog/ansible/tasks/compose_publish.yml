@@ -74,5 +74,14 @@
 
 - name: Fail after available Compose facts are published
   ansible.builtin.fail:
-    msg: Compose procedure could not establish the requested result. Review the reported native state before retrying.
+    msg: >-
+      Compose procedure could not establish the requested result. Review the reported native state before retrying.
+      {%- if compose_first_failure | default(none) is not none %}
+      First failed task: {{ compose_first_failure.task }}
+      rc: {{ compose_first_failure.rc }}
+      msg: {{ compose_first_failure.msg }}
+      {%- if 'stderr' in compose_first_failure %}
+      stderr: {{ compose_first_failure.stderr }}
+      {%- endif %}
+      {%- endif %}
   when: compose_outcome != 'succeeded'

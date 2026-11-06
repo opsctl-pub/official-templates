@@ -318,6 +318,9 @@
           {{ compose_unexpected_containers | length == 0 and compose_observed_services |
             rejectattr('state', 'in', ['running', 'healthy', 'completed', 'scaled_down']) | list | length == 0 }}
   rescue:
+    - name: Capture the original native observation failure
+      ansible.builtin.include_tasks: compose_capture_failure.yml
+
     - name: Retain incomplete observation without fabricating readiness
       ansible.builtin.set_fact:
         compose_observation_complete: false

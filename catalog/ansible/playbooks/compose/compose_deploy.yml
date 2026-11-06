@@ -19,6 +19,7 @@
         compose_operational_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         compose_auth_identity: null
         compose_birth_volumes: {}
+        compose_first_failure: null
       no_log: true
 
     - name: Publish preparation progress
@@ -958,6 +959,9 @@
             compose_phase: compose:complete
             compose_removed_containers: "{{ compose_absent_containers }}"
       rescue:
+        - name: Capture the original failure before observing partial effects
+          ansible.builtin.include_tasks: ../../tasks/compose_capture_failure.yml
+
         - name: Preserve successful file delivery and native partial effects
           ansible.builtin.set_fact:
             compose_files_written: >-
