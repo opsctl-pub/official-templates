@@ -72,6 +72,30 @@
       OPERATION_STEP={{ {'name': compose_phase, 'status': 'completed' if compose_outcome == 'succeeded' else 'failed',
         'metadata': {'display_name': 'Compose procedure', 'reason_code': compose_reason | default(none)}} | to_json }}
 
+- name: Publish bounded application startup diagnostics as one plain message
+  ansible.builtin.debug:
+    msg: >-
+      Application startup diagnostics:
+      {%- if compose_application_diagnostic.status == 'unavailable' %}
+      unavailable
+      {%- endif %}
+      {%- for member in compose_application_diagnostic.members %}
+      Service: {{ member.service }}; container: {{ member.id }}
+      {%- if member.status == 'available' %}
+      stdout:
+      {{ member.stdout }}
+      stderr:
+      {{ member.stderr }}
+      {%- else %}
+      unavailable
+      {%- endif %}
+      {%- endfor %}
+      Omitted non-ready members: {{ compose_application_diagnostic.omitted }}
+  when:
+    - compose_outcome != 'succeeded'
+    - compose_application_diagnostic | default(none) is not none
+  no_log: false
+
 - name: Fail after available Compose facts are published
   ansible.builtin.fail:
     msg: >-

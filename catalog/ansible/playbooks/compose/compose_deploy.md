@@ -158,6 +158,18 @@ require exited/zero. `allow_completion=true` permits restart-disabled standalone
 running/healthy services to finish exited/zero. Restarting/nonzero never succeeds;
 zero desired replicas is scaled_down. Native wait alone is not readiness evidence.
 
+For initial and redeploy readiness failures at `compose:observe`, failed Run logs
+include application stdout/stderr from up to four observed containers of non-ready
+selected services.
+Each exact full ID must still match project, service and normalized working directory.
+Collection has one ten-second deadline, 50 lines/16 KiB per container and 200 lines/64 KiB
+total. Oversized whole tails shrink to 20 then 10 lines; unsafe or unavailable
+tails are omitted, with unavailable/omitted members reported. Existing Runner redaction
+recognizes only OpsCtl-delivered secrets, not unknown application-generated secrets.
+URL-encoded, base64 or otherwise transformed reprints may not match that redaction.
+This is diagnostic output only: typed results, inputs, effects and revision are unchanged.
+Ordinary image deployments and the Pulse workload viewer are outside this scope.
+
 ## Results
 
 Exactly one final `TEMPLATE_OUTPUT_JSON={"compose":...}` precedes any fixed failure.
@@ -184,7 +196,7 @@ health `healthy|unhealthy|starting|none|unknown`; exit_code integer or null.
 Ports include every `{host_ip,host_port,container_port,protocol:tcp|udp}` binding;
 mounts are `{type:volume|bind|tmpfs|other,source,target,read_only}`. Source is volume
 name, bind path or null. Env, labels, options, credentials, health commands/output
-and native stderr remain private.
+and raw inspection stderr remain private.
 
 Phases/progress names: `compose:prepare`, `compose:files`, `compose:apply`,
 `compose:observe`, `compose:remove`, `compose:complete`. OPERATION_STEP carries

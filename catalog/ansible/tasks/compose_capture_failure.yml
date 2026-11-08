@@ -30,3 +30,88 @@
           msg: Failure capture failed; original native diagnostics remain protected.
   when: compose_first_failure | default(none) is none
   no_log: true
+
+- name: Retain one independent bounded application diagnostic attempt
+  block:
+    - name: Select actual observed containers of non-ready selected services
+      ansible.builtin.set_fact:
+        compose_failure_members: >-
+          {%- set members = namespace(values=[]) -%}
+          {%- for service in compose_observed_services | default([]) | sort(attribute='name') -%}
+          {%- if service.state not in ['running', 'healthy', 'completed', 'scaled_down'] -%}
+          {%- for instance in service.instances | sort(attribute='id') -%}
+          {%- set rows = compose_observed_instances | default([]) | rejectattr('unexpected') |
+            selectattr('service', 'equalto', service.name) | selectattr('instance.id', 'equalto', instance.id) | list -%}
+          {%- if rows | length == 1 -%}
+          {%- set members.values = members.values + [{'id': instance.id, 'service': service.name}] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ members.values }}
+
+    - name: Collect application diagnostics only when observed members were selected
+      when: compose_failure_members | length > 0
+      block:
+        - name: Require the existing private native allocation and executable selection
+          ansible.builtin.assert:
+            that:
+              - compose_auth_directory.path is string
+              - compose_auth_identity is mapping
+              - compose_docker_resolved.stdout is string
+
+        - name: Reobserve the private allocation without following links
+          ansible.builtin.stat:
+            path: "{{ compose_auth_directory.path }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: compose_diagnostic_directory
+
+        - name: Require the original private allocation before diagnostic copy and execution
+          ansible.builtin.assert:
+            that:
+              - compose_diagnostic_directory.stat.isdir | default(false)
+              - not compose_diagnostic_directory.stat.islnk | default(true)
+              - compose_diagnostic_directory.stat.dev == compose_auth_identity.dev
+              - compose_diagnostic_directory.stat.inode == compose_auth_identity.inode
+              - compose_diagnostic_directory.stat.uid == compose_auth_identity.uid
+              - compose_diagnostic_directory.stat.mode == compose_auth_identity.mode
+
+        - name: Install the public bounded collector inside the existing owned private directory
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../../scripts/compose_failure_logs.py"
+            dest: "{{ compose_auth_directory.path }}/compose-failure-logs.py"
+            mode: '0700'
+            backup: false
+          diff: false
+
+        - name: Privately collect complete scoped application log tails
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ compose_auth_directory.path }}/compose-failure-logs.py"
+              - "{{ {'docker': compose_docker_resolved.stdout, 'project': compose_project_name,
+                    'workspace': compose_project_src | normpath, 'members': compose_failure_members[:4],
+                    'omitted': [0, compose_failure_members | length - 4] | max} | to_json }}"
+            expand_argument_vars: false
+          environment:
+            PATH: "{{ compose_operational_path }}"
+          changed_when: false
+          register: compose_application_diagnostic_read
+
+        - name: Preserve the first complete private diagnostic projection
+          ansible.builtin.set_fact:
+            compose_application_diagnostic: "{{ compose_application_diagnostic_read.stdout | from_json }}"
+  rescue:
+    - name: Retain unavailable application diagnostics without replacing native failure
+      ansible.builtin.set_fact:
+        compose_application_diagnostic:
+          status: unavailable
+          members: []
+          omitted: "{{ [0, compose_failure_members | default([]) | length - 4] | max }}"
+  when:
+    - compose_action | default('') == 'deploy'
+    - compose_phase | default('') == 'compose:observe'
+    - compose_application_diagnostic | default(none) is none
+  no_log: true
