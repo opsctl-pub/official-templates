@@ -84,6 +84,12 @@
 
 - name: Restore exact prior Traefik runtime
   block:
+    - name: Validate original environment before runtime removal
+      ansible.builtin.include_tasks: runtime_restore_environment.yml
+      vars:
+        runtime_restore_environment: "{{ restore_config.get('Env') }}"
+        runtime_restore_mismatch_code: prior_runtime_restore_mismatch
+
     - name: Recheck exact runtime identity immediately before restoration
       ansible.builtin.command:
         expand_argument_vars: false
@@ -204,7 +210,15 @@
         fail_msg: prior_runtime_restore_mismatch
       vars:
         current_config: "{{ (traefik_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
-      loop: [Image, Cmd, Entrypoint, Labels, Env, User, WorkingDir]
+      loop: [Image, Cmd, Entrypoint, Labels, User, WorkingDir]
+
+    - name: Validate and compare the actual restored gateway environment
+      ansible.builtin.include_tasks: runtime_restore_environment.yml
+      vars:
+        current_config: "{{ (traefik_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
+        runtime_restore_environment: "{{ current_config.get('Env') }}"
+        runtime_restore_expected_environment: "{{ restore_config.get('Env') }}"
+        runtime_restore_mismatch_code: prior_runtime_restore_mismatch
 
     - name: Verify exact prior host configuration
       ansible.builtin.assert:

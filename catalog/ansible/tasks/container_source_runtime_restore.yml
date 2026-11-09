@@ -1,6 +1,12 @@
 ---
 - name: Restore the validated source runtime and verify its health
   block:
+    - name: Validate original environment before source removal
+      ansible.builtin.include_tasks: runtime_restore_environment.yml
+      vars:
+        runtime_restore_environment: "{{ restore_config.get('Env') }}"
+        runtime_restore_mismatch_code: source_replacement_restore_config_mismatch
+
     - name: Remove the failed replacement before restoring the original source
       ansible.builtin.command:
         expand_argument_vars: false
@@ -98,7 +104,15 @@
         fail_msg: source_replacement_restore_config_mismatch
       vars:
         current_config: "{{ (source_replacement_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
-      loop: [Image, Cmd, Entrypoint, Env, WorkingDir, User, Labels, ExposedPorts, Volumes]
+      loop: [Image, Cmd, Entrypoint, WorkingDir, User, Labels, ExposedPorts, Volumes]
+
+    - name: Validate and compare the actual restored source environment
+      ansible.builtin.include_tasks: runtime_restore_environment.yml
+      vars:
+        current_config: "{{ (source_replacement_restore_result.stdout | from_json)[0].Config | default({}, true) }}"
+        runtime_restore_environment: "{{ current_config.get('Env') }}"
+        runtime_restore_expected_environment: "{{ restore_config.get('Env') }}"
+        runtime_restore_mismatch_code: source_replacement_restore_config_mismatch
 
     - name: Require exact restored published ports
       ansible.builtin.assert:

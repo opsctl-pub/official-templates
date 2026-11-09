@@ -1,0 +1,57 @@
+---
+- name: Validate complete runtime environment entries without normalizing values
+  block:
+    - name: Require the environment input
+      ansible.builtin.assert:
+        that: runtime_restore_environment is defined
+        fail_msg: "{{ runtime_restore_mismatch_code }}"
+
+    - name: Require environment lists with only null treated as empty
+      ansible.builtin.assert:
+        that:
+          - item is sequence and item is not string and item is not mapping
+          - item == (item | list)
+        fail_msg: "{{ runtime_restore_mismatch_code }}"
+      loop: "{{ runtime_restore_lists }}"
+      loop_control:
+        label: environment list
+
+    - name: Require strings with a nonempty key and no NUL
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - "'=' in item"
+          - item.split('=', 1)[0] | length > 0
+          - >-
+            '\x00' not in item
+        fail_msg: "{{ runtime_restore_mismatch_code }}"
+      loop: "{{ runtime_restore_lists | flatten(levels=1, skip_nulls=false) }}"
+      loop_control:
+        label: environment entry
+
+    - name: Require unique exact case-sensitive environment keys
+      ansible.builtin.assert:
+        that: >-
+          item | map('split', '=') | map('first') | unique(case_sensitive=true) |
+          list | length == item | length
+        fail_msg: "{{ runtime_restore_mismatch_code }}"
+      loop: "{{ runtime_restore_lists }}"
+      loop_control:
+        label: environment list
+
+    - name: Compare complete entries independently of native ordering
+      ansible.builtin.assert:
+        that: >-
+          runtime_restore_values | sort(case_sensitive=true)
+          == runtime_restore_expected_values | sort(case_sensitive=true)
+        fail_msg: "{{ runtime_restore_mismatch_code }}"
+      when: runtime_restore_expected_environment is defined
+  vars:
+    runtime_restore_values: >-
+      {{ runtime_restore_environment if runtime_restore_environment is not none else [] }}
+    runtime_restore_expected_values: >-
+      {{ runtime_restore_expected_environment if runtime_restore_expected_environment is not none else [] }}
+    runtime_restore_lists: >-
+      {{ [runtime_restore_values] +
+         ([runtime_restore_expected_values] if runtime_restore_expected_environment is defined else []) }}
+  no_log: true
