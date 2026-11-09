@@ -4,6 +4,7 @@
   gather_facts: false
   become: true
   vars:
+    container_operational_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     container_name: "{{ app_container_name | default('app') }}"
     router_name: "{{ app_router_name | default(app_container_name | default('app')) }}"
     health_path: "{{ app_health_path | default('/health') }}"
@@ -884,6 +885,12 @@
           ansible.builtin.set_fact:
             legacy_container_payload: []
             legacy_container_matches: []
+            legacy_container_inventory_complete: false
+
+        - name: Retain complete empty inventory after a successful empty names read
+          ansible.builtin.set_fact:
+            legacy_container_inventory_complete: true
+          when: legacy_container_names.stdout == ''
 
         - name: Inspect only the observed legacy candidate names
           ansible.builtin.command:
@@ -899,6 +906,25 @@
             - name: Read legacy candidate inspection facts
               ansible.builtin.set_fact:
                 legacy_container_payload: "{{ legacy_container_inspection.stdout | from_json }}"
+              no_log: true
+
+            - name: Retain diagnostic completeness only for the actual typed inspection list
+              ansible.builtin.set_fact:
+                legacy_container_inventory_complete: >-
+                  {%- set scan = namespace(valid=legacy_container_payload is sequence
+                    and legacy_container_payload is not string and legacy_container_payload is not mapping) -%}
+                  {%- if scan.valid -%}
+                  {%- for record in legacy_container_payload -%}
+                  {%- if record is not mapping or record.get('Name') is not string
+                    or record.get('Id') is not string or record.get('Id') is not match('^[0-9a-f]{64}$') -%}
+                  {%- set scan.valid = false -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {%- endif -%}
+                  {{ scan.valid and
+                    (legacy_container_payload | map(attribute='Name') | map('regex_replace', '^/', '') |
+                      sort(case_sensitive=true) | list)
+                    == (legacy_container_names.stdout.splitlines() | sort(case_sensitive=true) | list) }}
               no_log: true
           rescue:
             - name: Retain no legacy matches after malformed inspection JSON
@@ -1003,15 +1029,15 @@
       rescue:
         - name: Preserve startup restoration and publish available failed-attempt facts
           block:
+            - name: Collect container startup diagnostics
+              include_tasks: ../../tasks/container_failure_diagnostics.yml
+
             - name: Restore source container after container startup failure
               ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
               no_log: true
               when:
                 - source_replacement_verified | default(false) | bool
                 - source_replacement_removed | default(false) | bool
-
-            - name: Collect container startup diagnostics
-              include_tasks: ../../tasks/container_failure_diagnostics.yml
 
             - name: Report container preparation failed
               shell: |
@@ -1117,15 +1143,15 @@
       rescue:
         - name: Preserve health restoration and publish available failed-attempt facts
           block:
+            - name: Collect container health diagnostics
+              include_tasks: ../../tasks/container_failure_diagnostics.yml
+
             - name: Restore source container after health validation failure
               ansible.builtin.include_tasks: ../../tasks/container_source_runtime_restore.yml
               no_log: true
               when:
                 - source_replacement_verified | default(false) | bool
                 - source_replacement_removed | default(false) | bool
-
-            - name: Collect container health diagnostics
-              include_tasks: ../../tasks/container_failure_diagnostics.yml
 
             - name: Report container health check failed
               shell: |

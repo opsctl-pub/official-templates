@@ -128,6 +128,24 @@ conditional `replace:complete`/`replace:legacy_cleanup`, `container:prepare` and
 from the final `image_runtime` observation. Progress alone does not establish
 readiness or predecessor absence.
 
+Startup and health failures collect diagnostics before source restoration. The
+shared bounded reader resolves the target name once, then qualifies its full
+container ID against existing predecessor observations and exact managed labels.
+It never reads logs by name or falls back to the prior/restored container. Missing,
+malformed or mismatched identity produces unavailable diagnostics without changing
+the original failure or restoration. Restricted state and logs exclude Env and
+full configuration; unsafe or oversized state error text is omitted whole.
+
+One ten-second deadline covers lookup, qualification and both log pipes. Metadata
+is capped at 64 KiB per read. Whole UTF-8 stdout/stderr tails shrink from 50 to 20
+to 10 lines when needed, with a combined 16 KiB/50-line cap. Repeated lines and
+original bytes are preserved; unsafe controls or protocol markers make the whole
+tail unavailable, never a truncated prefix. Diagnostics use a separate debug JSON
+message through existing Runner redaction. Only known OpsCtl-delivered secrets
+are recognized: app-generated secrets and URL-encoded, base64 or otherwise
+transformed reprints may not match. These diagnostics do not change result,
+input, effect or restoration semantics and are not a Pulse log viewer.
+
 ## Example
 
 Example image inputs with one managed mount:

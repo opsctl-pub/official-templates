@@ -80,8 +80,8 @@
 
         - name: Install the public bounded collector inside the existing owned private directory
           ansible.builtin.copy:
-            src: "{{ playbook_dir }}/../../scripts/compose_failure_logs.py"
-            dest: "{{ compose_auth_directory.path }}/compose-failure-logs.py"
+            src: "{{ playbook_dir }}/../../scripts/container_failure_logs.py"
+            dest: "{{ compose_auth_directory.path }}/container-failure-logs.py"
             mode: '0700'
             backup: false
           diff: false
@@ -90,7 +90,7 @@
           ansible.builtin.command:
             argv:
               - python3
-              - "{{ compose_auth_directory.path }}/compose-failure-logs.py"
+              - "{{ compose_auth_directory.path }}/container-failure-logs.py"
               - "{{ {'docker': compose_docker_resolved.stdout, 'project': compose_project_name,
                     'workspace': compose_project_src | normpath, 'members': compose_failure_members[:4],
                     'omitted': [0, compose_failure_members | length - 4] | max} | to_json }}"
