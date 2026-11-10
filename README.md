@@ -1,13 +1,12 @@
 # OpsControl Official Templates
 
-Procedures for configuring and observing Servers with OpsControl. Start with the
-[catalog](catalog/README.md) to find a procedure's inputs, behavior, results and
-failure handling. Organization overrides can replace a procedure while preserving
-its documented inputs and results; OpsControl still authorizes and sequences runs.
+Procedures for configuring and observing Servers with OpsControl. Organization
+overrides can replace a procedure while keeping its inputs and results; OpsControl
+still authorizes and sequences runs.
 
 ## Structure
 
-- `catalog/ansible/playbooks/`: Procedures grouped by task, with adjacent documentation and declarations.
+- `catalog/ansible/playbooks/`: Procedures grouped by task, with their declarations.
 - `catalog/ansible/tasks/`: Shared procedure tasks.
 - `catalog/ansible/scripts/`: Native helpers.
 - `catalog/ansible/roles/` and `catalog/ansible/templates/`: Baseline tasks and rendered configuration.
@@ -15,9 +14,8 @@ its documented inputs and results; OpsControl still authorizes and sequences run
 - `catalog/terraform/modules/`: Provider HCL consumed by OpenTofu.
 
 Each registered entrypoint has a matching `.contract.json` declaration describing
-its result/completion format or associating the item and engine with its adjacent
-documentation. HCL modules also have a separate optional Server-create family
-declaration. Shared tasks and helpers support the entrypoints; they are not
+its result format or naming its item and engine. HCL modules can also have an
+optional Server-create declaration. Shared tasks and helpers support the entrypoints; they are not
 separate catalog items.
 
 ## Selecting a source
