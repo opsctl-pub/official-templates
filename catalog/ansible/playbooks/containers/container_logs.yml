@@ -1,0 +1,75 @@
+---
+- name: Read container logs
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    container_operational_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  tasks:
+    - name: Read container logs
+      block:
+        - name: Check container selection
+          ansible.builtin.assert:
+            that:
+              - lines is integer
+              - lines >= 1 and lines <= 1000
+              - container_name is not none or container_id is not none or group is not none
+              - container_name is none or container_id is none
+            fail_msg: A bounded container selection is required.
+
+        - name: Read selected logs
+          ansible.builtin.script:
+            cmd: >-
+              {{ (playbook_dir + '/../../scripts/container_failure_logs.py') | quote }}
+              --mode logs
+              {{ {'container_name': container_name, 'container_id': container_id, 'group': group, 'lines': lines, 'operational_path': container_operational_path} | to_json | quote }}
+            executable: python3
+          environment:
+            PATH: "{{ container_operational_path }}"
+          register: container_log_capture
+          changed_when: false
+
+        - name: Retain only the bounded private result for presentation
+          ansible.builtin.set_fact:
+            container_log_projection: "{{ container_log_capture.stdout | from_json }}"
+
+        - name: Check log result
+          ansible.builtin.assert:
+            that:
+              - container_log_projection is mapping
+              - container_log_projection.status in ['available', 'unavailable', 'selection_required']
+              - container_log_projection.observed_at is string
+              - container_log_projection.status != 'available' or (container_log_projection.logs is string and container_log_projection.container_name is string and container_log_projection.line_count is integer and container_log_projection.limited is boolean)
+              - container_log_projection.status != 'selection_required' or (container_log_projection.names is sequence and container_log_projection.names | length <= 20)
+      rescue:
+        - name: Retain unavailable without publishing capture or native error text
+          ansible.builtin.set_fact:
+            container_log_projection:
+              status: unavailable
+      no_log: true
+
+    - name: Print logs
+      ansible.builtin.debug:
+        msg: |-
+          Container logs
+          {% if container_log_projection.status == 'available' %}
+          Container: {{ container_log_projection.container_name }}
+          {% endif %}
+          Observed at: {{ container_log_projection.observed_at | default('unavailable; no observation recorded') }}
+          {% if container_log_projection.status == 'available' %}
+          {% if container_log_projection.limited %}
+          Output limited
+          {% endif %}
+          {{ container_log_projection.logs }}
+          {% elif container_log_projection.status == 'selection_required' %}
+          Selection required. Choose an exact container name or ID:
+          {% for name in container_log_projection.names %}
+          {{ name }}
+          {% endfor %}
+          {% if container_log_projection.names_limited %}
+          Additional containers omitted.
+          {% endif %}
+          {% else %}
+          Logs unavailable.
+          {% endif %}
+      no_log: false

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from datetime import datetime, timezone
 
 
 CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -39,20 +40,22 @@ class NativeReads:
                             if not key.startswith("DOCKER_")}
         self.deadline = deadline
 
-    def read(self, arguments, limit):
+    def read(self, arguments, limit, *, combined=False):
         """Return complete successful output within one aggregate byte/time bound."""
         if time.monotonic() >= self.deadline:
             raise Unavailable()
         child = subprocess.Popen(
             [*self.command, *arguments], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT if combined else subprocess.PIPE,
+            env=self.environment,
         )
         streams = [bytearray(), bytearray()]
         consumed = 0
         try:
             with selectors.DefaultSelector() as poller:
                 poller.register(child.stdout, selectors.EVENT_READ, 0)
-                poller.register(child.stderr, selectors.EVENT_READ, 1)
+                if child.stderr is not None:
+                    poller.register(child.stderr, selectors.EVENT_READ, 1)
                 while poller.get_map():
                     remaining = self.deadline - time.monotonic()
                     if remaining <= 0:
@@ -79,7 +82,8 @@ class NativeReads:
                     child.wait()
                 finally:
                     child.stdout.close()
-                    child.stderr.close()
+                    if child.stderr is not None:
+                        child.stderr.close()
 
 
 def inputs(raw):
@@ -121,7 +125,7 @@ def scoped(reads, request, member):
         raise Unavailable()
 
 
-def safe_tail(streams):
+def safe_tail(streams, *, max_lines=50):
     """Omit whole tails containing unsafe text; never edit a protected literal."""
     for stream in streams:
         validation = SGR.sub("", stream)
@@ -129,7 +133,7 @@ def safe_tail(streams):
                 or any(unicodedata.category(char).startswith("C")
                        and char not in "\n\r\t\u200c\u200d" for char in validation)):
             raise Unavailable()
-    if sum(len(stream.splitlines()) for stream in streams) > 50:
+    if sum(len(stream.splitlines()) for stream in streams) > max_lines:
         raise Overflow()
     return streams
 
@@ -228,9 +232,148 @@ def collect_member(reads, request, member):
     return unavailable
 
 
+def log_inputs(raw):
+    """Accept only the ordinary action's closed selectors and bounded line request."""
+    if (not isinstance(raw, dict)
+            or set(raw) != {"container_name", "container_id", "group", "lines", "operational_path"}
+            or not isinstance(raw["operational_path"], str)
+            or not 0 < len(raw["operational_path"]) <= 4096 or "\x00" in raw["operational_path"]
+            or type(raw["lines"]) is not int or not 1 <= raw["lines"] <= 1000):
+        raise Unavailable()
+    name, identity, group = raw["container_name"], raw["container_id"], raw["group"]
+    if (name is not None and (not isinstance(name, str) or not SERVICE.fullmatch(name))
+            or identity is not None and (not isinstance(identity, str) or not CONTAINER_ID.fullmatch(identity))
+            or name is not None and identity is not None
+            or name is None and identity is None and group is None):
+        raise Unavailable()
+    labels = {}
+    if group is not None:
+        if not isinstance(group, dict):
+            raise Unavailable()
+        if group.get("kind") == "image":
+            if (set(group) != {"kind", "organization_id", "deployment_id"}
+                    or any(not isinstance(group[key], str) or not UUID.fullmatch(group[key])
+                           for key in ("organization_id", "deployment_id"))):
+                raise Unavailable()
+            labels = {"com.opsctl.managed": "true", "com.opsctl.org_id": group["organization_id"],
+                      "com.opsctl.deployment_id": group["deployment_id"]}
+        elif group.get("kind") == "compose":
+            if (set(group) != {"kind", "project_name", "working_directory"}
+                    or not isinstance(group["project_name"], str) or len(group["project_name"]) > 128
+                    or not PROJECT.fullmatch(group["project_name"])
+                    or not isinstance(group["working_directory"], str)
+                    or not 0 < len(group["working_directory"]) <= 4096
+                    or not os.path.isabs(group["working_directory"])
+                    or os.path.normpath(group["working_directory"]) != group["working_directory"]):
+                raise Unavailable()
+            safe_tail((group["working_directory"],))
+            labels = {"com.docker.compose.project": group["project_name"],
+                      "com.docker.compose.project.working_dir": group["working_directory"]}
+        else:
+            raise Unavailable()
+    return labels
+
+
+def log_identity(reads, selector, labels):
+    """Inspect only identity, exact name and the read group's required labels."""
+    fields = ['"id":{{json .Id}}', '"name":{{json .Name}}']
+    for index, key in enumerate(labels):
+        fields.append('"label' + str(index) + '":{{json (index .Config.Labels "' + key + '")}}')
+    output, error = reads.read([
+        "container", "inspect", "--format", "{" + ",".join(fields) + "}", selector,
+    ], 16384)
+    observed = json.loads(output)
+    if (error or not isinstance(observed, dict)
+            or not isinstance(observed.get("id"), str) or not CONTAINER_ID.fullmatch(observed["id"])
+            or not isinstance(observed.get("name"), str) or not observed["name"].startswith("/")):
+        raise Unavailable()
+    name = observed["name"][1:]
+    if (not SERVICE.fullmatch(name)
+            or any(observed.get("label" + str(index)) != value for index, value in enumerate(labels.values()))):
+        raise Unavailable()
+    return {"id": observed["id"], "name": name}
+
+
+def log_selection(reads, request, labels):
+    """Resolve once; never choose a replica or use a replacement name after selection."""
+    selector = request["container_id"] or request["container_name"]
+    if selector is not None:
+        member = log_identity(reads, selector, labels)
+        if (request["container_id"] is not None and member["id"] != request["container_id"]
+                or request["container_name"] is not None and member["name"] != request["container_name"]):
+            raise Unavailable()
+        return [member]
+    arguments = ["container", "ls", "--all", "--no-trunc"]
+    for key, value in labels.items():
+        arguments.extend(["--filter", "label=" + key + "=" + value])
+    output, error = reads.read([*arguments, "--format", "{{.ID}}"], 16384)
+    identities = output.splitlines()
+    if (error or not identities or len(identities) > 128 or len(set(identities)) != len(identities)
+            or any(not CONTAINER_ID.fullmatch(value) for value in identities)):
+        raise Unavailable()
+    members = []
+    for identity in identities:
+        member = log_identity(reads, identity, labels)
+        if member["id"] != identity:
+            raise Unavailable()
+        members.append(member)
+    return members
+
+
+def ordinary_tail(reads, member, lines):
+    """Keep Docker record order in one pipe and shrink only complete recent tails."""
+    tail = lines
+    while True:
+        try:
+            output, _ = reads.read([
+                "logs", "--timestamps", "--tail", str(tail), member["id"],
+            ], 16384, combined=True)
+            safe_tail((output,), max_lines=tail)
+            return {"logs": output, "line_count": len(output.splitlines()), "limited": tail < lines}
+        except Overflow:
+            if tail == 1:
+                raise Unavailable() from None
+            tail = max(1, tail // 2)
+
+
+def ordinary_read(raw, deadline):
+    """Publish no partial content, native errors or guessed membership."""
+    result = {"status": "unavailable", "observed_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        labels = log_inputs(raw)
+        executable = shutil.which("docker", path=raw["operational_path"])
+        if executable is None:
+            raise Unavailable()
+        docker = os.path.realpath(executable)
+        with tempfile.TemporaryDirectory(prefix="docker-logs-", dir=os.path.dirname(os.path.abspath(__file__))) as config:
+            reads = NativeReads(docker, config, deadline)
+            members = log_selection(reads, raw, labels)
+            if len(members) > 1:
+                result.update(status="selection_required", names=[member["name"] for member in members[:20]],
+                              names_limited=len(members) > 20)
+            else:
+                member = members[0]
+                content = ordinary_tail(reads, member, raw["lines"])
+                result.update(status="available", container_id=member["id"], container_name=member["name"], **content)
+    except (Unavailable, OSError, ValueError, subprocess.SubprocessError):
+        pass
+    result["observed_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
 def main():
     """Emit private diagnostic JSON only; collection never replaces native failure."""
     deadline = time.monotonic() + 10
+    if len(sys.argv) == 4 and sys.argv[1:3] == ["--mode", "logs"]:
+        result = {"status": "unavailable", "observed_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            if len(sys.argv[3].encode("utf-8")) > 32768:
+                raise Unavailable()
+            result = ordinary_read(json.loads(sys.argv[3]), deadline)
+        except (Unavailable, ValueError, UnicodeError):
+            pass
+        sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
+        return
     result = {"status": "unavailable", "members": [], "omitted": 0}
     try:
         if len(sys.argv) != 2 or len(sys.argv[1].encode("utf-8")) > 32768:
