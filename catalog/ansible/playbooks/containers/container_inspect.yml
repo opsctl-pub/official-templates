@@ -22,6 +22,29 @@
       vars:
         image_runtime_action: inspect
 
+    - name: Sample usage only for the admitted running image incarnation
+      ansible.builtin.include_tasks: ../../tasks/container_resource_usage.yml
+      vars:
+        resource_usage_ids: >-
+          {{ [image_runtime.container.id] if image_runtime.container is not none and
+            image_runtime.container.state == 'running' and
+            image_runtime.container.id == app_previous_container_id | default(none) else [] }}
+      when: collect_resource_usage | default(false) | bool
+
+    - name: Attach only this inspection's sample within the existing envelope bound
+      ansible.builtin.set_fact:
+        image_runtime: "{{ image_usage_candidate }}"
+      vars:
+        image_usage_candidate: >-
+          {{ image_runtime | combine({'container': image_runtime.container |
+            combine({'resource_usage': container_resource_usage[image_runtime.container.id]})}) }}
+      when:
+        - collect_resource_usage | default(false) | bool
+        - image_runtime.container is not none
+        - image_runtime.container.id in container_resource_usage
+        - "{'image_runtime': image_usage_candidate} | to_json(ensure_ascii=true) | length <= 262144"
+      no_log: true
+
     - name: Publish bounded native image and resource facts
       ansible.builtin.debug:
         msg: "TEMPLATE_OUTPUT_JSON={{ {'image_runtime': image_runtime} | to_json }}"

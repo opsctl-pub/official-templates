@@ -1,0 +1,83 @@
+---
+- name: Initialize unavailable optional resource usage
+  ansible.builtin.set_fact:
+    container_resource_usage: {}
+  no_log: true
+
+- name: Sample only the admitted running container identities
+  when: resource_usage_ids | length > 0
+  block:
+    - name: Require bounded unique full native selectors before invoking Docker
+      ansible.builtin.assert:
+        that:
+          - resource_usage_ids | type_debug == 'list'
+          - resource_usage_ids | length <= 128
+          - resource_usage_ids | unique | length == resource_usage_ids | length
+          - resource_usage_ids | select('match', '^[a-f0-9]{64}$') | list | length == resource_usage_ids | length
+
+    - name: Create an owned isolated Docker CLI configuration directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: opsctl-resource-usage-
+      register: resource_usage_config
+
+    - name: Read one bounded Docker-reported CPU and memory batch
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv: >-
+          {{ ['env', '-i', 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C', 'LC_ALL=C',
+            'DOCKER_HOST=unix:///var/run/docker.sock', 'DOCKER_CONFIG=' ~ resource_usage_config.path,
+            'timeout', '--kill-after=2s', '10s', 'docker',
+            '--host=unix:///var/run/docker.sock', '--config', resource_usage_config.path,
+            'stats', '--no-stream', '--no-trunc', '--format', resource_usage_format] + resource_usage_ids }}
+      vars:
+        resource_usage_format: "{% raw %}{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}{% endraw %}"
+      changed_when: false
+      register: resource_usage_read
+
+    - name: Retain the UTC sample completion clock
+      ansible.builtin.set_fact:
+        resource_usage_observed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Require exact response membership without adopting unexpected containers
+      ansible.builtin.assert:
+        that:
+          - resource_usage_read.stdout | length <= 32768
+          - resource_usage_read.stdout_lines | length == resource_usage_ids | length
+          - >-
+            resource_usage_read.stdout_lines | map('regex_replace', '\t.*$', '') |
+            sort == resource_usage_ids | sort
+
+    - name: Validate only bounded ID and numeric Docker-reported fields
+      ansible.builtin.assert:
+        that:
+          - usage_row | length <= 256
+          - usage_row is match('^[a-f0-9]{64}\t[0-9]+(?:\.[0-9]+)?%\t[0-9]+(?:\.[0-9]+)?(?:[kKMGTPE]i?B|B) / [0-9]+(?:\.[0-9]+)?(?:[kKMGTPE]i?B|B)$')
+          - usage_row.split('\t')[2] | length <= 128
+      loop: "{{ resource_usage_read.stdout_lines }}"
+      loop_control:
+        loop_var: usage_row
+        label: resource usage sample
+
+    - name: Publish validated optional samples without affecting readiness
+      ansible.builtin.set_fact:
+        container_resource_usage: >-
+          {%- set samples = namespace(values={}) -%}
+          {%- for row in resource_usage_read.stdout_lines -%}
+          {%- set fields = row.split('\t') -%}
+          {%- set samples.values = samples.values | combine({fields[0]: {
+            'observed_at': resource_usage_observed_at,
+            'cpu_percent': fields[1][:-1] | float, 'memory_usage': fields[2]}}) -%}
+          {%- endfor -%}
+          {{ samples.values }}
+  rescue:
+    - name: Omit unavailable or invalid samples without changing workload facts
+      ansible.builtin.set_fact:
+        container_resource_usage: {}
+  always:
+    - name: Remove only this collection's temporary CLI configuration
+      ansible.builtin.file:
+        path: "{{ resource_usage_config.path }}"
+        state: absent
+      when: resource_usage_config.path is defined
+  no_log: true

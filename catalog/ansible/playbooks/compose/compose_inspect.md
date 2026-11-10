@@ -16,6 +16,7 @@ registry credentials, Compose apply, image pull, login, creation or deletion occ
 | `compose_known_containers` | `[]` | Up to 128 recorded full Docker IDs; missing IDs are observed, not fabricated instances. |
 | `compose_known_networks` | `[]` | Up to 64 `{id,name,origin}`; origin `created|reused|external|unknown`. |
 | `compose_known_volumes` | `[]` | Up to 64 `{name,created_at,origin}`; nullable timestamp, same origins. |
+| `collect_resource_usage` | `false` | Optional CPU/memory snapshot for recorded, observed-running service instances only. |
 
 Central eligibility excludes authenticated env/secret roles and exact
 owner-delivered protected/generated/credential material, and requires
@@ -55,7 +56,8 @@ The [root-only result evolution rules](compose_deploy.md#public-result-evolution
 unknown root fields are discarded only after the full raw 256 KiB bound and explicit
 `procedure_error` presence refusal. Bounded new root diagnostic codes grant no
 success/coverage; exact complete/null-reason and all identity/truth guards remain.
-Nested additions, including selected-file reason changes, are unsupported. Raw
+The optional instance `resource_usage` described below is explicitly supported;
+other nested additions, including selected-file reason changes, are unsupported. Raw
 markers/logs are not redacted by projection; secrets remain forbidden.
 
 Each selected row is exactly `{path,presence,size_bytes,mode,sha256,reason}`.
@@ -89,6 +91,21 @@ health,exit_code,ports,mounts}`. Replica/digest/exit_code may be null; ports con
 `{type:volume|bind|tmpfs|other,source,target,read_only}`. Digest is the unambiguous
 native repo digest; source is volume name/bind path/null. No env, health commands,
 labels, credentials, arbitrary errors or private proof fields are returned.
+
+When explicitly requested, ordinary inspection alone invokes the shared
+[resource-usage task](../containers/container_inspect.md#optional-resource-usage)
+for up to128 unique running IDs already in `compose_known_containers`. Its exact
+response membership must match the selection. Unexpected/replaced/stopped
+instances have no usage. Each optional `resource_usage` supplies the UTC sample
+completion time, Docker CPU percentage and reported memory used/limit string;
+it is independent of readiness and workload completeness. Unavailable/invalid
+sampling omits usage. The existing publisher measures the exact ASCII-serialized
+envelope. If an inspection exceeds256KiB, it removes only service-instance
+`resource_usage` and serializes that same result again, preserving every workload
+and selected-file field. The existing incomplete-result fallback runs only if
+the actual envelope still exceeds the bound. Usage alone cannot cause a new
+readiness/completeness failure, and older samples are never substituted.
+Deploy/remove and inspections without usage retain their existing behavior.
 
 Bounds are 256 KiB, 32 services, 128 total instances, 64 networks/volumes, 256
 ports/128 mounts per instance. Overflow explicitly emits incomplete/unknown.

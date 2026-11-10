@@ -28,6 +28,32 @@
     - name: Observe exactly admitted nonsecret disk files independently of workloads
       ansible.builtin.include_tasks: ../../tasks/compose_selected_file_observe.yml
 
+    - name: Sample usage only for admitted running service instances
+      ansible.builtin.include_tasks: ../../tasks/container_resource_usage.yml
+      vars:
+        resource_usage_ids: >-
+          {{ compose_observed_services | map(attribute='instances') | flatten |
+            selectattr('state', 'equalto', 'running') | map(attribute='id') |
+            select('in', compose_known_containers | default([])) | list }}
+      when: collect_resource_usage | default(false) | bool
+
+    - name: Project samples onto this inspection's service instances
+      ansible.builtin.set_fact:
+        compose_observed_services: >-
+          {%- set services = namespace(values=[]) -%}
+          {%- for service in compose_observed_services -%}
+          {%- set instances = namespace(values=[]) -%}
+          {%- for instance in service.instances -%}
+          {%- set instances.values = instances.values + [instance |
+            combine({'resource_usage': container_resource_usage[instance.id]}
+              if instance.id in container_resource_usage else {})] -%}
+          {%- endfor -%}
+          {%- set services.values = services.values + [service | combine({'instances': instances.values})] -%}
+          {%- endfor -%}
+          {{ services.values }}
+      when: collect_resource_usage | default(false) | bool
+      no_log: true
+
     - name: Record successful complete read independently of readiness
       ansible.builtin.set_fact:
         compose_outcome: "{{ 'succeeded' if compose_observation_complete else 'unknown' }}"

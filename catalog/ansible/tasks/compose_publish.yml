@@ -25,6 +25,31 @@
     compose_serialized_result: "{{ {'compose': compose_result} | to_json(ensure_ascii=true) }}"
   no_log: true
 
+- name: Drop only optional inspection samples before workload overflow handling
+  when:
+    - compose_action == 'inspect'
+    - collect_resource_usage | default(false) | bool
+    - compose_serialized_result | length > 262144
+  block:
+    - name: Preserve every assembled field except instance resource usage
+      ansible.builtin.set_fact:
+        compose_result: >-
+          {%- set services = namespace(values=[]) -%}
+          {%- for service in compose_result.services -%}
+          {%- set instances = namespace(values=[]) -%}
+          {%- for instance in service.instances -%}
+          {%- set instances.values = instances.values + [instance | dict2items |
+            rejectattr('key', 'equalto', 'resource_usage') | items2dict] -%}
+          {%- endfor -%}
+          {%- set services.values = services.values + [service | combine({'instances': instances.values})] -%}
+          {%- endfor -%}
+          {{ compose_result | combine({'services': services.values}) }}
+
+    - name: Measure the same exact envelope without optional samples
+      ansible.builtin.set_fact:
+        compose_serialized_result: "{{ {'compose': compose_result} | to_json(ensure_ascii=true) }}"
+  no_log: true
+
 - name: Retain the actual wire overflow decision
   ansible.builtin.set_fact:
     compose_result_overflow: "{{ compose_serialized_result | length > 262144 }}"

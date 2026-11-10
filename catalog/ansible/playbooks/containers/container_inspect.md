@@ -13,6 +13,7 @@ Compose projects use the separate [compose_inspect](../compose/compose_inspect.m
 | `app_previous_container_id` | null | Optional recorded full predecessor ID to observe, never adoption authority. |
 | `app_observe_volumes` | `[]` | Up to64 `{name,created_at}` references; recorded timestamps required nonempty strings. |
 | `app_observe_networks` | `[]` | Up to64 `{id,name}` full-ID references. |
+| `collect_resource_usage` | `false` | Optional usage snapshot for the recorded, observed-running container only. |
 
 Every ordinary image inspection emits image_runtime through the shared info modules,
 including workloads without managed references (empty resource lists).
@@ -60,6 +61,30 @@ health literals follow [image deployment](container_deploy.md#results). Ports:
 `{host_ip,host_port,container_port,protocol:tcp|udp}`; mounts:
 `{type:volume|bind|tmpfs|other,source,target,read_only}`. Source is volume name/bind
 path/null. No env/options/health command/labels/credential/native error is projected.
+
+### Optional resource usage
+
+Only explicit inspectors use the shared
+[`container_resource_usage.yml`](../../tasks/container_resource_usage.yml) task.
+With `collect_resource_usage=true`, the running container must match the admitted
+full64 `app_previous_container_id`. Compose uses the same task for its admitted
+running instances; unexpected, replaced and stopped containers are never sampled.
+An empty selection skips Docker entirely. Before launch the task requires1-128
+unique full IDs; one literal-argv `docker stats --no-stream --no-trunc` batch must
+return exactly those unique IDs, with only the fixed ID/CPU/memory formatter.
+It uses the local socket, an isolated environment/temporary CLI config and Linux
+`timeout`10s with `--kill-after=2s`; `always` removes its owned config. Collection
+and validation tasks use `no_log`.
+
+An instance may include `resource_usage:{observed_at,cpu_percent,memory_usage}`:
+UTC sample completion time, finite nonnegative Docker CPU percentage (100 means
+one logical core; values can exceed100), and Docker's bounded used/limit memory
+string, for example `12.5MiB / 1GiB`. Memory retains reported precision and
+cache-adjusted meaning, not inferred exact bytes. Missing, malformed, failed or
+over-budget sampling omits this object, never substitutes zero or an old sample.
+Usage does not affect readiness, observation completeness, identity or drift.
+Deploy/remove and private verification never invoke this task. The existing
+Inspect action obtains another snapshot; there is no background collector.
 
 Bounds:64 Volume/Network references,128 users per resource,256 ports/128 mounts per
 instance,256KiB output. Unknown cannot release backend references or establish
