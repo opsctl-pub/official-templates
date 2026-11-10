@@ -1,0 +1,98 @@
+---
+- name: Restart only the recorded installed containers
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Initialize acknowledged restarts
+      ansible.builtin.set_fact:
+        restarted_container_ids: []
+
+    - name: Restart the admitted group without configuration convergence
+      block:
+        - name: Require bounded exact membership
+          ansible.builtin.assert:
+            that:
+              - restart_profile in ['image', 'compose']
+              - restart_containers is sequence and restart_containers is not string
+              - restart_containers | length >= 1
+              - restart_containers | length <= 128
+              - restart_containers | map(attribute='id') | unique | length == restart_containers | length
+              - restart_profile != 'image' or restart_containers | length == 1
+              - restart_profile != 'compose' or restart_compose_project is string and restart_compose_project | length > 0
+            fail_msg: The recorded restart group is unavailable.
+          no_log: true
+
+        - name: Validate every full native selector
+          ansible.builtin.assert:
+            that:
+              - item.id is match('^[a-f0-9]{64}$')
+              - item.name is string and item.name | length > 0
+              - restart_profile != 'compose' or item.service is string and item.service | length > 0
+              - restart_profile != 'compose' or item.replica is integer and item.replica >= 1 and item.replica <= 128
+            fail_msg: The recorded restart selector is unavailable.
+          loop: "{{ restart_containers }}"
+          no_log: true
+
+        - name: Inspect all exact incarnations before any restart
+          community.docker.docker_container_info:
+            docker_host: unix:///var/run/docker.sock
+            name: "{{ item.id }}"
+          loop: "{{ restart_containers }}"
+          register: restart_inspections
+          no_log: true
+
+        - name: Refuse missing or changed group members before effects
+          ansible.builtin.assert:
+            that:
+              - item.exists
+              - item.container.Id == item.item.id
+              - item.container.Name == '/' + item.item.name
+              - restart_profile != 'compose' or labels.get('com.docker.compose.project') == restart_compose_project
+              - restart_profile != 'compose' or labels.get('com.docker.compose.service') == item.item.service
+              - restart_profile != 'compose' or labels.get('com.docker.compose.container-number') == item.item.replica | string
+              - restart_profile != 'compose' or labels.get('com.docker.compose.oneoff', '') | lower == 'false'
+            fail_msg: The installed restart group no longer matches the reviewed target.
+          vars:
+            labels: "{{ item.container.Config.Labels | default({}, true) }}"
+          loop: "{{ restart_inspections.results }}"
+          no_log: true
+
+        - name: Report interruption started
+          ansible.builtin.debug:
+            msg: "OPERATION_STEP={{ {'name': 'restart:containers', 'status': 'running', 'metadata': {'display_name': 'Restart installed containers'}} | to_json }}"
+
+        - name: Restart existing containers without changing configuration
+          community.docker.docker_container:
+            docker_host: unix:///var/run/docker.sock
+            name: "{{ item.id }}"
+            state: started
+            restart: true
+            recreate: false
+            pull: never
+            comparisons:
+              '*': ignore
+          loop: "{{ restart_containers }}"
+          loop_control:
+            break_when: restart_step is failed
+          register: restart_step
+          no_log: true
+      always:
+        - name: Retain only acknowledged exact native restarts
+          ansible.builtin.set_fact:
+            restarted_container_ids: "{{ restarted_container_ids + [item.item.id] }}"
+          loop: "{{ restart_step.results | default([]) }}"
+          when:
+            - item is succeeded
+            - item.container is defined
+            - item.container.Id == item.item.id
+          no_log: true
+
+        - name: Publish acknowledged progress without a health or installation claim
+          ansible.builtin.debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ {'restarted_container_ids': restarted_container_ids} | to_json }}"
+
+        - name: Report group restart completion only for the whole admitted set
+          ansible.builtin.debug:
+            msg: "OPERATION_STEP={{ {'name': 'restart:containers', 'status': 'completed', 'metadata': {'display_name': 'Restart installed containers'}} | to_json }}"
+          when: restarted_container_ids | length == restart_containers | default([]) | length
