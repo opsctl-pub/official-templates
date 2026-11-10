@@ -2,14 +2,5 @@
   "format_version": 1,
   "item_id": "container_restart",
   "engine": "ansible",
-  "result_version": 1,
-  "examples": [
-    {
-      "case": "acknowledged",
-      "outputs": {
-        "restarted_container_ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      }
-    },
-    {"case": "unacknowledged", "outputs": {"restarted_container_ids": []}}
-  ]
+  "documentation": "container_restart.md"
 }
