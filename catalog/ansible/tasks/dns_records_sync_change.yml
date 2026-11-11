@@ -69,6 +69,13 @@
           - dns_sync_compare_result.json.result.content == dns_change.value
           - (dns_sync_compare_result.json.result.ttl | int) == (dns_change.ttl | int)
           - (dns_sync_compare_result.json.result.proxied | bool) == (dns_change.proxied | bool)
+          - >-
+            dns_delete_scope | default('') != 'retirement_tracked_delete'
+            or (dns_sync_compare_result.json.success is sameas true
+                and dns_sync_compare_result.json.result.ttl is integer
+                and dns_sync_compare_result.json.result.ttl == dns_change.ttl
+                and dns_sync_compare_result.json.result.proxied is boolean
+                and dns_sync_compare_result.json.result.proxied == dns_change.proxied)
         fail_msg: "Confirmed external DNS record changed or is missing"
       when:
         - dns_change.action == 'delete'
@@ -187,6 +194,40 @@
       when:
         - dns_change.action in ['create', 'update']
         - not (dns_sync_apply_result.skipped | default(false))
+
+    - name: Confirm tracked retirement deletion at the provider
+      when:
+        - dns_delete_scope | default('') == 'retirement_tracked_delete'
+        - not dns_sync_delete_already_absent
+      block:
+        - name: Require the original provider record to return 404
+          uri:
+            url: "{{ cloudflare_api_base }}/zones/{{ provider_zone_id }}/dns_records/{{ dns_change.provider_record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+            status_code: 404
+          no_log: true
+
+        - name: Read the exact hostname and type after deletion
+          uri:
+            url: >-
+              {{ cloudflare_api_base }}/zones/{{ provider_zone_id }}/dns_records?name.exact={{ dns_change.hostname | urlencode }}&type={{ dns_change.record_type | urlencode }}&match=all&page=1
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+            status_code: 200
+            return_content: true
+          register: dns_sync_retirement_absence
+          no_log: true
+
+        - name: Refuse any replacement at the same hostname and type
+          assert:
+            that:
+              - dns_sync_retirement_absence.json.success is sameas true
+              - dns_sync_retirement_absence.json.result == []
+            fail_msg: "Tracked retirement DNS absence is unavailable"
+          no_log: true
 
     - name: Accumulate the applied managed DNS change
       set_fact:

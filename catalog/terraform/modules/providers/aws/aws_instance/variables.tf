@@ -16,12 +16,6 @@ variable "security_group_id" {
   default     = ""
 }
 
-variable "destroy_security_group" {
-  description = "Whether to destroy the exact provision-owned security group"
-  type        = bool
-  default     = true
-}
-
 variable "destroy_ami_id" {
   description = "AMI ID from the imported EC2 instance state (required when destroy=true)"
   type        = string
@@ -113,4 +107,22 @@ variable "ingress_rules" {
     ])
     error_message = "Ingress rules require tcp/udp and a port from 1 through 65535."
   }
+}
+
+variable "destroy_target_names" {
+  description = "The single recorded target selected by the shared retirement executor"
+  type        = set(string)
+  default     = []
+  validation {
+    condition = !var.destroy || (length(var.destroy_target_names) == 1 && alltrue([
+      for name in var.destroy_target_names : contains(["instance", "security_group"], name)
+    ]))
+    error_message = "Destroy requires exactly one declared target."
+  }
+}
+
+variable "destroy_observe_only" {
+  description = "Read exact recorded target presence without managed resources"
+  type        = bool
+  default     = false
 }

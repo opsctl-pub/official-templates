@@ -2,6 +2,10 @@ terraform {
   required_version = ">= 1.0"
 
   required_providers {
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.0"
+    }
     digitalocean = {
       source  = "digitalocean/digitalocean"
       version = "~> 2.0"
@@ -107,7 +111,7 @@ resource "digitalocean_firewall" "server" {
 
 # For destroy operations, import the existing droplet
 resource "digitalocean_droplet" "this" {
-  count = var.destroy ? 1 : 0
+  count = var.destroy && !var.destroy_observe_only && contains(var.destroy_target_names, "droplet") ? 1 : 0
 
   # Minimal required fields for import
   # These values don't matter as we're destroying
@@ -125,10 +129,9 @@ resource "digitalocean_droplet" "this" {
 }
 
 resource "digitalocean_firewall" "destroy" {
-  count = var.destroy && var.destroy_firewall ? 1 : 0
+  count = var.destroy && !var.destroy_observe_only && contains(var.destroy_target_names, "firewall") ? 1 : 0
 
   name       = "opsctl-destroy-firewall"
-  depends_on = [digitalocean_droplet.this]
 
   outbound_rule {
     protocol              = "tcp"
@@ -139,7 +142,7 @@ resource "digitalocean_firewall" "destroy" {
   lifecycle {
     precondition {
       condition     = var.firewall_id != ""
-      error_message = "firewall_id is required when destroy_firewall=true"
+      error_message = "The selected firewall target requires firewall_id."
     }
   }
 }
@@ -152,4 +155,31 @@ resource "digitalocean_project" "default" {
   purpose     = var.project_purpose
   environment = var.project_environment
   resources   = [digitalocean_droplet.server[0].urn]
+}
+
+locals {
+  destroy_target = try(one(var.destroy_target_names), "")
+  destroy_ids   = { droplet = var.droplet_id, firewall = var.firewall_id }
+  destroy_paths = { droplet = "droplets", firewall = "firewalls" }
+  destroy_id    = lookup(local.destroy_ids, local.destroy_target, "")
+}
+
+data "http" "destroy_target" {
+  count = var.destroy && var.destroy_observe_only ? 1 : 0
+  url   = "https://api.digitalocean.com/v2/${local.destroy_paths[local.destroy_target]}/${urlencode(local.destroy_id)}"
+  request_headers = {
+    Authorization = "Bearer ${var.destroy_api_token}"
+    Accept        = "application/json"
+  }
+  request_timeout_ms = 10000
+  lifecycle {
+    precondition {
+      condition = var.destroy_api_token != "" && (
+        local.destroy_target == "droplet"
+        ? can(regex("^[1-9][0-9]*$", local.destroy_id))
+        : can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", local.destroy_id))
+      )
+      error_message = "Exact target and delivered credentials are required."
+    }
+  }
 }

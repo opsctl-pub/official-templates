@@ -18,12 +18,6 @@ variable "firewall_id" {
   default     = ""
 }
 
-variable "destroy_firewall" {
-  description = "Whether to destroy the provision-owned firewall"
-  type        = bool
-  default     = false
-}
-
 variable "ingress_rules" {
   description = "Backend-declared public TCP/UDP ingress for this managed Droplet"
   type = list(object({
@@ -180,4 +174,29 @@ variable "project_environment" {
   description = "Project environment (Development, Staging, Production)"
   type        = string
   default     = "Development"
+}
+
+variable "destroy_target_names" {
+  description = "The single recorded target selected by the shared retirement executor"
+  type        = set(string)
+  default     = []
+  validation {
+    condition = !var.destroy || (length(var.destroy_target_names) == 1 && alltrue([
+      for name in var.destroy_target_names : contains(["droplet", "firewall"], name)
+    ]))
+    error_message = "Destroy requires exactly one declared target."
+  }
+}
+
+variable "destroy_observe_only" {
+  description = "Read exact recorded target presence without managed resources"
+  type        = bool
+  default     = false
+}
+
+variable "destroy_api_token" {
+  description = "Delivered DigitalOcean token used only by the exact-ID HTTP observer"
+  type        = string
+  sensitive   = true
+  default     = ""
 }
