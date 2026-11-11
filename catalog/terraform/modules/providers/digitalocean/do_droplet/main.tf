@@ -158,7 +158,7 @@ resource "digitalocean_project" "default" {
 }
 
 locals {
-  destroy_target = try(one(var.destroy_target_names), "")
+  destroy_target = var.destroy && var.destroy_observe_only ? one(var.destroy_target_names) : ""
   destroy_ids   = { droplet = var.droplet_id, firewall = var.firewall_id }
   destroy_paths = { droplet = "droplets", firewall = "firewalls" }
   destroy_id    = lookup(local.destroy_ids, local.destroy_target, "")

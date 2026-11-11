@@ -159,7 +159,7 @@ resource "aws_security_group" "destroy" {
 }
 
 locals {
-  destroy_target = try(one(var.destroy_target_names), "")
+  destroy_target = var.destroy && var.destroy_observe_only ? one(var.destroy_target_names) : ""
   destroy_ids    = { instance = var.instance_id, security_group = var.security_group_id }
   destroy_id     = lookup(local.destroy_ids, local.destroy_target, "")
 }
