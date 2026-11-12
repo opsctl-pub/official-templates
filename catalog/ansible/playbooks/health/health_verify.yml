@@ -6,7 +6,8 @@
     timeout_s: 60
     resolved_health_mode: "{{ health_mode | default('http') }}"
     resolved_health_target_kind: "{{ health_target_kind | default('loopback') }}"
-    resolved_expected_status: "{{ expected_status | default(200) | int }}"
+    resolved_http_policy: "{{ http_policy | default('exact') }}"
+    resolved_expected_status: "{{ none if resolved_http_policy == 'response' else expected_status | default(200) | int }}"
     resolved_health_validate_certs: "{{ health_validate_certs | default(true) }}"
     resolved_health_url: >-
       {{ health_url if resolved_health_target_kind == 'loopback' else
@@ -35,11 +36,13 @@
           assert:
             that:
               - resolved_health_target_kind in ['loopback', 'wireguard']
+              - resolved_http_policy in ['exact', 'response']
+              - resolved_http_policy != 'response' or (expected_status | default(none) is none and body_contains | default(none) is none)
               - >-
                 (resolved_health_target_kind == 'wireguard') or
                 (resolved_health_url is match('^https?://127\\.0\\.0\\.1:[0-9]+/.*$'))
-              - resolved_expected_status >= 100
-              - resolved_expected_status <= 599
+              - resolved_http_policy == 'response' or resolved_expected_status >= 100
+              - resolved_http_policy == 'response' or resolved_expected_status <= 599
               - resolved_health_validate_certs is boolean
               - resolved_health_url is match('^https://') or resolved_health_validate_certs
               - body_contains is not defined or (body_contains is string and body_contains | length > 0 and body_contains | length <= 1024)
@@ -70,10 +73,11 @@
               - -c
               - "{{ lookup('ansible.builtin.file', '../../scripts/health_verify_http.py', lstrip=false, rstrip=false) }}"
               - "{{ resolved_health_url }}"
-              - "{{ resolved_expected_status }}"
+              - "{{ 'null' if resolved_http_policy == 'response' else resolved_expected_status }}"
               - "{{ body_contains | default('') }}"
               - "{{ health_headers | default({}) | to_json }}"
               - "{{ resolved_health_validate_certs | bool | lower }}"
+              - "{{ resolved_http_policy }}"
           register: _resp
           changed_when: false
           no_log: true
@@ -88,10 +92,13 @@
           when: resolved_health_mode == 'http'
 
         - name: Report HTTP health check passed
-          shell: |
-            printf 'OPERATION_STEP={"name":"health:complete","status":"completed","metadata":{"display_name":"Health check passed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
-          args:
-            executable: /bin/sh
+          ansible.builtin.debug:
+            msg: >-
+              OPERATION_STEP={{ {'name': 'health:complete', 'status': 'completed', 'metadata': {
+                'display_name': 'Route response verified' if resolved_http_policy == 'response' else 'Health check passed',
+                'mode': 'http', 'http_policy': resolved_http_policy, 'expected_status': resolved_expected_status,
+                'observed_status': _health_result.status, 'body_match': _health_result.body_match,
+                'error_code': _health_result.error_code}} | to_json }}
           when: resolved_health_mode == 'http'
 
         - name: Report TCP connection check started
@@ -123,10 +130,13 @@
           when: resolved_health_mode == 'http'
 
         - name: Report HTTP health check failed
-          shell: |
-            printf 'OPERATION_STEP={"name":"health:failure","status":"failed","metadata":{"display_name":"Health check failed","mode":"http","expected_status":%s,"observed_status":%s,"body_match":%s,"error_code":"%s"}}\n' "{{ resolved_expected_status }}" "{{ _health_result.status }}" "{{ _health_result.body_match | bool | lower }}" "{{ _health_result.error_code }}"
-          args:
-            executable: /bin/sh
+          ansible.builtin.debug:
+            msg: >-
+              OPERATION_STEP={{ {'name': 'health:failure', 'status': 'failed', 'metadata': {
+                'display_name': 'Route response verification failed' if resolved_http_policy == 'response' else 'Health check failed',
+                'mode': 'http', 'http_policy': resolved_http_policy, 'expected_status': resolved_expected_status,
+                'observed_status': _health_result.status, 'body_match': _health_result.body_match,
+                'error_code': _health_result.error_code}} | to_json }}
           when: resolved_health_mode == 'http'
 
         - name: Report TCP connection check failed

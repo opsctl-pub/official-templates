@@ -3,6 +3,7 @@
   "item_id": "container_inspect",
   "engine": "ansible",
   "result_version": 1,
+  "image_http_backend_version": 1,
   "examples": [
     {
       "case": "ready_present",

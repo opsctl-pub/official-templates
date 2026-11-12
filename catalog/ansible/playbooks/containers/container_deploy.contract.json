@@ -3,6 +3,7 @@
   "item_id": "container_deploy",
   "engine": "ansible",
   "result_version": 1,
+  "image_http_backend_version": 1,
   "workload_files": {"version": 1, "capability": "delivery_and_replacement_cleanup"},
   "examples": [
     {

@@ -2,5 +2,6 @@
   "format_version": 1,
   "item_id": "health_verify",
   "engine": "ansible",
+  "http_response_version": 1,
   "documentation": "health_verify.md"
 }

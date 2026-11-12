@@ -9,14 +9,25 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 url, expected_raw, needle, headers_raw, validate_raw = sys.argv[1:6]
-expected = int(expected_raw)
+policy = sys.argv[6] if len(sys.argv) > 6 else 'exact'
+expected = None
 validate_certs = validate_raw == "true"
 result = {
-    "body_match": needle == "",
+    "body_match": None if policy == 'response' else needle == "",
+    "http_policy": policy,
+    "expected_status": None,
     "error_code": "connection_failed",
     "status": 0,
 }
 try:
+    if policy not in {'exact', 'response'}:
+        raise ValueError('invalid HTTP verification policy')
+    if policy == 'response':
+        if needle or expected_raw not in {'', 'null', 'None'}:
+            raise ValueError('response policy cannot assert status or body')
+    else:
+        expected = int(expected_raw)
+        result['expected_status'] = expected
     headers = json.loads(headers_raw)
     if not isinstance(headers, dict):
         raise ValueError("health headers must be an object")
@@ -43,15 +54,17 @@ try:
         result["error_code"] = "response_too_large"
         print(json.dumps(result, separators=(",", ":")))
         raise SystemExit(4)
-    result["body_match"] = (
+    result["body_match"] = None if policy == 'response' else (
         needle == ""
         or needle in body.decode("utf-8", errors="replace")
     )
-    if result["status"] != expected:
+    status_matches = (type(result['status']) is int and 200 <= result['status'] <= 399
+                      if policy == 'response' else result['status'] == expected)
+    if not status_matches:
         result["error_code"] = "status_mismatch"
         print(json.dumps(result, separators=(",", ":")))
         raise SystemExit(2)
-    if not result["body_match"]:
+    if policy == 'exact' and not result["body_match"]:
         result["error_code"] = "content_mismatch"
         print(json.dumps(result, separators=(",", ":")))
         raise SystemExit(3)

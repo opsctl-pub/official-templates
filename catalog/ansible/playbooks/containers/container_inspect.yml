@@ -1,4 +1,7 @@
 ---
+# Optional app_http_origin selects private HTTP observation. image_runtime.http_backend
+# contains only inspected name/scope/container_name/network/target_port, never raw
+# configuration, labels or IPs. Missing/stopped instances retain ordinary facts.
 - name: Inspect deployment container and retained native resources
   hosts: all
   gather_facts: false

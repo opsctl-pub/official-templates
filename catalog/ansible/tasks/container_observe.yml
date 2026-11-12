@@ -6,6 +6,7 @@
     image_previous_absent: null
     image_observed_volumes: []
     image_observed_networks: []
+    image_observed_http_backend: null
     image_runtime_ready: null
   no_log: true
 
@@ -84,6 +85,60 @@
           - image_observed_container.ports | map(attribute='protocol') | difference(['tcp', 'udp']) | length == 0
       when: image_container_info.exists
 
+    - name: Qualify the actual private Image HTTP backend configuration
+      when: image_container_info.exists and app_http_origin | default(none) is not none
+      block:
+        - name: Require actual scoped Image ownership and private network
+          ansible.builtin.assert:
+            that:
+              - image_http_native_labels.get('com.opsctl.managed') == 'true'
+              - image_http_native_labels.get('com.opsctl.org_id') == app_org_id
+              - image_http_native_labels.get('com.opsctl.deployment_id') == app_deployment_id
+              - image_http_native_labels.get('io.opsctl.http.name') == 'deployment-' + app_deployment_id
+              - image_http_native_labels.get('io.opsctl.http.organization_id') == app_org_id
+              - image_http_native_labels.get('io.opsctl.http.deployment_id') == app_deployment_id
+              - image_http_native_labels.get('io.opsctl.http.container_name') == image_observed_container.name
+              - image_http_native_labels.get('io.opsctl.http.network', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+              - image_container_info.container.NetworkSettings.Networks.keys() | list == [image_http_native_labels.get('io.opsctl.http.network')]
+              - image_http_native_labels.get('io.opsctl.http.target_port', '') == app_http_origin.target_port | string
+              - not image_container_info.container.NetworkSettings.Ports.get(image_http_native_labels['io.opsctl.http.target_port'] + '/tcp')
+              - not image_http_native_labels.get('com.docker.compose.project')
+              - not image_http_native_labels.get('com.docker.compose.service')
+          vars:
+            image_http_native_labels: "{{ image_container_info.container.Config.Labels | default({}, true) }}"
+
+        - name: Project observed Image discovery identity without raw configuration
+          ansible.builtin.set_fact:
+            image_observed_http_backend:
+              name: "{{ image_http_native_labels['io.opsctl.http.name'] }}"
+              organization_id: "{{ image_http_native_labels['io.opsctl.http.organization_id'] }}"
+              deployment_id: "{{ image_http_native_labels['io.opsctl.http.deployment_id'] }}"
+              container_name: "{{ image_observed_container.name }}"
+              network: "{{ image_http_native_labels['io.opsctl.http.network'] }}"
+              target_port: "{{ image_http_native_labels['io.opsctl.http.target_port'] | int }}"
+          vars:
+            image_http_native_labels: "{{ image_container_info.container.Config.Labels }}"
+
+        - name: Require service-only discovery labels without implicit routers
+          ansible.builtin.assert:
+            that: observed_http_labels == expected_http_labels
+          vars:
+            observed_http_labels: >-
+              {%- set labels = namespace(value={}) -%}
+              {%- for key, value in image_container_info.container.Config.Labels.items() -%}
+              {%- if key.startswith('io.opsctl.http.') or key.startswith('traefik.') -%}
+              {%- set labels.value = labels.value | combine({key: value}) -%}
+              {%- endif -%}{%- endfor -%}{{ labels.value }}
+            expected_http_labels: >-
+              {%- set labels = namespace(value={}) -%}
+              {%- for key, value in image_observed_http_backend.items() -%}
+              {%- set labels.value = labels.value | combine({'io.opsctl.http.' + key: value | string}) -%}
+              {%- endfor -%}
+              {{ labels.value | combine({'io.opsctl.http.managed': 'true', 'traefik.enable': 'true',
+                'traefik.docker.network': image_observed_http_backend.network,
+                'traefik.http.services.' + image_observed_http_backend.name + '.loadbalancer.server.port': image_observed_http_backend.target_port | string,
+                'traefik.http.services.' + image_observed_http_backend.name + '.loadbalancer.server.scheme': 'http'}) }}
+
     - name: Inspect recorded predecessor by full identity
       community.docker.docker_container_info:
         name: "{{ app_previous_container_id }}"
@@ -148,6 +203,7 @@
       ansible.builtin.set_fact:
         image_observation_complete: false
         image_runtime_ready: null
+        image_observed_http_backend: null
   no_log: true
 
 - name: Assemble plain bounded image-runtime facts
@@ -159,19 +215,20 @@
           image_observed_networks | selectattr('presence', 'equalto', 'unknown') | list | length == 0,
         'ready': image_runtime_ready, 'container': image_observed_container,
         'previous_container_absent': image_previous_absent,
-        'volumes': image_observed_volumes, 'networks': image_observed_networks} }}
+        'volumes': image_observed_volumes, 'networks': image_observed_networks}
+        | combine({'http_backend': image_observed_http_backend} if image_observed_http_backend is not none else {}) }}
   no_log: true
 
 - name: Clear unavailable readiness without inventing a workload result
   ansible.builtin.set_fact:
-    image_runtime: "{{ image_runtime | combine({'ready': none}) }}"
+    image_runtime: "{{ image_runtime | dict2items | rejectattr('key', 'equalto', 'http_backend') | items2dict | combine({'ready': none}) }}"
   when: not image_runtime.observation_complete
   no_log: true
 
 - name: Retain explicit unavailable image facts when the full envelope exceeds its bound
   ansible.builtin.set_fact:
     image_runtime: >-
-      {{ image_runtime | combine({'observation_complete': false, 'ready': none,
+      {{ image_runtime | dict2items | rejectattr('key', 'equalto', 'http_backend') | items2dict | combine({'observation_complete': false, 'ready': none,
         'container': none, 'volumes': [], 'networks': []}) }}
   when: "{'image_runtime': image_runtime} | to_json | length > 262144"
   no_log: true

@@ -1,4 +1,8 @@
 ---
+# docker_backend accepts real Compose project_name/service or Image container_name.
+# Both use the scoped deployment service, one private network and target_port.
+# The file records deployment-UUID@docker, route_port:null and no URL backends;
+# withdrawal observes the owned file without requiring a surviving application.
 - name: Converge one same-server Traefik deployment route
   hosts: all
   gather_facts: false
@@ -68,12 +72,13 @@
       assert:
         that:
           - docker_backend is mapping
-          - docker_backend.keys() | sort == ['deployment_id', 'name', 'network', 'organization_id', 'project_name', 'service', 'target_port']
+          - docker_backend.keys() | sort in [['deployment_id', 'name', 'network', 'organization_id', 'project_name', 'service', 'target_port'], ['container_name', 'deployment_id', 'name', 'network', 'organization_id', 'target_port']]
           - docker_backend.name == route_key
           - docker_backend.deployment_id == deployment_id
           - docker_backend.organization_id == org_id
-          - docker_backend.project_name is match('^[a-z0-9][a-z0-9_-]*$')
-          - docker_backend.service is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+          - docker_backend.get('container_name') is not none or docker_backend.project_name is match('^[a-z0-9][a-z0-9_-]*$')
+          - docker_backend.get('container_name') is not none or docker_backend.service is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+          - docker_backend.get('container_name') is none or docker_backend.container_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
           - docker_backend.network is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
           - docker_backend.target_port is integer
           - docker_backend.target_port == route_port
@@ -164,10 +169,6 @@
               - route_docker_labels.get('io.opsctl.http.name') == route_key
               - route_docker_labels.get('io.opsctl.http.organization_id') == org_id
               - route_docker_labels.get('io.opsctl.http.deployment_id') == deployment_id
-              - route_docker_labels.get('io.opsctl.http.project_name', '') is match('^[a-z0-9][a-z0-9_-]*$')
-              - route_docker_labels.get('io.opsctl.http.project_name') == route_docker_labels.get('com.docker.compose.project')
-              - route_docker_labels.get('io.opsctl.http.service', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-              - route_docker_labels.get('io.opsctl.http.service') == route_docker_labels.get('com.docker.compose.service')
               - route_docker_labels.get('io.opsctl.http.network', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
               - route_docker_instance.container.NetworkSettings.Networks.keys() | list == [route_docker_labels.get('io.opsctl.http.network')]
               - route_docker_labels.get('io.opsctl.http.target_port', '') is match('^[1-9][0-9]{0,4}$')
@@ -176,16 +177,41 @@
           vars:
             route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
 
+        - name: Qualify the real Compose member ownership
+          assert:
+            that:
+              - route_docker_labels.get('io.opsctl.http.project_name', '') is match('^[a-z0-9][a-z0-9_-]*$')
+              - route_docker_labels.get('io.opsctl.http.project_name') == route_docker_labels.get('com.docker.compose.project')
+              - route_docker_labels.get('io.opsctl.http.service', '') is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+              - route_docker_labels.get('io.opsctl.http.service') == route_docker_labels.get('com.docker.compose.service')
+          vars:
+            route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
+          when: docker_backend.get('container_name') is none
+
+        - name: Qualify the real Image member ownership
+          assert:
+            that:
+              - route_docker_labels.get('com.opsctl.managed') == 'true'
+              - route_docker_labels.get('com.opsctl.org_id') == org_id
+              - route_docker_labels.get('com.opsctl.deployment_id') == deployment_id
+              - route_docker_instance.container.Name | regex_replace('^/', '') == docker_backend.container_name
+              - route_docker_labels.get('io.opsctl.http.container_name') == docker_backend.container_name
+              - not route_docker_labels.get('com.docker.compose.project')
+              - not route_docker_labels.get('com.docker.compose.service')
+          vars:
+            route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
+          when: docker_backend.get('container_name') is not none
+
         - name: Project only the plain native backend identity
           set_fact:
-            observed_docker_backend:
-              name: "{{ route_key }}"
-              organization_id: "{{ org_id }}"
-              deployment_id: "{{ deployment_id }}"
-              project_name: "{{ route_docker_labels['io.opsctl.http.project_name'] }}"
-              service: "{{ route_docker_labels['io.opsctl.http.service'] }}"
-              network: "{{ route_docker_labels['io.opsctl.http.network'] }}"
-              target_port: "{{ route_docker_labels['io.opsctl.http.target_port'] | int }}"
+            observed_docker_backend: >-
+              {{ {'name': route_key, 'organization_id': org_id, 'deployment_id': deployment_id,
+                'network': route_docker_labels['io.opsctl.http.network'],
+                'target_port': route_docker_labels['io.opsctl.http.target_port'] | int}
+                | combine({'container_name': route_docker_instance.container.Name | regex_replace('^/', '')}
+                  if docker_backend.get('container_name') is not none else
+                  {'project_name': route_docker_labels['io.opsctl.http.project_name'],
+                   'service': route_docker_labels['io.opsctl.http.service']}) }}
           vars:
             route_docker_labels: "{{ route_docker_instance.container.Config.Labels }}"
 
