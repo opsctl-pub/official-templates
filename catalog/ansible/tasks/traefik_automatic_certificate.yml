@@ -124,14 +124,58 @@
         - "{{ certificate_subject_state }}/lego"
         - "{{ traefik_certificate_dir }}/runtime"
 
-    - name: Install only the two native certificate primitives
+    - name: Inspect shared account storage and the subject mount target
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ traefik_acme_state_dir }}/accounts"
+        - "{{ certificate_subject_state }}/lego/accounts"
+      register: automatic_account_directories
+
+    - name: Refuse unsafe existing account directories
+      ansible.builtin.assert:
+        that:
+          - item.stat.isdir | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid == 0
+          - item.stat.mode == '0700'
+      when: item.stat.exists
+      loop: "{{ automatic_account_directories.results }}"
+
+    - name: Create only absent private account directories
+      ansible.builtin.file:
+        path: "{{ item.item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: not item.stat.exists
+      loop: "{{ automatic_account_directories.results }}"
+
+    - name: Inspect the subject account mount target without following links
+      ansible.builtin.find:
+        paths: "{{ certificate_subject_state }}/lego/accounts"
+        hidden: true
+        file_type: any
+        recurse: false
+        follow: false
+      register: automatic_account_target
+
+    - name: Refuse hiding existing subject account material
+      ansible.builtin.assert:
+        that:
+          - automatic_account_target.matched == 0
+          - automatic_account_target.skipped_paths | default({}) | length == 0
+
+    - name: Install only the native certificate primitives
       ansible.builtin.copy:
         src: "../scripts/{{ item }}"
         dest: "{{ traefik_certificate_dir }}/runtime/{{ item }}"
         owner: root
         group: root
         mode: '0600'
-      loop: [certificate_facts.py, traefik_certificate_publish.py]
+      loop: [certificate_facts.py, traefik_certificate_publish.py, acme_account_storage.py]
 
     - name: Ensure the exact admitted native client image
       community.docker.docker_image:
