@@ -3,6 +3,8 @@ set -euo pipefail
 umask 077
 
 state={{ certificate_subject_state | quote }}
+accounts={{ (traefik_acme_state_dir ~ '/accounts') | quote }}
+account_id=opsctl-server
 store={{ traefik_certificate_dir | quote }}
 selection={{ certificate_selection_path | quote }}
 route={{ (traefik_dynamic_dir ~ '/acme-' ~ certificate_subject_key ~ '.yml') | quote }}
@@ -65,9 +67,16 @@ else
     printf '%s' {{ expected_certificate | to_json | quote }} > "$work/expected.json"
 fi
 
-{% if challenge == 'http-01' %}
 exec 9>{{ (traefik_acme_state_dir ~ '/http-challenge.lock') | quote }}
 flock -w 600 9
+[ -d "$state/lego/accounts" ] && [ ! -L "$state/lego/accounts" ]
+[ "$(readlink -f -- "$state/lego/accounts")" = "$state/lego/accounts" ]
+[ "$(stat -c '%u:%a' -- "$state/lego/accounts")" = "0:700" ]
+account_target_entry=$(find "$state/lego/accounts" -mindepth 1 -maxdepth 1 -printf x -quit)
+[ -z "$account_target_entry" ]
+python3 "$store/runtime/acme_account_storage.py" "$accounts" \
+    {{ acme_directory_url | quote }} {{ acme_email | quote }} "$account_id"
+{% if challenge == 'http-01' %}
 if [ -e "$route" ] || [ -L "$route" ]; then exit 1; fi
 install -m 0644 -- "$state/challenge.yml" "$route_stage"
 ln -- "$route_stage" "$route"
@@ -81,6 +90,7 @@ docker_args=(run --cidfile "$work/client.id" --name "$client_name" --network hos
     --label {{ ('com.opsctl.subject_type=' ~ certificate_subject.type) | quote }}
     --label {{ ('com.opsctl.subject_id=' ~ certificate_subject.id) | quote }}
     --volume "$state/lego:$state/lego"
+    --volume "$accounts:$state/lego/accounts"
     --volume {{ ((certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt')) ~ ':' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt')) ~ ':ro') | quote }}
     --env {{ ('SSL_CERT_FILE=' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt'))) | quote }}
     --env {{ ('LEGO_CA_CERTIFICATES=' ~ (certificate_system_trust_file | default('/etc/ssl/certs/ca-certificates.crt'))) | quote }})
@@ -90,7 +100,7 @@ docker_args+=(--volume {{ (dns_challenge_token_file ~ ':' ~ dns_challenge_token_
     --env {{ ('HTTPREQ_PASSWORD_FILE=' ~ dns_challenge_token_file) | quote }} --env HTTPREQ_HTTP_TIMEOUT=120)
 {% endif %}
 lego_args=(run --server {{ acme_directory_url | quote }} --email {{ acme_email | quote }}
-    --accept-tos --path "$state/lego")
+    --accept-tos --path "$state/lego" --account-id "$account_id")
 {% for host in route_hosts %}
 lego_args+=(--domains {{ host | quote }})
 {% endfor %}
