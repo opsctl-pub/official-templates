@@ -1,112 +1,71 @@
+variable "opsctl_server" {
+  description = "Sealed neutral Server creation input; null only for recorded Destroy"
+  type = object({
+    name                     = string
+    region                   = string
+    size                     = string
+    image                    = string
+    image_metadata           = any
+    tags                     = list(string)
+    user_data                = string
+    provider_config          = any
+    ssh_port                 = number
+    ssh_bootstrap_profile    = string
+    public_ingress_rules     = list(object({ protocol = string, port = number }))
+    networks                 = any
+    private_ingress_bindings = any
+    ssh_key = object({
+      public_key      = string
+      fingerprint     = string
+      registered_id   = string
+      registered_name = string
+    })
+    simulate = bool
+  })
+  default = null
+
+  validation {
+    condition = var.opsctl_server == null ? true : (
+      var.opsctl_server.ssh_port >= 1 && var.opsctl_server.ssh_port <= 65535 &&
+      floor(var.opsctl_server.ssh_port) == var.opsctl_server.ssh_port &&
+      length(var.opsctl_server.tags) <= 128 && length(var.opsctl_server.private_ingress_bindings) <= 32 &&
+      length(var.opsctl_server.public_ingress_rules) <= 35 &&
+      alltrue([for rule in var.opsctl_server.public_ingress_rules :
+        contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535 && floor(rule.port) == rule.port
+      ])
+    )
+    error_message = "Server creation requires bounded ports, tags and private peers."
+  }
+}
+
 variable "destroy" {
-  description = "Whether this is a destroy operation"
+  description = "Whether this is a recorded Destroy operation"
   type        = bool
   default     = false
 }
 
+variable "region" {
+  description = "Recorded AWS region for Destroy only"
+  type        = string
+  default     = ""
+}
+
 variable "instance_id" {
-  description = "ID of the existing EC2 instance to destroy (required when destroy=true)"
+  description = "Exact recorded instance target"
   type        = string
   default     = ""
 }
 
 variable "security_group_id" {
-  description = "ID of the provision-owned security group to destroy (required when destroy=true)"
+  description = "Exact provision-owned security group target"
   type        = string
   default     = ""
 }
 
 variable "destroy_ami_id" {
-  description = "AMI ID from the imported EC2 instance state (required when destroy=true)"
+  description = "Original AMI ID from the imported state"
   type        = string
   default     = ""
-}
-
-variable "name" {
-  description = "Name of the EC2 instance (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "region" {
-  description = "AWS region"
-  type        = string
-  default     = ""
-}
-
-variable "instance_type" {
-  description = "EC2 instance type (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "image_ssm_parameter" {
-  description = "AWS SSM parameter path that resolves to the AMI ID (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "public_key" {
-  description = "Optional SSH public key material used to create an EC2 key pair"
-  type        = string
-  default     = ""
-}
-
-variable "key_name" {
-  description = "Optional existing EC2 key pair name, or name to use when public_key is provided"
-  type        = string
-  default     = ""
-}
-
-variable "user_data" {
-  description = "Optional cloud-init user data"
-  type        = string
-  default     = ""
-}
-
-variable "ssh_port" {
-  description = "Reviewed initial SSH listening port"
-  type        = number
-  default     = 22
-
-  validation {
-    condition     = var.ssh_port >= 1 && var.ssh_port <= 65535 && floor(var.ssh_port) == var.ssh_port
-    error_message = "ssh_port must be an integer from 1 through 65535."
-  }
-}
-
-variable "ssh_bootstrap_profile" {
-  description = "Backend-qualified managed image profile for nondefault SSH setup"
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = contains(["", "ubuntu-22.04", "ubuntu-24.04"], var.ssh_bootstrap_profile)
-    error_message = "SSH bootstrap requires a supported Ubuntu image profile."
-  }
-}
-
-variable "tags" {
-  description = "Tags to apply to the instance and supporting resources"
-  type        = list(string)
-  default     = ["terraform", "opsctl"]
-}
-
-variable "ingress_rules" {
-  description = "Backend-declared public TCP/UDP ingress for this managed instance"
-  type = list(object({
-    protocol = string
-    port     = number
-  }))
-  default = []
-
-  validation {
-    condition = alltrue([
-      for rule in var.ingress_rules :
-      contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535
-    ])
-    error_message = "Ingress rules require tcp/udp and a port from 1 through 65535."
-  }
 }
 
 variable "destroy_target_names" {
@@ -120,4 +79,3 @@ variable "destroy_target_names" {
     error_message = "Destroy requires exactly one declared target."
   }
 }
-

@@ -1,16 +1,17 @@
 provider "aws" {
-  region = var.region
+  region = var.destroy ? var.region : var.opsctl_server.region
 }
 
 locals {
-  resource_name       = trimspace(var.name) != "" ? trimspace(var.name) : "opsctl-instance"
-  image_ssm_parameter = trimspace(var.image_ssm_parameter)
+  creation            = var.opsctl_server
+  resource_name       = var.destroy ? "opsctl-instance" : local.creation.name
+  image_ssm_parameter = try(local.creation.image_metadata.ssm_parameter, "")
   default_subnet_id   = try(sort(data.aws_subnets.default[0].ids)[0], "")
-  create_key_pair     = !var.destroy && trimspace(var.public_key) != ""
-  created_key_name    = trimspace(var.key_name) != "" ? trimspace(var.key_name) : "${local.resource_name}-key"
-  instance_key_name   = local.create_key_pair ? aws_key_pair.this[0].key_name : (trimspace(var.key_name) != "" ? trimspace(var.key_name) : null)
+  create_key_pair     = var.destroy ? false : (!local.creation.simulate && local.creation.ssh_key.registered_name == "" && local.creation.ssh_key.public_key != "")
+  created_key_name    = "${local.resource_name}-key"
+  instance_key_name   = var.destroy ? null : (local.create_key_pair ? aws_key_pair.this[0].key_name : (local.creation.ssh_key.registered_name != "" ? local.creation.ssh_key.registered_name : null))
   aws_tags = merge(
-    { for tag in var.tags : tag => "true" },
+    { for tag in (var.destroy ? ["terraform", "opsctl"] : local.creation.tags) : tag => "true" },
     { Name = local.resource_name }
   )
 }
@@ -43,7 +44,7 @@ resource "aws_key_pair" "this" {
   count = local.create_key_pair ? 1 : 0
 
   key_name   = local.created_key_name
-  public_key = var.public_key
+  public_key = local.creation.ssh_key.public_key
   tags       = local.aws_tags
 }
 
@@ -56,7 +57,7 @@ resource "aws_security_group" "this" {
   tags        = local.aws_tags
 
   dynamic "ingress" {
-    for_each = var.ingress_rules
+    for_each = local.creation.public_ingress_rules
     content {
       description = "OpsControl declared ingress"
       from_port   = ingress.value.port
@@ -79,13 +80,13 @@ resource "aws_instance" "server" {
   count = var.destroy ? 0 : 1
 
   ami                         = try(nonsensitive(data.aws_ssm_parameter.selected_image[0].value), "")
-  instance_type               = var.instance_type
+  instance_type               = local.creation.size
   subnet_id                   = local.default_subnet_id
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.this[0].id]
   key_name                    = local.instance_key_name
-  user_data = var.ssh_port == 22 ? (trimspace(var.user_data) != "" ? var.user_data : null) : templatefile(
-    "${path.module}/../../../ssh/cloud-init.yaml.tftpl", { ssh_port = var.ssh_port }
+  user_data = local.creation.ssh_port == 22 ? (trimspace(local.creation.user_data) != "" ? local.creation.user_data : null) : templatefile(
+    "${path.module}/../../../ssh/cloud-init.yaml.tftpl", { ssh_port = local.creation.ssh_port }
   )
   tags = local.aws_tags
 
@@ -96,17 +97,17 @@ resource "aws_instance" "server" {
 
   lifecycle {
     precondition {
-      condition = var.ssh_port == 22 || (
-        var.user_data == "" && contains(["ubuntu-22.04", "ubuntu-24.04"], var.ssh_bootstrap_profile)
+      condition = local.creation.ssh_port == 22 || (
+        local.creation.user_data == "" && contains(["ubuntu-22.04", "ubuntu-24.04"], local.creation.ssh_bootstrap_profile)
       )
       error_message = "Nondefault SSH requires a qualified image and no custom user_data."
     }
 
     precondition {
       condition = (
-        trimspace(var.name) != ""
-        && trimspace(var.region) != ""
-        && trimspace(var.instance_type) != ""
+        trimspace(local.creation.name) != ""
+        && trimspace(local.creation.region) != ""
+        && trimspace(local.creation.size) != ""
         && local.image_ssm_parameter != ""
       )
       error_message = "name, region, instance_type, and image_ssm_parameter are required when destroy=false."

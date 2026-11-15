@@ -2,37 +2,50 @@
 
 ## Inputs
 
-This HCL module uses OpenTofu and private `DIGITALOCEAN_TOKEN` provider delivery.
-`destroy` defaults to false; creation requires `name`, `region`, `size` and `image`.
-`ssh_key_id` takes precedence over optional `ssh_key_name`. Monitoring, backups
-and IPv6 default to false; `vpc_uuid` and `user_data` default to empty.
-`ingress_rules` defaults to `[]` with explicit TCP/UDP ports; tags default to
-`terraform` and `opsctl`. An optional nonempty `project_name` creates a provider
-project and assigns the Droplet; this is not an OpsCtl Project.
+Creation accepts one `opsctl_server` object: `name`, `region`, `size`, `image`,
+`image_metadata`, `tags`, `user_data`, `provider_config`, `ssh_port`,
+`ssh_bootstrap_profile`, `public_ingress_rules`, `networks`,
+`private_ingress_bindings`, `ssh_key` and `simulate`. Strings and collections are
+bounded by the public API contract; credentials stay in `DIGITALOCEAN_TOKEN`.
+The object contains no private management key. Runner simulation remains a
+separate execution control and the object also identifies a simulation plan.
 
-`private_ingress_rules` defaults to `[]`. Each row has `protocol: "tcp"`, an
-integer `port` (1–65535), and `source_addresses` containing one qualified IPv4
-host `/32`. These are separate from public `ingress_rules`; the module never
-discovers peers, changes VPC ownership or implies workload connectivity.
+`ssh_key` carries `public_key`, `fingerprint`, `registered_id` and
+`registered_name`. Ordinary creation uses the registered id. Saved planning
+uses native `digitalocean_ssh_keys` filtered by fingerprint and requires exactly
+one match with identical first two OpenSSH fields; it never creates a key.
+Simulation skips registration and key lookup.
 
-`ssh_port` defaults to 22. A different integer port (1–65535) requires a declared
-Ubuntu 22.04/24.04 bootstrap profile and empty custom user data. Destroy mode
-selects one recorded target through `destroy_target_names` and uses its
-`droplet_id` or provision-owned `firewall_id`. See [variable declarations](variables.tf).
+`provider_config.do` owns optional monitoring, backups and IPv6 (default false).
+The single authorized `networks` domain supplies its VPC. Private bindings supply
+only their exact peer host/32
+and requested TCP port; they cannot discover peers or change network ownership.
+Public rules use explicit TCP/UDP ports. `ssh_port` is an integer 1–65535; a
+nondefault port requires the declared Ubuntu profile and empty user data.
+
+Recorded Destroy keeps `destroy`, `destroy_target_names`, `droplet_id` and
+`firewall_id`; there are no flat creation-input aliases.
 
 ## Behavior
 
-Create the requested Droplet, attach selected keys and declared firewall ingress,
-and optionally create the provider project. Outbound TCP/UDP/ICMP is allowed.
+Create the requested Droplet, attach selected keys and declared firewall ingress.
+Outbound TCP/UDP/ICMP is allowed.
 Nondefault SSH uses the existing shared first-boot template. The caller imports
 recorded resources for the existing destroy path; this module does not search
-for deletion targets. It does not install Docker or establish SSH trust/readiness.
+for deletion targets. It does not install Docker or establish management SSH trust/reachability.
 
 ## Results
 
 [Outputs](outputs.tf) include Droplet/firewall IDs, name, region, size, IPv4,
 URN, private IPv4, optional IPv6, status, creation time, tags and the full provider
-resource. Observation is isolated in the data-only root below.
+resource. `opsctl_server` is the plain version-1 allocation result: native identity,
+hostname, region, size, canonical status, nullable IPv4 addresses, tags, `ready`
+and nullable `reason`. Native active status plus usable public IPv4 is ready;
+other statuses remain factual and report not ready. Readiness is independent of
+managed ingress and SSH setup. The platform retains an unready allocation as a
+failed, charged Server without rewriting this result. Saved apply selects the
+seven original registration outputs plus this result. Observation stays isolated
+in the data-only root below.
 
 ## Progress
 
@@ -43,7 +56,7 @@ Use native OpenTofu progress/results. No module-owned `OPERATION_STEP` or
 
 The independent [observe/](observe/main.tf) root accepts only `targets`, an ordered
 list of `{name, id}` objects (`droplet`, `firewall`) with exact string IDs.
-The v2 item contract declares no additional observation inputs. Credentials use
+The v3 item contract declares no additional observation inputs. Credentials use
 native `DIGITALOCEAN_TOKEN` delivery. This root
 pins OpenTofu >= 1.13.2 and digitalocean/digitalocean = 2.107.0. It contains no
 managed resources, imports or application/destroy controls.

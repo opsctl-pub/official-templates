@@ -62,7 +62,7 @@ output "droplet_ipv4_address_private" {
 
 output "droplet_ipv6_address" {
   description = "IPv6 address of the droplet"
-  value       = var.destroy ? "" : (var.enable_ipv6 && length(digitalocean_droplet.server) > 0 ? digitalocean_droplet.server[0].ipv6_address : "")
+  value       = var.destroy ? "" : (try(local.options.enable_ipv6, false) && length(digitalocean_droplet.server) > 0 ? digitalocean_droplet.server[0].ipv6_address : "")
 }
 
 output "droplet_status" {
@@ -87,3 +87,30 @@ output "droplet" {
   sensitive   = false
 }
 
+
+locals {
+  allocated_ipv4 = try(digitalocean_droplet.server[0].ipv4_address, "")
+  usable_public_ipv4 = can(cidrnetmask("${local.allocated_ipv4}/32")) && !anytrue([
+    for cidr in ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4"] :
+    try(cidrcontains(cidr, local.allocated_ipv4), true)
+  ])
+  allocated_status = lookup({ new = "provisioning", active = "active", off = "stopped", error = "error" }, try(digitalocean_droplet.server[0].status, ""), "unknown")
+  provider_ready   = local.allocated_status == "active" && local.usable_public_ipv4
+}
+
+output "opsctl_server" {
+  description = "Allocated Server identity and native readiness, independently of management setup"
+  value = var.destroy ? null : {
+    format_version       = 1
+    provider_instance_id = tostring(digitalocean_droplet.server[0].id)
+    hostname             = digitalocean_droplet.server[0].name
+    region               = digitalocean_droplet.server[0].region
+    size                 = digitalocean_droplet.server[0].size
+    status               = local.allocated_status
+    ip_address           = local.allocated_ipv4 != "" ? local.allocated_ipv4 : null
+    private_ip           = digitalocean_droplet.server[0].ipv4_address_private != "" ? digitalocean_droplet.server[0].ipv4_address_private : null
+    tags                 = sort(tolist(digitalocean_droplet.server[0].tags))
+    ready                = local.provider_ready
+    reason               = local.provider_ready ? null : (local.allocated_status == "active" ? "public_ip_unavailable" : "provider_not_ready")
+  }
+}

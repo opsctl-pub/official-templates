@@ -6,6 +6,32 @@ key pair, preserving the existing SSM image selection and SSH bootstrap.
 `destroy_target_names` selects one recorded `instance` or `security_group` for
 import and saved deletion; neither target is discovered by name.
 
+## Creation input and result
+
+Creation accepts one `opsctl_server` object: `name`, `region`, `size`, `image`,
+`image_metadata`, `tags`, `user_data`, `provider_config`, `ssh_port`,
+`ssh_bootstrap_profile`, `public_ingress_rules`, `networks`,
+`private_ingress_bindings`, `ssh_key` and `simulate`. The fixed public object
+contains no credentials or private key. Native AWS credentials stay in their
+execution environment. AWS saved planning is not declared.
+
+The module maps size to instance type, reads the captured
+`image_metadata.ssm_parameter` through native SSM, and converts platform tags
+to native tag keys with `Name` set to the actual requested name. Ordinary
+creation uses `ssh_key.registered_name`; the public key and fingerprint do not
+grant registration authority. Simulation skips key registration. Initial SSH
+uses the declared port/Ubuntu profile and existing shared cloud-init template.
+Recorded Destroy retains its original region, instance/security-group/AMI IDs
+and target names; flat creation aliases are absent.
+
+The plain `opsctl_server` version-1 result contains the allocated identity,
+hostname, region, size, canonical status, nullable public/private IPv4, tags,
+`ready` and nullable `reason`. Only running plus usable public IPv4 is ready;
+other native states map honestly, including explicit unknown. An unready
+allocation remains a failed, charged Server without changing this raw result.
+Raw instance/security-group/AMI outputs remain available to existing callers.
+Native readiness does not attest managed ingress or SSH setup.
+
 ## Read-only observation
 
 The independent [observe/](observe/main.tf) root requires an ordered `targets`
@@ -37,7 +63,7 @@ are dated facts, not current health or universal provider-parity claims. Destroy
 uses this same read before import and after apply; failed reads never grant it
 a deletion/absence result. Native AWS behavior remains unqualified until tested.
 
-The v2 item contract declares `region` from the recorded Server metadata/region
+The v3 item contract declares `region` from the recorded Server metadata/region
 selectors; it retains the existing Destroy inputs and import declarations.
 The [shared formatter](../../../opsctl/observation/main.tf) alone constructs
 coverage envelopes from raw native facts. Exact full-package materialization

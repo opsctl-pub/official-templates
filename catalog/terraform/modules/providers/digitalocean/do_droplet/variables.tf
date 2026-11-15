@@ -1,179 +1,65 @@
-# Destroy operation flag
+variable "opsctl_server" {
+  description = "Sealed neutral Server creation input; null only for recorded Destroy"
+  type = object({
+    name                     = string
+    region                   = string
+    size                     = string
+    image                    = string
+    image_metadata           = any
+    tags                     = list(string)
+    user_data                = string
+    provider_config          = any
+    ssh_port                 = number
+    ssh_bootstrap_profile    = string
+    public_ingress_rules     = list(object({ protocol = string, port = number }))
+    networks                 = any
+    private_ingress_bindings = any
+    ssh_key = object({
+      public_key      = string
+      fingerprint     = string
+      registered_id   = string
+      registered_name = string
+    })
+    simulate = bool
+  })
+  default = null
+
+  validation {
+    condition = var.opsctl_server == null ? true : (
+      var.opsctl_server.ssh_port >= 1 && var.opsctl_server.ssh_port <= 65535 &&
+      floor(var.opsctl_server.ssh_port) == var.opsctl_server.ssh_port &&
+      length(var.opsctl_server.tags) <= 128 &&
+      length(var.opsctl_server.public_ingress_rules) <= 35 &&
+      length(var.opsctl_server.private_ingress_bindings) <= 32 &&
+      alltrue([for binding in var.opsctl_server.private_ingress_bindings :
+        binding.requested.protocol == "tcp" && binding.requested.port >= 1 &&
+        binding.requested.port <= 65535 && floor(binding.requested.port) == binding.requested.port &&
+        can(cidrnetmask("${binding.endpoint.host}/32"))
+      ]) &&
+      alltrue([for rule in var.opsctl_server.public_ingress_rules :
+        contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535 && floor(rule.port) == rule.port
+      ])
+    )
+    error_message = "Server creation requires bounded ports, tags and private peers."
+  }
+}
+
 variable "destroy" {
-  description = "Whether this is a destroy operation"
+  description = "Whether this is a recorded Destroy operation"
   type        = bool
   default     = false
 }
 
-# Droplet ID for destroy operations
 variable "droplet_id" {
-  description = "ID of existing droplet to destroy (required when destroy=true)"
+  description = "Exact recorded Droplet target"
   type        = string
   default     = ""
 }
 
 variable "firewall_id" {
-  description = "ID of the exact provision-owned firewall to destroy"
+  description = "Exact provision-owned firewall target"
   type        = string
   default     = ""
-}
-
-variable "ingress_rules" {
-  description = "Backend-declared public TCP/UDP ingress for this managed Droplet"
-  type = list(object({
-    protocol = string
-    port     = number
-  }))
-  default = []
-
-  validation {
-    condition = alltrue([
-      for rule in var.ingress_rules :
-      contains(["tcp", "udp"], rule.protocol) && rule.port >= 1 && rule.port <= 65535
-    ])
-    error_message = "Ingress rules require tcp/udp and a port from 1 through 65535."
-  }
-}
-
-# Variables required only for provisioning (when destroy=false)
-variable "name" {
-  description = "Name of the droplet (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "region" {
-  description = "DigitalOcean region (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "size" {
-  description = "Droplet size (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "image" {
-  description = "Operating system image (required when destroy=false)"
-  type        = string
-  default     = ""
-}
-
-variable "ssh_key_name" {
-  description = "Name of the SSH key registered in DigitalOcean account"
-  type        = string
-  default     = ""
-}
-
-variable "ssh_key_id" {
-  description = "ID of the SSH key in DigitalOcean account (alternative to name)"
-  type        = string
-  default     = ""
-}
-
-variable "enable_monitoring" {
-  description = "Enable DigitalOcean monitoring"
-  type        = bool
-  default     = false
-}
-
-variable "enable_backups" {
-  description = "Enable automatic backups"
-  type        = bool
-  default     = false
-}
-
-variable "enable_ipv6" {
-  description = "Enable IPv6"
-  type        = bool
-  default     = false
-}
-
-variable "vpc_uuid" {
-  description = "VPC UUID to place the droplet in (optional)"
-  type        = string
-  default     = ""
-}
-
-variable "private_ingress_rules" {
-  description = "Explicit single-port TCP allowances from qualified private IPv4 peers"
-  type = list(object({
-    protocol         = string
-    port             = number
-    source_addresses = list(string)
-  }))
-  default = []
-
-  validation {
-    condition = length(var.private_ingress_rules) <= 32 && alltrue([
-      for rule in var.private_ingress_rules : rule.protocol == "tcp" &&
-      rule.port >= 1 && rule.port <= 65535 && floor(rule.port) == rule.port &&
-      length(rule.source_addresses) == 1 && alltrue([
-        for address in rule.source_addresses : can(cidrnetmask(address)) && endswith(address, "/32")
-      ])
-    ])
-    error_message = "Private ingress requires at most 32 single-port TCP rules with one IPv4 /32 source each."
-  }
-}
-
-variable "user_data" {
-  description = "Cloud-init user data script (optional)"
-  type        = string
-  default     = ""
-}
-
-variable "ssh_port" {
-  description = "Reviewed initial SSH listening port"
-  type        = number
-  default     = 22
-
-  validation {
-    condition     = var.ssh_port >= 1 && var.ssh_port <= 65535 && floor(var.ssh_port) == var.ssh_port
-    error_message = "ssh_port must be an integer from 1 through 65535."
-  }
-}
-
-variable "ssh_bootstrap_profile" {
-  description = "Backend-qualified managed image profile for nondefault SSH setup"
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = contains(["", "ubuntu-22.04", "ubuntu-24.04"], var.ssh_bootstrap_profile)
-    error_message = "SSH bootstrap requires a supported Ubuntu image profile."
-  }
-}
-
-variable "tags" {
-  description = "Tags to apply to the droplet"
-  type        = list(string)
-  default     = ["terraform", "opsctl"]
-}
-
-# Project-related variables (optional)
-variable "project_name" {
-  description = "DigitalOcean project name (optional)"
-  type        = string
-  default     = ""
-}
-
-variable "project_description" {
-  description = "Project description"
-  type        = string
-  default     = "Resources managed by OpsControl"
-}
-
-variable "project_purpose" {
-  description = "Project purpose"
-  type        = string
-  default     = "Web Application"
-}
-
-variable "project_environment" {
-  description = "Project environment (Development, Staging, Production)"
-  type        = string
-  default     = "Development"
 }
 
 variable "destroy_target_names" {
@@ -187,4 +73,3 @@ variable "destroy_target_names" {
     error_message = "Destroy requires exactly one declared target."
   }
 }
-
