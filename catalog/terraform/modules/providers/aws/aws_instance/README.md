@@ -74,3 +74,108 @@ under `observation`, without a region-specific Python path or compatibility
 fallback. One execution-private `TF_PLUGIN_CACHE_DIR` serves observation and
 import/delete states and is removed at closure. Cold fetches remain a cost;
 there is no persistent/shared cache or zero-network initialization claim.
+
+## Declared creation ingress procedure (source only)
+
+The optional v3 `ingress` capability selects [ingress.sh](ingress.sh), with
+[ingress.jq](ingress.jq) owning its exact request/read projection. This procedure
+is **unexecuted**, not serving acceptance. This private source wires creation
+reads into the original apply Job; serving callers remain unchanged. Only `creation` is declared; ordinary full-policy observation
+and ingress changes are unsupported. AWS provisioning policy remains unchanged.
+
+Stdin is one finite JSON object, at most32 KiB, with exactly `format_version:1`,
+`action:"creation"`, recorded `provider_instance_id` (`i-...`), `firewall_id`
+(`sg-...`), `region`, `ssh_port`, `managed_rules`, `managed_private_rules`.
+Public rules are exact `{protocol:"tcp"|"udp",port:<integer 1–65535>}`, unique,
+at most35, including the recorded TCP SSH port. Private rules must be empty.
+No URL or credential is accepted. Existing native AWS environment credentials
+and AWS CLI are used with the explicit recorded region, no implicit endpoint
+selection, metadata credentials, CLI pagination or write retry. No resource is
+searched by name and no allocation/mutation is performed.
+
+Only exact `describe-security-groups --group-ids` and `describe-instances
+--instance-ids` reads are made within a 360-second total wait, with a 375-second
+Runner invocation ceiling. Exactly one matching
+group, one matching instance and its sole matching security-group attachment
+are required. At most100 native ingress rules are considered; each must be a
+TCP/UDP single port with exactly `0.0.0.0/0`. IPv6, group/prefix-list peers,
+ranges, duplicates and unsupported protocol forms do not qualify. Complete
+requires the exact expected rule set. Errors, malformed/truncated responses,
+authentication and timeout never prove a match or absence.
+
+Stdout is one version1 object with `format_version`, original `action`,
+`provider_instance_id`, `firewall_id`, real UTC `collection_started_at` and
+`collection_completed_at`, `status` (`complete`, `unknown`, `unsupported`,
+`rejected`), nullable bounded `reason`, and `observation:null`. Complete exits0;
+all other statuses exit1. The Runner bounds results to256 KiB and owns Operation
+markers; the script emits only this JSON and no raw native diagnostic/secret.
+Temporary files are private and removed on exit/interruption. This declaration
+makes no AWS live proof, mutation support or readiness parity claim.
+
+### Creation caller contract (unexecuted source)
+
+The ingress declaration's optional `firewall_output` is required when `creation`
+is declared. Here it names `security_group_id` exactly, without provider-name or
+output-alias inference. Runner passes only `procedure`/`actions` to its confined
+invoker. One shared request builder uses the original neutral `opsctl_server`
+input's SSH/public rules and authorized private binding hosts as /32; allocated
+identity/region come from the plain `opsctl_server` result and the firewall ID
+comes from the explicitly declared original output.
+
+`provider_ingress` is reserved for auxiliary evidence, not a declared firewall
+or saved native output name. The declared firewall output must differ from the
+provision result and be included when saved native outputs are selected. An
+ordinary native output already named `provider_ingress` is preserved unchanged;
+Runner does not overwrite it, and the typed creation gate refuses unavailable
+evidence.
+
+Ordinary creation appends `provider_ingress` alongside all native outputs after
+successful apply/output selection. Saved create appends it beside
+`opentofu_applied`/the unchanged `provider_outputs`, after actual saved apply
+returns. The same original Job performs the read; no extra Job or apply exists.
+Plans, simulation, updates and Destroy do not run this creation read. Missing
+historical capability invents no result. Unavailable ingress retains native
+allocation/apply success and exact artifact consumption; the API completion gate
+fails creation while existing registration/capacity owners retain responsibility.
+It qualifies original source/terminal custody and immutable reviewed intent;
+saved evidence stays on the original closed apply child, not a synthetic root
+receipt. Creation complete requires reason=null and observation=null. A source
+without captured creation ingress requires fresh review before new work. Verify now captures ingress in its existing native read Job; configuration
+and comparison remain pending separate migration. No behavior here
+has been demonstrated or accepted by this source handback.
+
+### Verify reuse (unexecuted source)
+
+Verify captures an optional ordered ingress read beside each existing primary
+target in the same account/module group and Job. Only provision-owned Servers
+with recorded firewall output, exposure, SSH port and qualified private bindings
+supply a scope. Imported/registered inventory and unavailable scope use null;
+there is no guessed firewall ID or peer/network/source lookup during ingestion.
+DO selects declared `observe`; AWS selects its declared creation-only exact
+match. `change` is never a Verify action.
+
+The backend's closed read capture includes `exposure` and `private_bindings` for
+current-scope requalification. Runner delivers only the eight plain procedure
+request fields above, with the captured module's `procedure`/`actions`. Reads
+run only for primary targets observed present. The original primary result is
+retained; `provider_ingress_observations` adds `{version:1,targets:[{name,id,result}]}`
+in that same order. Null means no usable ingress result. Failed ingress reads
+retain failed native status, while Verify owns aggregate warnings. Each ingress
+result is validated independently after ordered attribution; malformed ingress
+cannot erase valid primary facts or a sibling's valid ingress.
+
+Request/result evidence lives in the latest recorded provider verification.
+Pending/unknown refresh supersedes prior ingress success. Before projection,
+current Server/account custody, captured scope and the existing observation
+freshness rule are requalified without another provider request. Scope drift
+discards ingress only. Unavailable requested ingress warns while independently
+usable lifecycle/size/address facts remain usable. Only complete, settled exact
+desired public/private rules with no foreign inbound policy may repair an
+unverified creation gate; AWS creation-complete supplies that exact match.
+Desired exposure and peer bindings are never changed by Verify.
+
+The API creation-ingress recovery poll and DO/AWS creation reader are removed
+in this private source. Configuration retains its current full-policy reader
+and incremental writer until its reviewed migration. This source has not run:
+the earlier credential-free diagnostic does not qualify Verify, provider
+behavior, AWS parity or serving acceptance.

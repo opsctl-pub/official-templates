@@ -4,6 +4,7 @@
   "engine": "opentofu",
   "documentation": "README.md",
   "provision": {"input": "opsctl_server", "output": "opsctl_server", "saved_plan_outputs": null},
+  "ingress": {"procedure": "ingress.sh", "actions": ["creation"], "firewall_output": "security_group_id"},
   "provider_observation": {"inputs": {"region": ["server_metadata.region", "region"]}},
   "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.opsctl_server.name"], "creation_tags": ["native_variables.opsctl_server.tags"]}},
   "destroy_import": {

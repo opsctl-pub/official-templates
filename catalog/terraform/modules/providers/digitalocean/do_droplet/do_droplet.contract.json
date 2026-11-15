@@ -4,6 +4,7 @@
   "engine": "opentofu",
   "documentation": "README.md",
   "provision": {"input": "opsctl_server", "output": "opsctl_server", "saved_plan_outputs": ["droplet_id", "firewall_id", "name", "region", "size", "ipv4_address", "droplet_status", "opsctl_server"]},
+  "ingress": {"procedure": "ingress.sh", "actions": ["creation", "observe", "change"], "firewall_output": "firewall_id"},
   "provider_observation": {"inputs": {}},
   "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.opsctl_server.name"], "creation_tags": ["native_variables.opsctl_server.tags"]}},
   "destroy_import": {
