@@ -1,6 +1,17 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "item_id": "do_droplet",
   "engine": "opentofu",
-  "documentation": "README.md"
+  "documentation": "README.md",
+  "provider_observation": {"inputs": {}},
+  "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.name"], "creation_tags": ["native_variables.tags"]}},
+  "destroy_import": {
+    "primary_target": "droplet",
+    "targets": [
+      {"name": "droplet", "address": "digitalocean_droplet.this[0]", "required": true, "id_field": "provider_instance_id", "input_name": "droplet_id", "provisioned_only": false, "requires_primary_absence": false},
+      {"name": "firewall", "address": "digitalocean_firewall.destroy[0]", "required": true, "id_field": "server_metadata.firewall_id", "input_name": "firewall_id", "provisioned_only": true, "requires_primary_absence": true}
+    ],
+    "inputs": {},
+    "sensitive_variables": {}
+  }
 }

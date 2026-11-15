@@ -1,6 +1,17 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "item_id": "aws_instance",
   "engine": "opentofu",
-  "documentation": "README.md"
+  "documentation": "README.md",
+  "provider_observation": {"inputs": {"region": ["server_metadata.region", "region"]}},
+  "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.name"], "creation_tags": ["native_variables.tags"]}},
+  "destroy_import": {
+    "primary_target": "instance",
+    "targets": [
+      {"name": "instance", "address": "aws_instance.this[0]", "required": true, "id_field": "provider_instance_id", "input_name": "instance_id", "provisioned_only": false, "requires_primary_absence": false},
+      {"name": "security_group", "address": "aws_security_group.destroy[0]", "required": true, "id_field": "server_metadata.security_group_id", "input_name": "security_group_id", "provisioned_only": true, "requires_primary_absence": true}
+    ],
+    "inputs": {"region": ["server_metadata.region", "region"], "destroy_ami_id": ["server_metadata.ami_id"]},
+    "sensitive_variables": {}
+  }
 }

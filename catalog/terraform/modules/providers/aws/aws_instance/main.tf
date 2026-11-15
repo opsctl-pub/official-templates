@@ -120,7 +120,7 @@ resource "aws_instance" "server" {
 }
 
 resource "aws_instance" "this" {
-  count = var.destroy && !var.destroy_observe_only && contains(var.destroy_target_names, "instance") ? 1 : 0
+  count = var.destroy && contains(var.destroy_target_names, "instance") ? 1 : 0
 
   ami           = var.destroy_ami_id
   instance_type = "t3.micro"
@@ -145,7 +145,7 @@ resource "aws_instance" "this" {
 }
 
 resource "aws_security_group" "destroy" {
-  count = var.destroy && !var.destroy_observe_only && contains(var.destroy_target_names, "security_group") ? 1 : 0
+  count = var.destroy && contains(var.destroy_target_names, "security_group") ? 1 : 0
 
   name        = "opsctl-destroy-placeholder"
   description = "OpsControl destroy import placeholder"
@@ -158,42 +158,3 @@ resource "aws_security_group" "destroy" {
   }
 }
 
-locals {
-  destroy_target = var.destroy && var.destroy_observe_only ? one(var.destroy_target_names) : ""
-  destroy_ids    = { instance = var.instance_id, security_group = var.security_group_id }
-  destroy_id     = lookup(local.destroy_ids, local.destroy_target, "")
-}
-
-data "aws_instances" "destroy_target" {
-  count = var.destroy && var.destroy_observe_only && local.destroy_target == "instance" ? 1 : 0
-  instance_state_names = ["pending", "running", "stopping", "stopped", "shutting-down"]
-  filter {
-    name   = "instance-id"
-    values = [local.destroy_id]
-  }
-  lifecycle {
-    precondition {
-      condition     = can(regex("^i-[0-9a-f]+$", local.destroy_id))
-      error_message = "The selected instance requires an exact EC2 instance ID."
-    }
-  }
-}
-
-data "aws_security_groups" "destroy_target" {
-  count = var.destroy && var.destroy_observe_only && local.destroy_target == "security_group" ? 1 : 0
-  filter {
-    name   = "group-id"
-    values = [local.destroy_id]
-  }
-  lifecycle {
-    precondition {
-      condition     = can(regex("^sg-[0-9a-f]+$", local.destroy_id))
-      error_message = "The selected security group requires an exact security group ID."
-    }
-  }
-}
-
-locals {
-  observed_destroy_ids = (var.destroy && var.destroy_observe_only ?
-    (local.destroy_target == "instance" ? data.aws_instances.destroy_target[0].ids : data.aws_security_groups.destroy_target[0].ids) : [])
-}

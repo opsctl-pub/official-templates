@@ -188,15 +188,3 @@ variable "destroy_target_names" {
   }
 }
 
-variable "destroy_observe_only" {
-  description = "Read exact recorded target presence without managed resources"
-  type        = bool
-  default     = false
-}
-
-variable "destroy_api_token" {
-  description = "Delivered DigitalOcean token used only by the exact-ID HTTP observer"
-  type        = string
-  sensitive   = true
-  default     = ""
-}

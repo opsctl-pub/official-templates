@@ -121,8 +121,3 @@ variable "destroy_target_names" {
   }
 }
 
-variable "destroy_observe_only" {
-  description = "Read exact recorded target presence without managed resources"
-  type        = bool
-  default     = false
-}
