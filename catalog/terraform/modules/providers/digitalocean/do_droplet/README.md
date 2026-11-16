@@ -245,3 +245,45 @@ requires fresh exact after-state and unchanged preserved policy/authority/peers.
 The old Python firewall readers/writers are removed. This source has not run:
 the earlier credential-free diagnostic does not qualify Verify, provider
 behavior, AWS parity or serving acceptance.
+
+## Existing private network procedure
+
+`network` declares `network.sh` with read-only `domain`, `targets` and `creation`
+actions. No network resource is created, adopted or modified. AWS has no such
+capability. The request is one closed JSON object (32 KiB maximum):
+`format_version:1`, `action`, exact `network_id`, nullable `region`/`ipv4_cidr`,
+ordered `members` (native Droplet IDs, at most32) and `listeners` (at most128).
+A listener is `{from_id,to_id,protocol:"tcp",port}` with distinct selected
+members. Domain requests have null region/CIDR and empty members/listeners;
+targets require the approved region/CIDR. Creation selects exactly one allocated
+member and no listener. Credentials remain solely in `DIGITALOCEAN_TOKEN`.
+
+One15-second overall budget covers exact VPC, Droplet and attached-firewall GETs,
+with no retries or inventory fallback. Complete membership requires the same VPC,
+region and private IPv4 CIDR and one unique usable private host per member. The
+complete bounded firewall page must have matching total, no next page, unique
+firewalls, settled direct membership and no tag attachment. At most100 firewalls,
+100 inbound/outbound rules per firewall and100 peers per rule are admitted.
+Native allow rules normalize protocol/port ranges and canonical address/instance/
+tag/load-balancer/Kubernetes peers. Policies sort by canonical compact ASCII JSON;
+SHA256 of that exact policy JSON is the source-owned access fingerprint.
+
+Listener qualification requires permitted consumer egress and a directly attached
+producer firewall. Matching producer ingress may cover only the selected consumer
+instances or exact host/32 addresses of the approved consumers; public, broadened or foreign
+or unrepresentable access refuses. A safe policy lacking the consumer allowance
+returns that listener in `missing_listeners`, allowing normal imported-peer
+instructions. Missing egress, unsettled/incomplete/malformed/unauthorized reads
+are unknown, never missing-listener permission or observed workload reachability.
+
+Stdout is one bounded JSON result: `format_version`, original `action`/`network_id`,
+ordered UTC `collection_started_at`/`collection_completed_at`, `status`, nullable
+`reason`, explicit `profile` (`digitalocean/existing-vpc`), `region`, `ipv4_cidr`, ordered `members` (`id`, `host`,
+`access_fingerprint`) and `missing_listeners`. Complete exits0; unknown,
+unsupported and rejected exit1 with null domain and empty fact arrays. Raw
+responses/credentials never appear in the result. Creation reports membership
+only, without asserting listener access. Runner appends it as reserved auxiliary
+`provider_network` after successful ordinary/saved apply; original outputs,
+artifact and native success remain unchanged when membership is unavailable.
+Selected VPC data/preconditions qualify exact ID/region/CIDR before allocation;
+Destroy and simulation skip that data read. No VPC lifecycle ownership is implied.

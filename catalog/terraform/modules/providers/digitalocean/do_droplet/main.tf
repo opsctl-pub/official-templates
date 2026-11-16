@@ -30,6 +30,11 @@ data "digitalocean_ssh_keys" "existing" {
   }
 }
 
+data "digitalocean_vpc" "selected" {
+  count = !var.destroy && !local.creation.simulate && local.vpc_uuid != null ? 1 : 0
+  id    = local.vpc_uuid
+}
+
 # Create the droplet (only when not destroying)
 resource "digitalocean_droplet" "server" {
   count = var.destroy ? 0 : 1
@@ -57,6 +62,16 @@ resource "digitalocean_droplet" "server" {
   tags = local.creation.tags
 
   lifecycle {
+    precondition {
+      condition = var.destroy || local.creation.simulate || local.vpc_uuid == null ? true : try(
+        data.digitalocean_vpc.selected[0].id == local.vpc_uuid &&
+        data.digitalocean_vpc.selected[0].region == local.creation.region &&
+        alltrue([for network in local.networks :
+          network.ipv4_cidr == data.digitalocean_vpc.selected[0].ip_range
+        ]), false
+      )
+      error_message = "The selected existing VPC must retain its exact region and private CIDR."
+    }
     precondition {
       condition = !local.lookup_key ? true : try(
         length(data.digitalocean_ssh_keys.existing[0].ssh_keys) == 1 &&
