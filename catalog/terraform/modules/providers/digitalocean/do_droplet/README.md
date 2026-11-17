@@ -32,7 +32,8 @@ no disposable import/delete resources or flat creation-input aliases.
 
 `managed_state` declares the two addresses in this one module and `compute_present`
 (default true). Retirement first plans with compute absent while retaining the
-firewall and ignoring changes only to its Droplet attachments. After independent
+firewall. OpenTofu leaves its live name, rules and Droplet attachments unchanged
+after creation. After independent
 host absence and current ownership checks, a normal destroy removes the remaining
 firewall. This proposed ordering still requires pinned-provider and live proof;
 setting the input alone is not deletion authority. No resource targeting is used.
@@ -48,16 +49,13 @@ recreated. The saved plan binds this value; approved caller inputs stay unchange
 imports them at the same declared addresses; any planned provider mutation refuses.
 An absent host uses `compute_present=false`; unowned/shared protection is never
 selected. Adoption does not need creation inputs or management-key registration.
-Later signed ingress updates supply `opsctl_ingress` with exact `managed_rules`
-and `managed_private_rules`, independently of the original allocation inputs.
+Later rule updates use the declared ingress procedure.
 
 The declared policy procedure accepts `action:"validate_native_plan"`, `scope`,
 `variables` and the native JSON `plan` on stdin (16 MiB maximum). It uses no HTTP
 or credentials and returns only `{"allowed":true}` or a refusal. Runner separately
 bounds exact addresses, actions, identities and replacements. Creation checks the
-approved neutral input; ingress permits only the reviewed before/after rule delta,
-preserving other inbound rules, outbound rules and attachments or refusing before
-apply. Compute removal cannot change the firewall; remaining-state destruction
+approved neutral input. Compute removal cannot change the firewall. Remaining-state destruction
 requires no retained compute or foreign attachment. Overrides implement the same
 plain policy contract rather than a private attestation protocol.
 
@@ -153,24 +151,25 @@ read through a private header file, never a command-line argument.
 that Droplet's firewall attachments are read, with a 360-second total wait.
 Runner bounds creation invocation to 375 seconds; observation retains a
 60-second module budget and 75-second invocation ceiling.
-Complete means sole exact attachment, no tags, settled policy and exact expected
-inbound rules; unsupported/foreign ingress never becomes a false match.
+Complete requires the exact attachment, no tags, settled policy and the expected
+managed rules. Additional rules are preserved. Broader access on a private listener
+prevents a private-access match.
 `observe` supplies the union of current/requested managed rules. It reads once,
 returns the managed subset actually present and separately preserves all foreign
 policy. Waiting/failed attachment state is explicit in `settled`, not readiness.
 No name search or account-wide inventory is performed.
 
-The native plan's signed ingress intent adds `step`, `expected_before`, `expected_after`
+The signed `change` request adds `step`, `expected_before`, `expected_after`
 and `preserved_policy`. `step` is `{action:"add"|"remove",rule:<one public or
 private rule>}`. Each expected state is an exact object with `managed_rules`
 and `managed_private_rules` arrays, drawn only from the supplied union. Their
 only difference must be that single step. Both retain management SSH. Public
 TCP SSH changes, removal of TCP80/443, and private SSH/80/443 changes are refused.
 `preserved_policy` is the full object returned by observe, not a provider payload.
-Before the saved plan is applicable, exact before/after states, settled attachment
-and preserved policy must match. `ingress.sh` performs no firewall writes;
-only the approved native plan may change the same-state firewall. Separate
-readback can settle an uncertain result but never authorizes a repeated writer.
+The procedure qualifies the exact attachment and managed state, sends one targeted
+rule request when needed, and reads back the result. Unrelated live policy can
+change without blocking the command. Readback settles an uncertain response
+without resending the writer.
 
 Stdout is one object (256 KiB maximum): `format_version:1`, original `action`,
 `provider_instance_id`, `firewall_id`, UTC `collection_started_at` and
@@ -269,12 +268,12 @@ Desired exposure and peer bindings are never changed by Verify.
 The API creation-ingress recovery poll and DO/AWS creation reader are removed
 in this private source. Configuration uses the same declared procedure through
 the original Run's native children. Preview consumes qualified recorded Verify
-facts from the same captured source and refuses additions overlapping foreign
-ingress. Each approved remove-before-add step has one durable claim/native child;
+facts from the same captured source and checks for conflicting private access.
+Each approved remove-before-add step has one durable claim/native child;
 no-op uses one observe child. Unknown keeps the original claim pending. Only
 explicit replay can request read-only reconciliation after terminal/material
 closure; before/unsettled/unknown never authorizes a repeated write. Settlement
-requires fresh exact after-state and unchanged preserved policy/authority/peers.
+requires the fresh managed after-state and current authority and peers.
 The old Python firewall readers/writers are removed. This source has not run:
 the earlier credential-free diagnostic does not qualify Verify, provider
 behavior, AWS parity or serving acceptance.

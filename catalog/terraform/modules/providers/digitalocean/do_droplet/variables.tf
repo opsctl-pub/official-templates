@@ -50,15 +50,6 @@ variable "compute_present" {
   default     = true
 }
 
-variable "opsctl_ingress" {
-  description = "The approved intermediate policy for a native ingress update"
-  type = object({
-    managed_rules         = list(object({ protocol = string, port = number }))
-    managed_private_rules = list(object({ protocol = string, port = number, source_addresses = list(string) }))
-  })
-  default = null
-}
-
 variable "opsctl_adoption" {
   description = "Exact authorized existing identities for import-only state adoption"
   type = object({

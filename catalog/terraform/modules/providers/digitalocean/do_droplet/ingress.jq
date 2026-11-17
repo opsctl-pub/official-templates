@@ -198,10 +198,9 @@ def projection($r; $firewall; $page):
           require($rule.port_start == $rule.port_end and $raw.ports == ($rule.port_start | tostring))
           | [$private[] | select(managed_source($raw;.source_addresses[0]))] as $matches
           | require(($matches | length) == 1) | .private += [$matches[0] | private_key]
-        elif ($public | length) > 0 then
-          require($rule.port_start == $rule.port_end and $raw.ports == ($rule.port_start | tostring)
-            and managed_source($raw;"0.0.0.0/0"))
-          | .public += [[$rule.protocol,$rule.port_start]]
+        elif ($public | length) > 0 and $rule.port_start == $rule.port_end
+             and $raw.ports == ($rule.port_start | tostring) and managed_source($raw;"0.0.0.0/0") then
+          .public += [[$rule.protocol,$rule.port_start]]
         else .unrelated += [$rule] | .raw += [$raw] end)
   | require((.public | unique_rows) and (.private | unique_rows))
   | . as $classified
@@ -275,27 +274,6 @@ def native_plan:
           [$server.private_ingress_bindings[] | {protocol:.requested.protocol, port:.requested.port,
             source_addresses:[(.endpoint.host + "/32")]}]} as $desired
       | require(($firewall.inbound_rule | map(native_inbound) | canonical_sort) == ($desired | expected_inbound))
-    elif $scope.purpose == "ingress" then
-      ($scope.intent | request) as $r
-      | require($r.action == "change" and ($input.variables.compute_present // true) == true
-          and all($compute[]; .change.actions == ["no-op"]) and ($protection | length) == 1)
-      | $protection[0].change as $change
-      | require($change.actions == ["update"] or $change.actions == ["no-op"])
-      | require(($change.before | del(.inbound_rule,.status,.created_at,.pending_changes)) ==
-          ($change.after | del(.inbound_rule,.status,.created_at,.pending_changes)))
-      | require(($change.before.droplet_ids | map(tostring)) == [$r.provider_instance_id]
-          and ($change.before.tags // []) == [] and $change.before.id == $r.firewall_id
-          and $change.before.name == $r.preserved_policy.name
-          and $change.before.status == "succeeded" and ($change.before.pending_changes // []) == [])
-      | ($change.before.inbound_rule | map(native_inbound) | canonical_sort) as $before
-      | ($change.after.inbound_rule | map(native_inbound) | canonical_sort) as $after
-      | ($r.expected_before | expected_inbound) as $approved_before
-      | ($r.expected_after | expected_inbound) as $approved_after
-      | require(($approved_before - $before) == [] and ($approved_after - $after) == [])
-      | require(($before - $approved_before) == ($r.preserved_policy.unrelated_ingress | canonical_sort)
-          and ($change.before.outbound_rule | map(native_outbound) | canonical_sort)
-              == ($r.preserved_policy.outbound | canonical_sort))
-      | require(($before - $approved_before) == ($after - $approved_after))
     elif $scope.purpose == "retire_compute" then
       require($input.variables.compute_present == false and ($compute | length) == 1
           and $compute[0].change.actions == ["delete"]
@@ -308,7 +286,6 @@ def native_plan:
     elif $scope.purpose == "adopt" then
       require($server == null and $input.variables.opsctl_adoption == $scope.intent
           and $input.plan.variables.opsctl_adoption.value == $scope.intent
-          and $input.variables.opsctl_ingress == null
           and all($managed[]; .change.actions == ["no-op"]))
       | if $scope.intent.protection_id == null or $input.plan.variables.protection_present.value == false
         then require(($protection | length) == 0)
@@ -341,5 +318,13 @@ elif $mode == "observation" then observation($request[0]; $projection[0]; $diges
 elif $mode == "creation" then
   $projection[0].settled and $projection[0].public == ($request[0] | state | .public)
   and $projection[0].private == ($request[0] | state | .private)
-  and $projection[0].policy.unrelated_ingress == []
+elif $mode == "change_state" then
+  $request[0] as $r | $projection[0] as $p
+  | if ($p.settled | not) then "pending"
+    elif {public:$p.public,private:$p.private} == ($r.expected_after | state) then "after"
+    elif {public:$p.public,private:$p.private} == ($r.expected_before | state) then "before"
+    else "conflict" end
+elif $mode == "payload" then
+  $request[0].step.rule | {inbound_rules:[{protocol,ports:(.port | tostring),
+      sources:{addresses:(.source_addresses // ["0.0.0.0/0"])}}]}
 else error("mode") end

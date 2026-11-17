@@ -127,7 +127,7 @@ resource "digitalocean_droplet" "server" {
 }
 
 locals {
-  ingress = var.opsctl_ingress != null ? var.opsctl_ingress : {
+  ingress = {
     managed_rules = try(local.creation.public_ingress_rules, [])
     managed_private_rules = [for binding in try(local.creation.private_ingress_bindings, []) : {
       protocol         = binding.requested.protocol, port = binding.requested.port,
@@ -156,11 +156,11 @@ resource "digitalocean_firewall" "server" {
   tags        = local.adopting ? data.digitalocean_firewall.adopted[0].tags : []
 
   lifecycle {
-    ignore_changes = [droplet_ids]
+    ignore_changes = [droplet_ids, inbound_rule, outbound_rule, name]
   }
 
   dynamic "inbound_rule" {
-    for_each = local.adopting && var.opsctl_ingress == null ? data.digitalocean_firewall.adopted[0].inbound_rule : local.inbound
+    for_each = local.adopting ? data.digitalocean_firewall.adopted[0].inbound_rule : local.inbound
     content {
       protocol                  = inbound_rule.value.protocol
       port_range                = inbound_rule.value.port_range

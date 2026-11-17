@@ -86,7 +86,6 @@ else
     firewall=$(jq -r .firewall_id "$work/request")
     action=$(jq -r .action "$work/request")
 fi
-if [ "$action" = change ]; then finish rejected action_unsupported; fi
 if [ "$action" = creation ]; then deadline=$(( $(date +%s) + 360 )); fi
 if [ -z "${DIGITALOCEAN_TOKEN:-}" ] || \
     ! printf '%s' "$DIGITALOCEAN_TOKEN" | jq -Rse 'length > 0 and length <= 4096 and (explode | all(.[]; . >= 33 and . <= 126))' > /dev/null; then
@@ -97,15 +96,18 @@ unset DIGITALOCEAN_TOKEN
 
 http() {
     method=$1 path=$2 output=$3
-    [ "$method" = GET ] || return 1
     remaining=$(( deadline - $(date +%s) ))
     [ "$remaining" -gt 0 ] || return 1
     [ "$remaining" -le 12 ] || remaining=12
-    curl --disable --silent --proto '=https' --max-redirs 0 --retry 0 \
+    set -- --disable --silent --proto '=https' --max-redirs 0 --retry 0 \
         --connect-timeout 5 --max-time "$remaining" --max-filesize 262144 \
         --header "@$work/authorization" --header 'Accept: application/json' \
-        --output "$output" --write-out '%{http_code}' \
-        "https://api.digitalocean.com/v2/$path" > "$work/status" 2> "$work/error"
+        --output "$output" --write-out '%{http_code}'
+    if [ "$method" != GET ]; then
+        set -- "$@" --request "$method" --header 'Content-Type: application/json' \
+            --data-binary "@$work/payload"
+    fi
+    curl "$@" "https://api.digitalocean.com/v2/$path" > "$work/status" 2> "$work/error"
 }
 if [ "$native_prepare" = true ]; then
     http GET "firewalls/$firewall" "$work/firewall" || finish unknown read_unavailable
@@ -150,4 +152,21 @@ if [ "$action" = creation ]; then
     done
     finish complete ''
 fi
-finish rejected request_invalid
+state=$(q change_state -r 2> "$work/error") || finish rejected request_invalid
+[ "$state" != after ] || finish complete ''
+[ "$state" = before ] || finish rejected policy_conflict
+q payload -ce > "$work/payload" 2> "$work/error" || finish rejected request_invalid
+step=$(jq -r .step.action "$work/request")
+if [ "$step" = add ]; then method=POST; else method=DELETE; fi
+# Send once. A transport error or ambiguous response can only be resolved by readback.
+http "$method" "firewalls/$firewall/rules" "$work/write" || :
+case $(cat "$work/status") in
+    400|401|403|404|422) finish rejected provider_rejected ;;
+esac
+while wait_next; do
+    read_policy || finish unknown write_outcome_unknown
+    state=$(q change_state -r 2> "$work/error") || finish unknown write_outcome_unknown
+    [ "$state" != after ] || finish complete ''
+    case $state in before|pending) : ;; *) finish unknown write_outcome_unknown ;; esac
+done
+finish unknown write_outcome_unknown
