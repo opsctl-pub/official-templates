@@ -3,16 +3,25 @@
   "item_id": "do_droplet",
   "engine": "opentofu",
   "documentation": "README.md",
+  "managed_state": {
+    "compute_address": "digitalocean_droplet.server[0]",
+    "protection_address": "digitalocean_firewall.server[0]",
+    "compute_present_input": "compute_present",
+    "ingress_input": "opsctl_ingress",
+    "adoption_input": "opsctl_adoption",
+    "protection_present_input": "protection_present",
+    "plan_policy_procedure": "ingress.sh"
+  },
   "provision": {"input": "opsctl_server", "output": "opsctl_server", "saved_plan_outputs": ["droplet_id", "firewall_id", "name", "region", "size", "ipv4_address", "droplet_status", "opsctl_server"]},
-  "ingress": {"procedure": "ingress.sh", "actions": ["creation", "observe", "change"], "firewall_output": "firewall_id"},
+  "ingress": {"procedure": "ingress.sh", "actions": ["creation", "observe"], "firewall_output": "firewall_id"},
   "network": {"procedure": "network.sh", "actions": ["domain", "targets", "creation"]},
   "provider_observation": {"inputs": {}},
   "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.opsctl_server.name"], "creation_tags": ["native_variables.opsctl_server.tags"]}},
   "destroy_import": {
     "primary_target": "droplet",
     "targets": [
-      {"name": "droplet", "address": "digitalocean_droplet.this[0]", "required": true, "id_field": "provider_instance_id", "input_name": "droplet_id", "provisioned_only": false, "requires_primary_absence": false},
-      {"name": "firewall", "address": "digitalocean_firewall.destroy[0]", "required": true, "id_field": "server_metadata.firewall_id", "input_name": "firewall_id", "provisioned_only": true, "requires_primary_absence": true}
+      {"name": "droplet", "address": "digitalocean_droplet.server[0]", "required": true, "id_field": "provider_instance_id", "input_name": "droplet_id", "provisioned_only": false, "requires_primary_absence": false},
+      {"name": "firewall", "address": "digitalocean_firewall.server[0]", "required": true, "id_field": "server_metadata.firewall_id", "input_name": "firewall_id", "provisioned_only": true, "requires_primary_absence": true}
     ],
     "inputs": {},
     "sensitive_variables": {}

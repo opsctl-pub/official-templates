@@ -222,7 +222,115 @@ def observation($r; $p; $digest; $fingerprint; $observed):
       attached_instance_ids:[$r.provider_instance_id], fingerprint:$digest},
    observed_at:$observed, observation_complete:true};
 
-if $mode == "request" then $request[0] | request
+# Native policy runs without HTTP or credentials. Generic address/action and
+# identity bounds are enforced by Runner; attribute meaning stays in this module.
+def native_inbound:
+  require((.action // "allow") == "allow") |
+  {protocol, ports:(if .protocol == "icmp" and (.port_range // "") == "" then "0" else .port_range end), sources:{
+    addresses:(.source_addresses // []), droplet_ids:(.source_droplet_ids // [] | map(tonumber)),
+    tags:(.source_tags // []), load_balancer_uids:(.source_load_balancer_uids // []),
+    kubernetes_ids:(.source_kubernetes_ids // [])}} | policy_rule("sources");
+def native_outbound:
+  require((.action // "allow") == "allow") |
+  {protocol, ports:(if .protocol == "icmp" and (.port_range // "") == "" then "0" else .port_range end), destinations:{
+    addresses:(.destination_addresses // []), droplet_ids:(.destination_droplet_ids // [] | map(tonumber)),
+    tags:(.destination_tags // []), load_balancer_uids:(.destination_load_balancer_uids // []),
+    kubernetes_ids:(.destination_kubernetes_ids // [])}} | policy_rule("destinations");
+def expected_inbound:
+  [.managed_rules[] | {protocol, ports:(.port | tostring), sources:{addresses:["0.0.0.0/0"]}}]
+  + [.managed_private_rules[] | {protocol, ports:(.port | tostring), sources:{addresses:.source_addresses}}]
+  | map(policy_rule("sources")) | canonical_sort;
+def native_plan:
+  require(exact(["action", "scope", "variables", "plan"]))
+  | . as $input | .scope as $scope | .variables.opsctl_server as $server
+  | .plan.resource_changes as $changes
+  | require($changes | type == "array")
+  | require(.plan.variables.opsctl_server.value == $server)
+  | [$changes[] | select(.mode == "managed")] as $managed
+  | [$managed[] | select(.address == "digitalocean_droplet.server[0]")] as $compute
+  | [$managed[] | select(.address == "digitalocean_firewall.server[0]")] as $protection
+  | require(all($managed[]; .address == "digitalocean_droplet.server[0]"
+      or .address == "digitalocean_firewall.server[0]"))
+  | if $scope.purpose == "create" then
+      require(($input.variables.compute_present // true) == true
+          and .plan.variables.protection_present.value == true
+          and $server.simulate == false and ($compute | length) == 1 and ($protection | length) == 1)
+      | require(all($managed[]; .change.actions == ["create"]))
+      | $compute[0].change.after as $host | $protection[0].change.after as $firewall
+      | require($host.name == $server.name and $host.region == $server.region
+          and $host.size == $server.size and $host.image == $server.image
+          and ($host.tags | sort) == ($server.tags | sort)
+          and $host.monitoring == ($server.provider_config.do.enable_monitoring // false)
+          and $host.backups == ($server.provider_config.do.enable_backups // false)
+          and $host.ipv6 == ($server.provider_config.do.enable_ipv6 // false))
+      | require($server.ssh_key.registered_id != ""
+          and ($host.ssh_keys | map(tostring)) == [$server.ssh_key.registered_id])
+      | require(($server.networks | length) == 0 or
+          all($server.networks[]; .network_id == $host.vpc_uuid))
+      | require($firewall.name == ($server.name + "-fw") and ($firewall.tags // []) == [])
+      | require(($firewall.outbound_rule | map(native_outbound) | canonical_sort) ==
+          ([{protocol:"tcp",ports:"1-65535"}, {protocol:"udp",ports:"1-65535"}, {protocol:"icmp",ports:"0"}]
+            | map(. + {destinations:{addresses:["0.0.0.0/0", "::/0"]}} | policy_rule("destinations")) | canonical_sort))
+      | {managed_rules:$server.public_ingress_rules, managed_private_rules:
+          [$server.private_ingress_bindings[] | {protocol:.requested.protocol, port:.requested.port,
+            source_addresses:[(.endpoint.host + "/32")]}]} as $desired
+      | require(($firewall.inbound_rule | map(native_inbound) | canonical_sort) == ($desired | expected_inbound))
+    elif $scope.purpose == "ingress" then
+      ($scope.intent | request) as $r
+      | require($r.action == "change" and ($input.variables.compute_present // true) == true
+          and all($compute[]; .change.actions == ["no-op"]) and ($protection | length) == 1)
+      | $protection[0].change as $change
+      | require($change.actions == ["update"] or $change.actions == ["no-op"])
+      | require(($change.before | del(.inbound_rule,.status,.created_at,.pending_changes)) ==
+          ($change.after | del(.inbound_rule,.status,.created_at,.pending_changes)))
+      | require(($change.before.droplet_ids | map(tostring)) == [$r.provider_instance_id]
+          and ($change.before.tags // []) == [] and $change.before.id == $r.firewall_id
+          and $change.before.name == $r.preserved_policy.name
+          and $change.before.status == "succeeded" and ($change.before.pending_changes // []) == [])
+      | ($change.before.inbound_rule | map(native_inbound) | canonical_sort) as $before
+      | ($change.after.inbound_rule | map(native_inbound) | canonical_sort) as $after
+      | ($r.expected_before | expected_inbound) as $approved_before
+      | ($r.expected_after | expected_inbound) as $approved_after
+      | require(($approved_before - $before) == [] and ($approved_after - $after) == [])
+      | require(($before - $approved_before) == ($r.preserved_policy.unrelated_ingress | canonical_sort)
+          and ($change.before.outbound_rule | map(native_outbound) | canonical_sort)
+              == ($r.preserved_policy.outbound | canonical_sort))
+      | require(($before - $approved_before) == ($after - $approved_after))
+    elif $scope.purpose == "retire_compute" then
+      require($input.variables.compute_present == false and ($compute | length) == 1
+          and $compute[0].change.actions == ["delete"]
+          and all($protection[]; .change.actions == ["no-op"]))
+    elif $scope.purpose == "retire_remaining" then
+      require(($compute | length) == 0 and ($protection | length) <= 1
+          and all($protection[]; .change.actions == ["delete"]
+            and (.change.before.droplet_ids // [] | length) == 0
+            and (.change.before.tags // [] | length) == 0))
+    elif $scope.purpose == "adopt" then
+      require($server == null and $input.variables.opsctl_adoption == $scope.intent
+          and $input.plan.variables.opsctl_adoption.value == $scope.intent
+          and $input.variables.opsctl_ingress == null
+          and all($managed[]; .change.actions == ["no-op"]))
+      | if $scope.intent.protection_id == null or $input.plan.variables.protection_present.value == false
+        then require(($protection | length) == 0)
+        else require(($protection | length) == 1
+          and ($protection[0].change.after.droplet_ids | map(tostring)) ==
+              (if $input.plan.variables.compute_present.value then [$scope.intent.compute_id] else [] end)
+          and ($protection[0].change.after.tags // []) == []) end
+    else error("native purpose") end
+  | true;
+
+if $mode == "native_prepare" then
+  $request[0] | require(exact(["action", "scope", "variables"]))
+  | require(.action == "prepare_native_plan"
+      and (.scope.purpose == "retire_compute" or .scope.purpose == "retire_remaining" or .scope.purpose == "adopt")
+      and (.variables | has("protection_present") | not)
+      and (if .scope.purpose == "adopt" then .variables.opsctl_adoption == .scope.intent
+           else .variables.compute_present == false end))
+  | [.scope.resources[] | select(.address == "digitalocean_firewall.server[0]")]
+  | require(length == 1) | .[0].provider_id
+  | require(type == "string" and test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))
+elif $mode == "native_plan" then $request[0] | native_plan
+elif $mode == "request" then $request[0] | request
 elif $mode == "projection" then projection($request[0]; $firewall[0].firewall; $page[0])
 elif $mode == "policy" then $projection[0].policy | canonical
 elif $mode == "fingerprint" then
@@ -234,14 +342,4 @@ elif $mode == "creation" then
   $projection[0].settled and $projection[0].public == ($request[0] | state | .public)
   and $projection[0].private == ($request[0] | state | .private)
   and $projection[0].policy.unrelated_ingress == []
-elif $mode == "change_state" then
-  ($request[0]) as $r | $projection[0] as $p | $observation[0] as $o
-  | if $o.preserved_policy != $r.preserved_policy then "conflict"
-    elif ($p.settled | not) then "pending"
-    elif {public:$p.public,private:$p.private} == ($r.expected_after | state) then "after"
-    elif {public:$p.public,private:$p.private} == ($r.expected_before | state) then "before"
-    else "conflict" end
-elif $mode == "payload" then
-  $request[0].step.rule | {inbound_rules:[{protocol,ports:(.port | tostring),
-      sources:{addresses:(.source_addresses // ["0.0.0.0/0"])}}]}
 else error("mode") end

@@ -1,5 +1,5 @@
 variable "opsctl_server" {
-  description = "Sealed neutral Server creation input; null only for recorded Destroy"
+  description = "Sealed neutral creation input; null for adoption of an existing lifetime"
   type = object({
     name                     = string
     region                   = string
@@ -44,32 +44,32 @@ variable "opsctl_server" {
   }
 }
 
-variable "destroy" {
-  description = "Whether this is a recorded Destroy operation"
+variable "compute_present" {
+  description = "Keep protection while removing the compute resource from this same state"
   type        = bool
-  default     = false
+  default     = true
 }
 
-variable "droplet_id" {
-  description = "Exact recorded Droplet target"
-  type        = string
-  default     = ""
+variable "opsctl_ingress" {
+  description = "The approved intermediate policy for a native ingress update"
+  type = object({
+    managed_rules         = list(object({ protocol = string, port = number }))
+    managed_private_rules = list(object({ protocol = string, port = number, source_addresses = list(string) }))
+  })
+  default = null
 }
 
-variable "firewall_id" {
-  description = "Exact provision-owned firewall target"
-  type        = string
-  default     = ""
+variable "opsctl_adoption" {
+  description = "Exact authorized existing identities for import-only state adoption"
+  type = object({
+    compute_id    = string
+    protection_id = optional(string)
+  })
+  default = null
 }
 
-variable "destroy_target_names" {
-  description = "The single recorded target selected by the shared retirement executor"
-  type        = set(string)
-  default     = []
-  validation {
-    condition = !var.destroy || (length(var.destroy_target_names) == 1 && alltrue([
-      for name in var.destroy_target_names : contains(["droplet", "firewall"], name)
-    ]))
-    error_message = "Destroy requires exactly one declared target."
-  }
+variable "protection_present" {
+  description = "Source-derived exact protection presence; never recreate missing protection"
+  type        = bool
+  default     = true
 }

@@ -23,16 +23,50 @@ and requested TCP port; they cannot discover peers or change network ownership.
 Public rules use explicit TCP/UDP ports. `ssh_port` is an integer 1–65535; a
 nondefault port requires the declared Ubuntu profile and empty user data.
 
-Recorded Destroy keeps `destroy`, `destroy_target_names`, `droplet_id` and
-`firewall_id`; there are no flat creation-input aliases.
+Retirement reuses this module's existing state and `compute_present`; there are
+no disposable import/delete resources or flat creation-input aliases.
 
 ## Behavior
 
+### Persistent Server state (implementation in progress)
+
+`managed_state` declares the two addresses in this one module and `compute_present`
+(default true). Retirement first plans with compute absent while retaining the
+firewall and ignoring changes only to its Droplet attachments. After independent
+host absence and current ownership checks, a normal destroy removes the remaining
+firewall. This proposed ordering still requires pinned-provider and live proof;
+setting the input alone is not deletion authority. No resource targeting is used.
+
+For retirement and adoption, the same procedure accepts `action:"prepare_native_plan"`,
+`scope` and original `variables`. It reads only the exact owned firewall and returns
+`{"present":true|false}` (null/exit1 when unavailable). Runner derives the declared
+`protection_present` input inside that planning Job, so missing protection is not
+recreated. The saved plan binds this value; approved caller inputs stay unchanged.
+
+`opsctl_adoption` selects exact existing `compute_id` and nullable owned
+`protection_id` for import-only native planning. It reads their current values and
+imports them at the same declared addresses; any planned provider mutation refuses.
+An absent host uses `compute_present=false`; unowned/shared protection is never
+selected. Adoption does not need creation inputs or management-key registration.
+Later signed ingress updates supply `opsctl_ingress` with exact `managed_rules`
+and `managed_private_rules`, independently of the original allocation inputs.
+
+The declared policy procedure accepts `action:"validate_native_plan"`, `scope`,
+`variables` and the native JSON `plan` on stdin (16 MiB maximum). It uses no HTTP
+or credentials and returns only `{"allowed":true}` or a refusal. Runner separately
+bounds exact addresses, actions, identities and replacements. Creation checks the
+approved neutral input; ingress permits only the reviewed before/after rule delta,
+preserving other inbound rules, outbound rules and attachments or refusing before
+apply. Compute removal cannot change the firewall; remaining-state destruction
+requires no retained compute or foreign attachment. Overrides implement the same
+plain policy contract rather than a private attestation protocol.
+
 Create the requested Droplet, attach selected keys and declared firewall ingress.
 Outbound TCP/UDP/ICMP is allowed.
-Nondefault SSH uses the existing shared first-boot template. The caller imports
-recorded resources for the existing destroy path; this module does not search
-for deletion targets. It does not install Docker or establish management SSH trust/reachability.
+Nondefault SSH uses the existing shared first-boot template. An unbound selected
+resource is imported once before mutation; subsequent work uses the same state.
+The module does not search for deletion targets, install Docker or establish
+management SSH trust/reachability.
 
 ## Results
 
@@ -100,7 +134,7 @@ the original apply Job; it is not execution or serving acceptance. The procedure
 existing POSIX shell, curl, jq and sha256sum; no Python/provider SDK is used.
 
 Supply one finite JSON object on stdin (32 KiB maximum). The exact common fields
-are `format_version:1`, `action` (`creation`, `observe`, `change`),
+are `format_version:1`, `action` (`creation`, `observe`),
 `provider_instance_id` (decimal Droplet ID), `firewall_id` (recorded UUID),
 `region` (recorded slug), `ssh_port` (integer 1–65535), `managed_rules` and
 `managed_private_rules`. Region is sealed context, not a discovery selector.
@@ -108,7 +142,7 @@ Public rules are exact `{protocol:"tcp"|"udp",port:<integer>}`. Private rules
 are exact `{protocol:"tcp",port:<integer>,source_addresses:["<IPv4>/32"]}`;
 the backend must have authorized each exact peer. No credential or URL is input.
 Rules are unique. Creation and each expected before/after state have at most35
-public entries; configuration observe/change accepts their union of at most67.
+public entries; configuration observation accepts their union of at most67.
 Private unions contain at most64 entries. The SSH
 TCP rule is required; public/private scope for the same protocol/port conflicts.
 Private SSH/80/443 bindings are refused. Unknown fields/contradictory requests
@@ -117,7 +151,7 @@ read through a private header file, never a command-line argument.
 
 `creation` supplies the complete expected ingress. Only the exact firewall and
 that Droplet's firewall attachments are read, with a 360-second total wait.
-Runner bounds creation invocation to 375 seconds; observe/change retain a
+Runner bounds creation invocation to 375 seconds; observation retains a
 60-second module budget and 75-second invocation ceiling.
 Complete means sole exact attachment, no tags, settled policy and exact expected
 inbound rules; unsupported/foreign ingress never becomes a false match.
@@ -126,18 +160,17 @@ returns the managed subset actually present and separately preserves all foreign
 policy. Waiting/failed attachment state is explicit in `settled`, not readiness.
 No name search or account-wide inventory is performed.
 
-`change` adds exactly four fields: `step`, `expected_before`, `expected_after`
+The native plan's signed ingress intent adds `step`, `expected_before`, `expected_after`
 and `preserved_policy`. `step` is `{action:"add"|"remove",rule:<one public or
 private rule>}`. Each expected state is an exact object with `managed_rules`
 and `managed_private_rules` arrays, drawn only from the supplied union. Their
 only difference must be that single step. Both retain management SSH. Public
 TCP SSH changes, removal of TCP80/443, and private SSH/80/443 changes are refused.
 `preserved_policy` is the full object returned by observe, not a provider payload.
-Immediately before a write, exact before/after states, settled attachment and
-preserved policy must match. Already-after returns without a write. Otherwise
-only one POST/DELETE to the exact firewall's `/rules` endpoint is sent. There
-is no retry, whole-policy PUT, inverse action or rollback. Ambiguous write
-results permit bounded exact after-state readback only, otherwise unknown.
+Before the saved plan is applicable, exact before/after states, settled attachment
+and preserved policy must match. `ingress.sh` performs no firewall writes;
+only the approved native plan may change the same-state firewall. Separate
+readback can settle an uncertain result but never authorizes a repeated writer.
 
 Stdout is one object (256 KiB maximum): `format_version:1`, original `action`,
 `provider_instance_id`, `firewall_id`, UTC `collection_started_at` and
