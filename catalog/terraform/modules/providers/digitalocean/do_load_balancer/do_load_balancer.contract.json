@@ -1,0 +1,13 @@
+{
+  "format_version": 3,
+  "item_id": "do_load_balancer",
+  "engine": "opentofu",
+  "documentation": "One owned regional TCP load balancer with exact backend membership.",
+  "load_balancer": {
+    "address": "digitalocean_loadbalancer.managed",
+    "id_output": "load_balancer_id",
+    "endpoint_output": "load_balancer_ip",
+    "observe_procedure": "observe.sh",
+    "plan_policy_procedure": "plan-policy.sh"
+  }
+}
