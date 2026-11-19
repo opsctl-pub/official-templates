@@ -15,34 +15,11 @@ provider "digitalocean" {
 }
 
 locals {
-  adopting   = var.opsctl_adoption != null
   creation   = var.opsctl_server
   options    = try(local.creation.provider_config.do, {})
-  lookup_key = !var.compute_present || local.adopting ? false : (!local.creation.simulate && local.creation.ssh_key.registered_id == "")
+  lookup_key = var.compute_present && !local.creation.simulate && local.creation.ssh_key.registered_id == ""
   networks   = try(values(local.creation.networks), [])
   vpc_uuid   = length(local.networks) == 0 ? null : local.networks[0].network_id
-}
-
-data "digitalocean_droplet" "adopted" {
-  count = local.adopting && var.compute_present ? 1 : 0
-  id    = tonumber(var.opsctl_adoption.compute_id)
-}
-
-data "digitalocean_firewall" "adopted" {
-  count       = local.adopting && var.protection_present && try(var.opsctl_adoption.protection_id, null) != null ? 1 : 0
-  firewall_id = var.opsctl_adoption.protection_id
-}
-
-import {
-  for_each = local.adopting && var.compute_present ? { selected = var.opsctl_adoption.compute_id } : {}
-  to       = digitalocean_droplet.server[0]
-  id       = each.value
-}
-
-import {
-  for_each = local.adopting && var.protection_present && try(var.opsctl_adoption.protection_id, null) != null ? { selected = var.opsctl_adoption.protection_id } : {}
-  to       = digitalocean_firewall.server[0]
-  id       = each.value
 }
 
 data "digitalocean_ssh_keys" "existing" {
@@ -54,44 +31,44 @@ data "digitalocean_ssh_keys" "existing" {
 }
 
 data "digitalocean_vpc" "selected" {
-  count = !local.adopting && var.compute_present && !local.creation.simulate && local.vpc_uuid != null ? 1 : 0
+  count = var.compute_present && !local.creation.simulate && local.vpc_uuid != null ? 1 : 0
   id    = local.vpc_uuid
 }
 
 resource "digitalocean_droplet" "server" {
   count = var.compute_present ? 1 : 0
 
-  name   = local.adopting ? data.digitalocean_droplet.adopted[0].name : local.creation.name
-  region = local.adopting ? data.digitalocean_droplet.adopted[0].region : local.creation.region
-  size   = local.adopting ? data.digitalocean_droplet.adopted[0].size : local.creation.size
-  image  = local.adopting ? data.digitalocean_droplet.adopted[0].image : local.creation.image
+  name   = local.creation.name
+  region = local.creation.region
+  size   = local.creation.size
+  image  = local.creation.image
 
   # Enable monitoring and backups based on variables
-  monitoring = local.adopting ? data.digitalocean_droplet.adopted[0].monitoring : try(local.options.enable_monitoring, false)
-  backups    = local.adopting ? data.digitalocean_droplet.adopted[0].backups : try(local.options.enable_backups, false)
-  ipv6       = local.adopting ? data.digitalocean_droplet.adopted[0].ipv6 : try(local.options.enable_ipv6, false)
-  vpc_uuid   = local.adopting ? data.digitalocean_droplet.adopted[0].vpc_uuid : local.vpc_uuid
+  monitoring = try(local.options.enable_monitoring, false)
+  backups    = try(local.options.enable_backups, false)
+  ipv6       = try(local.options.enable_ipv6, false)
+  vpc_uuid   = local.vpc_uuid
 
   # Add SSH keys if provided
-  ssh_keys = local.adopting ? null : (local.creation.simulate ? [] : (local.lookup_key ? [one(data.digitalocean_ssh_keys.existing[0].ssh_keys).id] : [local.creation.ssh_key.registered_id]))
+  ssh_keys = local.creation.simulate ? [] : (local.lookup_key ? [one(data.digitalocean_ssh_keys.existing[0].ssh_keys).id] : [local.creation.ssh_key.registered_id])
 
   # User data for cloud-init (optional)
-  user_data = local.adopting ? null : (local.creation.ssh_port == 22 ? (local.creation.user_data != "" ? local.creation.user_data : null) : templatefile(
+  user_data = local.creation.ssh_port == 22 ? (local.creation.user_data != "" ? local.creation.user_data : null) : templatefile(
     "${path.module}/../../../ssh/cloud-init.yaml.tftpl", { ssh_port = local.creation.ssh_port }
-  ))
+  )
 
   # Tags
-  tags = local.adopting ? data.digitalocean_droplet.adopted[0].tags : local.creation.tags
+  tags = local.creation.tags
 
   lifecycle {
     precondition {
-      condition = local.adopting ? true : (local.creation.simulate || local.vpc_uuid == null ? true : try(
+      condition = local.creation.simulate || local.vpc_uuid == null ? true : try(
         data.digitalocean_vpc.selected[0].id == local.vpc_uuid &&
         data.digitalocean_vpc.selected[0].region == local.creation.region &&
         alltrue([for network in local.networks :
           network.ipv4_cidr == data.digitalocean_vpc.selected[0].ip_range
         ]), false
-      ))
+      )
       error_message = "The selected existing VPC must retain its exact region and private CIDR."
     }
     precondition {
@@ -113,14 +90,14 @@ resource "digitalocean_droplet" "server" {
     }
 
     precondition {
-      condition = local.adopting ? true : (local.creation.ssh_port == 22 || (
+      condition = local.creation.ssh_port == 22 || (
         local.creation.user_data == "" && contains(["ubuntu-22.04", "ubuntu-24.04"], local.creation.ssh_bootstrap_profile)
-      ))
+      )
       error_message = "Nondefault SSH requires a qualified image and no custom user_data."
     }
 
     precondition {
-      condition     = local.adopting ? true : (local.creation.name != "" && local.creation.region != "" && local.creation.size != "" && local.creation.image != "")
+      condition     = local.creation.name != "" && local.creation.region != "" && local.creation.size != "" && local.creation.image != ""
       error_message = "Creation requires name, region, size, and image."
     }
   }
@@ -149,18 +126,18 @@ locals {
 }
 
 resource "digitalocean_firewall" "server" {
-  count = !var.protection_present || (local.adopting && try(var.opsctl_adoption.protection_id, null) == null) ? 0 : 1
+  count = var.protection_present ? 1 : 0
 
-  name        = local.adopting ? data.digitalocean_firewall.adopted[0].name : "${local.creation.name}-fw"
-  droplet_ids = local.adopting ? data.digitalocean_firewall.adopted[0].droplet_ids : digitalocean_droplet.server[*].id
-  tags        = local.adopting ? data.digitalocean_firewall.adopted[0].tags : []
+  name        = "${local.creation.name}-fw"
+  droplet_ids = digitalocean_droplet.server[*].id
+  tags        = []
 
   lifecycle {
     ignore_changes = [droplet_ids, inbound_rule, outbound_rule, name]
   }
 
   dynamic "inbound_rule" {
-    for_each = local.adopting ? data.digitalocean_firewall.adopted[0].inbound_rule : local.inbound
+    for_each = local.inbound
     content {
       protocol                  = inbound_rule.value.protocol
       port_range                = inbound_rule.value.port_range
@@ -174,7 +151,7 @@ resource "digitalocean_firewall" "server" {
   }
 
   dynamic "outbound_rule" {
-    for_each = local.adopting ? data.digitalocean_firewall.adopted[0].outbound_rule : local.outbound
+    for_each = local.outbound
     content {
       protocol                       = outbound_rule.value.protocol
       port_range                     = outbound_rule.value.port_range

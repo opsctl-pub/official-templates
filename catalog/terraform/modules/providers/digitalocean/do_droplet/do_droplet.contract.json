@@ -7,7 +7,6 @@
     "compute_address": "digitalocean_droplet.server[0]",
     "protection_address": "digitalocean_firewall.server[0]",
     "compute_present_input": "compute_present",
-    "adoption_input": "opsctl_adoption",
     "protection_present_input": "protection_present",
     "plan_policy_procedure": "ingress.sh"
   },

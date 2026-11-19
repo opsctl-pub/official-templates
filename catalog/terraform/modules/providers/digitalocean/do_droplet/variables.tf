@@ -1,5 +1,5 @@
 variable "opsctl_server" {
-  description = "Sealed neutral creation input; null for adoption of an existing lifetime"
+  description = "Sealed neutral Server input retained for the resource lifetime"
   type = object({
     name                     = string
     region                   = string
@@ -22,10 +22,10 @@ variable "opsctl_server" {
     })
     simulate = bool
   })
-  default = null
+  nullable = false
 
   validation {
-    condition = var.opsctl_server == null ? true : (
+    condition = (
       var.opsctl_server.ssh_port >= 1 && var.opsctl_server.ssh_port <= 65535 &&
       floor(var.opsctl_server.ssh_port) == var.opsctl_server.ssh_port &&
       length(var.opsctl_server.tags) <= 128 &&
@@ -48,15 +48,6 @@ variable "compute_present" {
   description = "Keep protection while removing the compute resource from this same state"
   type        = bool
   default     = true
-}
-
-variable "opsctl_adoption" {
-  description = "Exact authorized existing identities for import-only state adoption"
-  type = object({
-    compute_id    = string
-    protection_id = optional(string)
-  })
-  default = null
 }
 
 variable "protection_present" {

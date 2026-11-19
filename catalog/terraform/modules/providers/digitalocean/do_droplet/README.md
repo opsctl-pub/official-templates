@@ -38,18 +38,13 @@ host absence and current ownership checks, a normal destroy removes the remainin
 firewall. This proposed ordering still requires pinned-provider and live proof;
 setting the input alone is not deletion authority. No resource targeting is used.
 
-For retirement and adoption, the same procedure accepts `action:"prepare_native_plan"`,
+For retirement, the same procedure accepts `action:"prepare_native_plan"`,
 `scope` and original `variables`. It reads only the exact owned firewall and returns
 `{"present":true|false}` (null/exit1 when unavailable). Runner derives the declared
 `protection_present` input inside that planning Job, so missing protection is not
 recreated. The saved plan binds this value; approved caller inputs stay unchanged.
 
-`opsctl_adoption` selects exact existing `compute_id` and nullable owned
-`protection_id` for import-only native planning. It reads their current values and
-imports them at the same declared addresses; any planned provider mutation refuses.
-An absent host uses `compute_present=false`; unowned/shared protection is never
-selected. Adoption does not need creation inputs or management-key registration.
-Later rule updates use the declared ingress procedure.
+Rule updates use the declared ingress procedure.
 
 The declared policy procedure accepts `action:"validate_native_plan"`, `scope`,
 `variables` and the native JSON `plan` on stdin (16 MiB maximum). It uses no HTTP
@@ -61,8 +56,7 @@ plain policy contract rather than a private attestation protocol.
 
 Create the requested Droplet, attach selected keys and declared firewall ingress.
 Outbound TCP/UDP/ICMP is allowed.
-Nondefault SSH uses the existing shared first-boot template. An unbound selected
-resource is imported once before mutation; subsequent work uses the same state.
+Nondefault SSH uses the existing shared first-boot template.
 The module does not search for deletion targets, install Docker or establish
 management SSH trust/reachability.
 
@@ -111,7 +105,7 @@ and private IPv4/IPv6, size and status. Each Firewall uses the singular exact-ID
 lookup: its successful known-null ID means absent, while a matching nonnull ID
 means present. Firewall Server attributes are unsupported. Errors, incomplete
 plans and mismatched identities never prove absence; no REST fallback exists.
-The shared Destroy executor uses this root before import and after apply.
+The shared retirement executor uses this root to confirm absence after apply.
 
 The [shared formatter](../../../opsctl/observation/main.tf) alone turns raw
 native facts into coverage envelopes. The complete captured source package keeps
@@ -119,7 +113,7 @@ that local dependency at the same revision and relative path in each private
 state. The Runner requires exact captured `input_names`/`inputs` (finite JSON,
 32 KiB total), independently of provider variable types. Destroy captures these
 under `observation`; no old observation-input fallback is supported. One
-execution-private `TF_PLUGIN_CACHE_DIR` is reused by reads and import/delete
+execution-private `TF_PLUGIN_CACHE_DIR` is reused by reads and retirement
 plans and removed at closure. Its first cold fetch remains a cost; no persistent
 cache or zero-network initialization is promised.
 

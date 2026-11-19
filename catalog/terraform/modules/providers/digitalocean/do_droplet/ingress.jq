@@ -283,26 +283,15 @@ def native_plan:
           and all($protection[]; .change.actions == ["delete"]
             and (.change.before.droplet_ids // [] | length) == 0
             and (.change.before.tags // [] | length) == 0))
-    elif $scope.purpose == "adopt" then
-      require($server == null and $input.variables.opsctl_adoption == $scope.intent
-          and $input.plan.variables.opsctl_adoption.value == $scope.intent
-          and all($managed[]; .change.actions == ["no-op"]))
-      | if $scope.intent.protection_id == null or $input.plan.variables.protection_present.value == false
-        then require(($protection | length) == 0)
-        else require(($protection | length) == 1
-          and ($protection[0].change.after.droplet_ids | map(tostring)) ==
-              (if $input.plan.variables.compute_present.value then [$scope.intent.compute_id] else [] end)
-          and ($protection[0].change.after.tags // []) == []) end
     else error("native purpose") end
   | true;
 
 if $mode == "native_prepare" then
   $request[0] | require(exact(["action", "scope", "variables"]))
   | require(.action == "prepare_native_plan"
-      and (.scope.purpose == "retire_compute" or .scope.purpose == "retire_remaining" or .scope.purpose == "adopt")
+      and (.scope.purpose == "retire_compute" or .scope.purpose == "retire_remaining")
       and (.variables | has("protection_present") | not)
-      and (if .scope.purpose == "adopt" then .variables.opsctl_adoption == .scope.intent
-           else .variables.compute_present == false end))
+      and .variables.compute_present == false)
   | [.scope.resources[] | select(.address == "digitalocean_firewall.server[0]")]
   | require(length == 1) | .[0].provider_id
   | require(type == "string" and test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))
