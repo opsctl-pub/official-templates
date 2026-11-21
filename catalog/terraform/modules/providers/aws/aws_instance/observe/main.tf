@@ -15,10 +15,11 @@ provider "aws" {
 locals {
   instance_targets = { for index, target in var.targets : tostring(index) => target.id if target.name == "instance" }
   group_targets    = { for index, target in var.targets : tostring(index) => target.id if target.name == "security_group" }
+  volume_targets   = { for index, target in var.targets : tostring(index) => target.id if target.name == "volume" }
 }
 
 data "aws_instances" "selected" {
-  for_each = local.instance_targets
+  for_each             = local.instance_targets
   instance_state_names = ["pending", "running", "stopping", "stopped", "shutting-down"]
   filter {
     name   = "instance-id"
@@ -34,6 +35,14 @@ data "aws_security_groups" "selected" {
   }
 }
 
+data "aws_ebs_volumes" "selected" {
+  for_each = local.volume_targets
+  filter {
+    name   = "volume-id"
+    values = [each.value]
+  }
+}
+
 data "aws_instance" "selected" {
   for_each = { for ordinal, id in local.instance_targets : ordinal => id
     if length(data.aws_instances.selected[ordinal].ids) == 1 && contains(data.aws_instances.selected[ordinal].ids, id)
@@ -43,7 +52,7 @@ data "aws_instance" "selected" {
 
 locals {
   status = {
-    pending = "provisioning", running = "active", stopped = "stopped"
+    pending       = "provisioning", running = "active", stopped = "stopped"
     shutting-down = "destroying", terminated = "terminated"
   }
   instance_presence = { for ordinal, id in local.instance_targets : ordinal => (
@@ -69,18 +78,29 @@ locals {
     reason   = local.instance_presence[ordinal] == "unknown" ? "identity_conflict" : null
   }, try(local.instance_facts[ordinal], {})) }
   group_observations = { for ordinal, id in local.group_targets : ordinal => {
-    id       = id
-    presence = local.group_presence[ordinal]
-    reason   = local.group_presence[ordinal] == "unknown" ? "identity_conflict" : null
+    id          = id
+    presence    = local.group_presence[ordinal]
+    reason      = local.group_presence[ordinal] == "unknown" ? "identity_conflict" : null
+    unsupported = ["lifecycle", "size", "public_ips", "private_ips"]
+  } }
+  volume_presence = { for ordinal, id in local.volume_targets : ordinal => (
+    length(data.aws_ebs_volumes.selected[ordinal].ids) == 0 ? "absent" :
+    length(data.aws_ebs_volumes.selected[ordinal].ids) == 1 && contains(data.aws_ebs_volumes.selected[ordinal].ids, id)
+    ? "present" : "unknown"
+  ) }
+  volume_observations = { for ordinal, id in local.volume_targets : ordinal => {
+    id          = id
+    presence    = local.volume_presence[ordinal]
+    reason      = local.volume_presence[ordinal] == "unknown" ? "identity_conflict" : null
     unsupported = ["lifecycle", "size", "public_ips", "private_ips"]
   } }
 }
 
 module "observation" {
   source       = "../../../../opsctl/observation"
-  observations = merge(local.instance_observations, local.group_observations)
+  observations = merge(local.instance_observations, local.group_observations, local.volume_observations)
   creation_observation = local.creation_enabled ? {
-    presence      = local.creation_complete ? (length(local.creation_rows) == 0 ? "absent" : "present") : "unknown"
+    presence      = local.creation_complete ? (local.creation_empty ? "absent" : "present") : "unknown"
     basis         = "name"
     provider_name = var.creation_name
     region        = var.creation_region
@@ -100,11 +120,41 @@ data "aws_instances" "creation" {
   }
 }
 
+data "aws_security_groups" "creation" {
+  count = local.creation_enabled ? 1 : 0
+  dynamic "filter" {
+    for_each = local.creation_tags
+    content {
+      name   = "tag:${filter.key}"
+      values = [filter.value]
+    }
+  }
+}
+
+data "aws_ebs_volumes" "creation" {
+  count = local.creation_enabled ? 1 : 0
+  dynamic "filter" {
+    for_each = local.creation_tags
+    content {
+      name   = "tag:${filter.key}"
+      values = [filter.value]
+    }
+  }
+}
+
 locals {
   creation_enabled = var.creation_recovery && length(var.targets) == 0
   creation_tags = local.creation_enabled ? merge(
     { for tag in var.creation_tags : tag => "true" }, { Name = var.creation_name }
   ) : {}
-  creation_rows     = local.creation_enabled ? data.aws_instances.creation[0].ids : []
-  creation_complete = alltrue([for id in local.creation_rows : can(regex("^i-[0-9a-f]+$", id))])
+  creation_inventories = local.creation_enabled ? {
+    i   = tolist(data.aws_instances.creation[0].ids)
+    sg  = tolist(data.aws_security_groups.creation[0].ids)
+    vol = tolist(data.aws_ebs_volumes.creation[0].ids)
+  } : {}
+  creation_empty = alltrue([for ids in local.creation_inventories : length(ids) == 0])
+  creation_complete = alltrue([
+    for prefix, ids in local.creation_inventories : length(distinct(ids)) == length(ids) &&
+    alltrue([for id in ids : can(regex("^${prefix}-([0-9a-f]{8}|[0-9a-f]{17})$", id))])
+  ])
 }

@@ -1,28 +1,31 @@
 provider "aws" {
-  region = var.destroy ? var.region : var.opsctl_server.region
+  region = var.opsctl_server.region
+}
+
+data "aws_caller_identity" "allocation" {
+  count = var.compute_present ? 1 : 0
 }
 
 locals {
   creation            = var.opsctl_server
-  resource_name       = var.destroy ? "opsctl-instance" : local.creation.name
+  resource_name       = local.creation.name
   image_ssm_parameter = try(local.creation.image_metadata.ssm_parameter, "")
+  image_id            = try(nonsensitive(data.aws_ssm_parameter.selected_image[0].value), "")
   default_subnet_id   = try(sort(data.aws_subnets.default[0].ids)[0], "")
-  create_key_pair     = var.destroy ? false : (!local.creation.simulate && local.creation.ssh_key.registered_name == "" && local.creation.ssh_key.public_key != "")
-  created_key_name    = "${local.resource_name}-key"
-  instance_key_name   = var.destroy ? null : (local.create_key_pair ? aws_key_pair.this[0].key_name : (local.creation.ssh_key.registered_name != "" ? local.creation.ssh_key.registered_name : null))
+  instance_key_name   = local.creation.simulate ? null : local.creation.ssh_key.registered_name
   aws_tags = merge(
-    { for tag in (var.destroy ? ["terraform", "opsctl"] : local.creation.tags) : tag => "true" },
+    { for tag in local.creation.tags : tag => "true" },
     { Name = local.resource_name }
   )
 }
 
 data "aws_vpc" "default" {
-  count   = var.destroy ? 0 : 1
+  count   = var.compute_present ? 1 : 0
   default = true
 }
 
 data "aws_subnets" "default" {
-  count = var.destroy ? 0 : 1
+  count = var.compute_present ? 1 : 0
 
   filter {
     name   = "vpc-id"
@@ -36,25 +39,41 @@ data "aws_subnets" "default" {
 }
 
 data "aws_ssm_parameter" "selected_image" {
-  count = !var.destroy && local.image_ssm_parameter != "" ? 1 : 0
+  count = var.compute_present && local.image_ssm_parameter != "" ? 1 : 0
   name  = local.image_ssm_parameter
 }
 
-resource "aws_key_pair" "this" {
-  count = local.create_key_pair ? 1 : 0
+data "aws_ami" "selected" {
+  count = var.compute_present && can(regex("^ami-([0-9a-f]{8}|[0-9a-f]{17})$", local.image_id)) ? 1 : 0
 
-  key_name   = local.created_key_name
-  public_key = local.creation.ssh_key.public_key
-  tags       = local.aws_tags
+  filter {
+    name   = "image-id"
+    values = [local.image_id]
+  }
+
+  timeouts {
+    read = "30s"
+  }
+}
+
+locals {
+  image = try(data.aws_ami.selected[0], null)
+  image_ebs_devices = try([
+    for mapping in local.image.block_device_mappings : mapping.device_name if try(length(mapping.ebs), 0) != 0
+  ], [])
 }
 
 resource "aws_security_group" "this" {
-  count = var.destroy ? 0 : 1
+  count = 1
 
   name        = "${local.resource_name}-sg"
   description = "OpsControl managed instance access"
-  vpc_id      = data.aws_vpc.default[0].id
+  vpc_id      = try(data.aws_vpc.default[0].id, null)
   tags        = local.aws_tags
+
+  lifecycle {
+    ignore_changes = all
+  }
 
   dynamic "ingress" {
     for_each = local.creation.public_ingress_rules
@@ -77,9 +96,9 @@ resource "aws_security_group" "this" {
 }
 
 resource "aws_instance" "server" {
-  count = var.destroy ? 0 : 1
+  count = var.compute_present ? 1 : 0
 
-  ami                         = try(nonsensitive(data.aws_ssm_parameter.selected_image[0].value), "")
+  ami                         = local.image_id
   instance_type               = local.creation.size
   subnet_id                   = local.default_subnet_id
   associate_public_ip_address = true
@@ -88,7 +107,8 @@ resource "aws_instance" "server" {
   user_data = local.creation.ssh_port == 22 ? (trimspace(local.creation.user_data) != "" ? local.creation.user_data : null) : templatefile(
     "${path.module}/../../../ssh/cloud-init.yaml.tftpl", { ssh_port = local.creation.ssh_port }
   )
-  tags = local.aws_tags
+  tags        = local.aws_tags
+  volume_tags = local.aws_tags
 
   root_block_device {
     volume_type           = "gp3"
@@ -110,7 +130,23 @@ resource "aws_instance" "server" {
         && trimspace(local.creation.size) != ""
         && local.image_ssm_parameter != ""
       )
-      error_message = "name, region, instance_type, and image_ssm_parameter are required when destroy=false."
+      error_message = "name, region, instance_type, and image_ssm_parameter are required for creation."
+    }
+
+    precondition {
+      condition = try(
+        local.image.id == local.image_id
+        && local.image.root_device_type == "ebs"
+        && local.image.root_device_name != ""
+        && local.image_ebs_devices == [local.image.root_device_name],
+        false
+      )
+      error_message = "The exact SSM-selected AMI must declare one EBS mapping for its root device."
+    }
+
+    precondition {
+      condition     = local.creation.simulate || local.instance_key_name != ""
+      error_message = "Creation requires the organization SSH key registered in this region."
     }
 
     precondition {
@@ -119,43 +155,3 @@ resource "aws_instance" "server" {
     }
   }
 }
-
-resource "aws_instance" "this" {
-  count = var.destroy && contains(var.destroy_target_names, "instance") ? 1 : 0
-
-  ami           = var.destroy_ami_id
-  instance_type = "t3.micro"
-  tags          = local.aws_tags
-
-  lifecycle {
-    precondition {
-      condition     = trimspace(var.instance_id) != ""
-      error_message = "instance_id is required when destroy=true."
-    }
-
-    precondition {
-      condition     = trimspace(var.region) != ""
-      error_message = "region is required when destroy=true."
-    }
-
-    precondition {
-      condition     = trimspace(var.destroy_ami_id) != ""
-      error_message = "destroy_ami_id is required when destroy=true."
-    }
-  }
-}
-
-resource "aws_security_group" "destroy" {
-  count = var.destroy && contains(var.destroy_target_names, "security_group") ? 1 : 0
-
-  name        = "opsctl-destroy-placeholder"
-  description = "OpsControl destroy import placeholder"
-
-  lifecycle {
-    precondition {
-      condition     = trimspace(var.security_group_id) != ""
-      error_message = "The selected security group target requires security_group_id."
-    }
-  }
-}
-
