@@ -1,0 +1,422 @@
+---
+# Input: admitted issuer_request plus Runner-owned private attempt and file projection.
+# Result: private certificate and TLS key or fixed failure status; no output frame.
+- name: Issue a generated hostname certificate inside the Runner
+  hosts: localhost
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require the Runner's local inventory
+      ansible.builtin.assert:
+        that:
+          - groups['all'] | default([]) == ['localhost']
+          - ansible_play_hosts_all == ['localhost']
+          - inventory_hostname == 'localhost'
+          - ansible_host | default('localhost') == 'localhost'
+          - ansible_connection | default('') == 'local'
+          - not (ansible_become | default(false) | bool)
+        quiet: true
+        fail_msg: other
+
+    - name: Issue once using a prequalified native account
+      no_log: true
+      diff: false
+      register: issuer_attempt
+      failed_when: false
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -I
+          - -c
+          - |
+            from contextlib import ExitStack
+            from ipaddress import IPv6Address
+            import json
+            import os
+            from pathlib import Path
+            import re
+            from selectors import DefaultSelector, EVENT_READ
+            import stat
+            import subprocess
+            import sys
+            from time import monotonic
+            from urllib.parse import urlsplit
+
+            FILES = Path("/var/run/opsctl/file-secret")
+            ACCOUNT_LIMIT = 64 * 1024
+            LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            DNS_NAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
+            ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+            RATE_LIMITED = 20
+            DNS_CHALLENGE_FAILED = 21
+            ACCOUNT_UNAUTHORIZED = 22
+            TIMEOUT = 23
+            OTHER = 24
+            ACCOUNT_REGISTERED_UNEXPECTEDLY = 25
+            TAIL_LIMIT = 16 * 1024
+            CLIENT_TIMEOUT = 600
+            ACME_PROBLEM = re.compile(
+                r"acme: error: [0-9]{1,3}(?: :: [A-Z]+ :: [^\s]+)?"
+                r" :: urn:ietf:params:acme:error:([A-Za-z]+) :: "
+            )
+            CHALLENGE_FAILURE = re.compile(
+                rf"resolver: one or more domains had a problem: \[({DNS_NAME.pattern}): "
+            )
+
+
+            def require(condition):
+                if not condition:
+                    raise ValueError("Invalid generated issuer input or result")
+
+
+            def unique_members(pairs):
+                # Go's account decoder also matches field names case-insensitively.
+                seen = set()
+                fields = {}
+                for name, value in pairs:
+                    folded = name.casefold()
+                    require(folded not in seen)
+                    seen.add(folded)
+                    fields[name] = value
+                return fields
+
+
+            def dns_name(value):
+                return (
+                    isinstance(value, str)
+                    and len(value) <= 253
+                    and DNS_NAME.fullmatch(value) is not None
+                )
+
+
+            def https_url(value):
+                require(isinstance(value, str) and re.fullmatch(r"[\x21-\x7e]{1,2048}", value))
+                require(value.startswith("https://") and not any(c in value for c in "?#\\"))
+                parsed = urlsplit(value)
+                host = parsed.hostname
+                require(host is not None and parsed.username is None and parsed.password is None)
+                port = parsed.port
+                port_suffix = r"(?::[0-9]{1,5})?"
+                if parsed.netloc.startswith("["):
+                    require(re.fullmatch(r"\[[0-9a-fA-F:.]+\]" + port_suffix, parsed.netloc))
+                    IPv6Address(host)
+                else:
+                    require(re.fullmatch(r"[a-zA-Z0-9.-]+" + port_suffix, parsed.netloc))
+                    require(dns_name(host.removesuffix(".")))
+                require(port is None or 1 <= port <= 65535)
+                return parsed, (host, 443 if port is None else port)
+
+
+            def private_dir(path):
+                info = path.lstat()
+                require(
+                    stat.S_ISDIR(info.st_mode)
+                    and stat.S_IMODE(info.st_mode) == 0o700
+                    and info.st_uid == os.geteuid()
+                )
+
+
+            def fresh_attempt():
+                raw = os.environ.get("OPSCTL_GENERATED_DNS01_ATTEMPT_DIR", "")
+                path = Path(raw)
+                root = Path("/tmp")
+                require(
+                    os.geteuid() != 0 and str(path) == raw and path.is_absolute()
+                    and path != root and path.is_relative_to(root)
+                    and path.resolve(strict=True) == path
+                )
+                private_dir(path)
+                require(next(path.iterdir(), None) is None)
+                return path
+
+
+            def open_projected(stack, name, limit):
+                # Kubernetes projects files through symlinks. Check the open file.
+                fd = os.open(FILES / name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                stream = stack.enter_context(os.fdopen(fd, "rb"))
+                info = os.fstat(stream.fileno())
+                require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= limit)
+                return stream
+
+
+            def read_account(account_id, directory_url, ca_origin):
+                with ExitStack() as stack:
+                    metadata_file = open_projected(stack, "acme-account.json", ACCOUNT_LIMIT)
+                    key_file = open_projected(stack, "acme-account.key", ACCOUNT_LIMIT)
+                    open_projected(stack, "broker-password", 512)
+                    metadata = metadata_file.read(ACCOUNT_LIMIT + 1)
+                    key = key_file.read(ACCOUNT_LIMIT + 1)
+                require(0 < len(metadata) <= ACCOUNT_LIMIT and 0 < len(key) <= ACCOUNT_LIMIT)
+                account = json.loads(metadata.decode("utf-8"), object_pairs_hook=unique_members)
+                require(isinstance(account, dict))
+                # An absent or incomplete native account can lead lego run to register.
+                require(account.get("id") == account_id and account.get("server") == directory_url)
+                for field in ("email", "keyType"):
+                    value = account.get(field)
+                    require(isinstance(value, str) and value.strip())
+                registration = account.get("registration")
+                require(isinstance(registration, dict) and registration.get("status") == "valid")
+                _, registered_origin = https_url(registration.get("accountURL"))
+                require(registered_origin == ca_origin)
+                return metadata, key
+
+
+            def materialize(attempt, namespace, account_id, metadata, key):
+                account_dir = attempt
+                for component in ("accounts", namespace, account_id):
+                    account_dir /= component
+                    account_dir.mkdir(mode=0o700)
+                for name, payload in (("account.json", metadata), (account_id + ".key", key)):
+                    with (account_dir / name).open("xb") as stream:
+                        stream.write(payload)
+
+
+            def require_exact_children(path, names):
+                private_dir(path)
+                remaining = set(names)
+                with os.scandir(path) as children:
+                    for child in children:
+                        require(child.name in remaining)
+                        remaining.remove(child.name)
+                require(not remaining)
+
+
+            def require_unchanged_account(attempt, namespace, account_id, metadata, key):
+                require(attempt.resolve(strict=True) == attempt)
+                private_dir(attempt)
+                accounts = attempt / "accounts"
+                require_exact_children(accounts, (namespace,))
+                namespace_dir = accounts / namespace
+                require_exact_children(namespace_dir, (account_id,))
+                account_dir = namespace_dir / account_id
+                files = {"account.json": metadata, account_id + ".key": key}
+                require_exact_children(account_dir, files)
+                for name, expected in files.items():
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                    with os.fdopen(os.open(account_dir / name, flags), "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        require(
+                            stat.S_ISREG(info.st_mode)
+                            and info.st_uid == os.geteuid()
+                            and stat.S_IMODE(info.st_mode) == 0o600
+                            and info.st_nlink == 1
+                            and info.st_size == len(expected)
+                        )
+                        require(stream.read(len(expected) + 1) == expected)
+
+
+            def stamp(info):
+                return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink,
+                        info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+            def open_private_dir(stack, name, *, parent=None):
+                descriptor = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent,
+                )
+                stack.callback(os.close, descriptor)
+                info = os.fstat(descriptor)
+                require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
+                return descriptor
+
+
+            def read_private_result(directory, name, limit):
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                with os.fdopen(os.open(name, flags, dir_fd=directory), "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    require(
+                        stat.S_ISREG(before.st_mode)
+                        and before.st_uid == os.geteuid()
+                        and stat.S_IMODE(before.st_mode) == 0o600
+                        and before.st_nlink == 1
+                        and 0 < before.st_size <= limit
+                    )
+                    content = stream.read(limit + 1)
+                    require(len(content) == before.st_size and stamp(before)
+                            == stamp(os.fstat(stream.fileno()))
+                            == stamp(os.stat(name, dir_fd=directory, follow_symlinks=False)))
+                return content
+
+
+            def export_result(attempt):
+                with ExitStack() as stack:
+                    root = open_private_dir(stack, attempt)
+                    workspace = open_private_dir(stack, "lego", parent=root)
+                    native = open_private_dir(stack, "certificates", parent=workspace)
+                    before = stamp(os.fstat(native))
+                    pair = (
+                        ("generated-hostname.crt", read_private_result(native, "generated-hostname.crt", 256 * 1024)),
+                        ("generated-hostname.key", read_private_result(native, "generated-hostname.key", 64 * 1024)),
+                    )
+                    require(before == stamp(os.fstat(native))
+                            == stamp(os.stat("certificates", dir_fd=workspace, follow_symlinks=False)))
+                    require(stamp(os.fstat(workspace)) == stamp(os.stat("lego", dir_fd=root, follow_symlinks=False)))
+                    os.mkdir("certificates", mode=0o700, dir_fd=root)
+                    output = open_private_dir(stack, "certificates", parent=root)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                    for name, content in pair:
+                        with os.fdopen(os.open(name, flags, 0o600, dir_fd=output), "wb") as stream:
+                            require(stream.write(content) == len(content))
+
+
+            def native_failure(tail, hosts):
+                # Only the final JSON fatal record and pinned error prefixes are signals.
+                if not tail.endswith(b"\n"):
+                    return OTHER
+                start = tail.rfind(b"\n", 0, len(tail) - 1) + 1
+                try:
+                    record = json.loads(tail[start:])
+                except ValueError:
+                    return OTHER
+                if not isinstance(record, dict) or record.get("level") != "ERROR":
+                    return OTHER
+                error = record.get("error")
+                prefix = "obtain certificate: "
+                if record.get("msg") != "Error" or not isinstance(error, str):
+                    return OTHER
+                if not error.startswith(prefix):
+                    return OTHER
+                error = error[len(prefix):]
+                challenge = CHALLENGE_FAILURE.match(error)
+                if challenge:
+                    if challenge[1] not in hosts:
+                        return OTHER
+                    error = error[challenge.end():]
+                    if error.startswith((
+                        "dns01: error presenting token (", "dns01: time limit exceeded",
+                    )):
+                        return DNS_CHALLENGE_FAILED
+                    for context in (
+                        "invalid challenge: ", "invalid authorization: ",
+                        "failed to initiate the challenge: ",
+                    ):
+                        if error.startswith(context):
+                            error = error[len(context):]
+                            break
+                problem = ACME_PROBLEM.match(error)
+                if not problem:
+                    return OTHER
+                if problem[1] == "rateLimited":
+                    return RATE_LIMITED
+                if problem[1] == "accountDoesNotExist":
+                    return ACCOUNT_UNAUTHORIZED
+                if problem[1] == "dns" or (challenge and problem[1] == "unauthorized"):
+                    return DNS_CHALLENGE_FAILED
+                return OTHER
+
+
+            def run_client(args, attempt, broker_url, hosts):
+                tail = bytearray()
+                deadline = monotonic() + CLIENT_TIMEOUT
+                with subprocess.Popen(
+                    args, cwd=attempt,
+                    env={
+                        "HOME": str(attempt),
+                        "HTTPREQ_ENDPOINT": broker_url,
+                        "HTTPREQ_USERNAME": "opsctl",
+                        "HTTPREQ_PASSWORD_FILE": str(FILES / "broker-password"),
+                    },
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                ) as client:
+                    try:
+                        with DefaultSelector() as selector:
+                            selector.register(client.stdout, EVENT_READ)
+                            while True:
+                                remaining = deadline - monotonic()
+                                if remaining <= 0 or not selector.select(remaining):
+                                    return TIMEOUT
+                                chunk = os.read(client.stdout.fileno(), 4096)
+                                if not chunk:
+                                    break
+                                overflow = len(tail) + len(chunk) - TAIL_LIMIT
+                                if overflow > 0:
+                                    del tail[:overflow]
+                                tail.extend(chunk)
+                        remaining = deadline - monotonic()
+                        if remaining <= 0:
+                            return TIMEOUT
+                        rc = client.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        return TIMEOUT
+                    finally:
+                        if client.poll() is None:
+                            client.kill()
+                            client.wait()
+                if rc == 0:
+                    return 0
+                return native_failure(tail, hosts)
+
+
+            def issue():
+                request = json.load(sys.stdin, object_pairs_hook=unique_members)
+                require(isinstance(request, dict) and request.keys() == {
+                    "acme_directory_url", "broker_url", "account_id", "route_hosts",
+                })
+                directory, ca_origin = https_url(request["acme_directory_url"])
+                broker, _ = https_url(request["broker_url"])
+                require(broker.path == "/api/v1/dns-challenge")
+                account_id = request["account_id"]
+                require(isinstance(account_id, str) and ACCOUNT_ID.fullmatch(account_id))
+                hosts = request["route_hosts"]
+                require(isinstance(hosts, list) and 1 <= len(hosts) <= 100)
+                require(all(dns_name(host) for host in hosts) and hosts == sorted(set(hosts)))
+
+                attempt = fresh_attempt()
+                metadata, key = read_account(account_id, request["acme_directory_url"], ca_origin)
+                # lego v5.5.2 sanitizeHost uses the URL host, including its explicit port.
+                namespace = directory.netloc.translate(str.maketrans(":/\\", "___"))
+                os.umask(0o077)
+                workspace = attempt / "lego"
+                workspace.mkdir(mode=0o700)
+                materialize(workspace, namespace, account_id, metadata, key)
+
+                args = [
+                    "/usr/local/bin/lego", "--log.format", "json", "run",
+                    "--server", request["acme_directory_url"],
+                    "--account-id", account_id,
+                    "--path", str(workspace),
+                    "--cert.name", "generated-hostname",
+                    "--dns", "httpreq",
+                ]
+                for host in hosts:
+                    args.extend(("--domains", host))
+                rc = run_client(args, workspace, request["broker_url"], hosts)
+                try:
+                    require_unchanged_account(workspace, namespace, account_id, metadata, key)
+                except (OSError, ValueError, RuntimeError):
+                    rc = ACCOUNT_REGISTERED_UNEXPECTEDLY
+                if rc != 0:
+                    require(rc in {RATE_LIMITED, DNS_CHALLENGE_FAILED, ACCOUNT_UNAUTHORIZED,
+                                   TIMEOUT, OTHER, ACCOUNT_REGISTERED_UNEXPECTEDLY})
+                    require(attempt.resolve(strict=True) == attempt)
+                    private_dir(attempt)
+                    descriptor = os.open(
+                        attempt / "diagnostic.status",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                    )
+                    with os.fdopen(descriptor, "wb") as status:
+                        status.write(str(rc).encode("ascii"))
+                    return rc
+                export_result(attempt)
+                return 0
+
+
+            try:
+                result = issue()
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                result = OTHER
+            sys.exit(result)
+        stdin: "{{ issuer_request | default(none) | to_json }}"
+        stdin_add_newline: false
+        expand_argument_vars: false
+
+    - name: Report the bounded issuer failure
+      ansible.builtin.fail:
+        msg: >-
+          {{ {20: 'rate_limited', 21: 'dns_challenge_failed', 22: 'account_unauthorized',
+              23: 'timeout', 24: 'other', 25: 'account_registered_unexpectedly'}
+             .get(issuer_attempt.rc, 'other')
+             if issuer_attempt is defined and issuer_attempt.rc is integer else 'other' }}
+      when: issuer_attempt is not defined or issuer_attempt.rc is not integer or issuer_attempt.rc != 0

@@ -39,6 +39,15 @@
           - route_hosts == route_hosts | unique | sort
           - not (simulate | default(false))
 
+    - name: Require an installed deployment observation for subject renewal units
+      ansible.builtin.assert:
+        that:
+          - certificate_subject.type == 'deployment'
+          - certificate_probe_hosts is sameas false
+          - not (certificate_selection_only | default(false))
+          - not (certificate_allow_uninstalled_gateway | default(false))
+      when: certificate_read_subject_units | default(false)
+
     - name: Resolve template-owned native subject references
       ansible.builtin.set_fact:
         certificate_subject_key: "{{ certificate_subject.type }}-{{ certificate_subject.id }}"
@@ -89,6 +98,7 @@
           --port {{ certificate_probe_port | default(443) }}
           {{ '--selection-only' if certificate_selection_only | default(false) else '' }}
           {{ '--uninstalled-gateway' if certificate_uninstalled_gateway else '' }}
+          {{ '--subject-units' if certificate_read_subject_units | default(false) else '' }}
           --dynamic-root {{ traefik_dynamic_dir | default('/etc/traefik/dynamic/opsctl') | quote }}
           --acme-root {{ traefik_acme_dir | default('/var/lib/traefik') | quote }}
           --state-root {{ traefik_acme_state_dir | default('/var/lib/opsctl/automatic-certificates') | quote }}
@@ -113,6 +123,13 @@
             default(none if certificate_native_observation.rc == 0 else
               {'phase': 'probe', 'code': 'certificate_serving_unverified'}) }}
       when: not (certificate_selection_only | default(false))
+
+    - name: Retain qualified subject renewal unit facts
+      ansible.builtin.set_fact:
+        certificate_subject_unit_facts: "{{ (certificate_native_observation.stdout | from_json).certificate_subject_units }}"
+      when:
+        - certificate_read_subject_units | default(false)
+        - certificate_procedure_error is none
 
     - name: Require the exact selection-only snapshot shape
       ansible.builtin.assert:
