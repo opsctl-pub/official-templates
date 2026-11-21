@@ -5,10 +5,12 @@ variable "targets" {
   validation {
     condition = (length(var.targets) >= 1 || var.creation_recovery) && length(var.targets) <= 16 && (
       length(distinct([for target in var.targets : jsonencode([target.name, target.id])])) == length(var.targets)
-    ) && alltrue([
-      for target in var.targets : contains(["instance", "security_group"], target.name) && (
-        target.name == "instance" ? can(regex("^i-[0-9a-f]+$", target.id)) : can(regex("^sg-[0-9a-f]+$", target.id))
-      )
+      ) && alltrue([
+        for target in var.targets : can(regex(lookup({
+          instance       = "^i-[0-9a-f]+$"
+          security_group = "^sg-[0-9a-f]+$"
+          volume         = "^vol-[0-9a-f]+$"
+        }, target.name, null), target.id))
     ])
     error_message = "Observation requires declared targets and exact IDs."
   }

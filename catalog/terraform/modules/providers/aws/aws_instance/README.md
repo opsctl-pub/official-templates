@@ -1,10 +1,9 @@
 # Manage an AWS instance
 
-The creation root uses the recorded region and native AWS credentials. It
-creates the requested instance, declared security-group ingress and optional
-key pair, preserving the existing SSM image selection and SSH bootstrap.
-`destroy_target_names` selects one recorded `instance` or `security_group` for
-import and saved deletion; neither target is discovered by name.
+The managed root uses the recorded region and native AWS credentials. Saved
+creation creates the instance and its security group using the registered
+organization key. Saved retirement removes compute before the security group.
+Both phases use the original state and recorded identities.
 
 ## Creation input and result
 
@@ -13,16 +12,16 @@ Creation accepts one `opsctl_server` object: `name`, `region`, `size`, `image`,
 `ssh_bootstrap_profile`, `public_ingress_rules`, `networks`,
 `private_ingress_bindings`, `ssh_key` and `simulate`. The fixed public object
 contains no credentials or private key. Native AWS credentials stay in their
-execution environment. AWS saved planning is not declared.
+execution environment.
 
 The module maps size to instance type, reads the captured
 `image_metadata.ssm_parameter` through native SSM, and converts platform tags
-to native tag keys with `Name` set to the actual requested name. Ordinary
+to native tag keys with `Name` set to the actual requested name. The instance,
+security group and root volume receive those same tags at launch. A bounded
+exact AMI read qualifies an EBS root with no additional EBS mapping. Ordinary
 creation uses `ssh_key.registered_name`; the public key and fingerprint do not
 grant registration authority. Simulation skips key registration. Initial SSH
 uses the declared port/Ubuntu profile and existing shared cloud-init template.
-Recorded Destroy retains its original region, instance/security-group/AMI IDs
-and target names; flat creation aliases are absent.
 
 The plain `opsctl_server` version-1 result contains the allocated identity,
 hostname, region, size, canonical status, nullable public/private IPv4, tags,
@@ -30,12 +29,49 @@ hostname, region, size, canonical status, nullable public/private IPv4, tags,
 other native states map honestly, including explicit unknown. An unready
 allocation remains a failed, charged Server without changing this raw result.
 Raw instance/security-group/AMI outputs remain available to existing callers.
+`root_volume_id` comes from the actual native instance root block. Retirement
+uses that exact ID independently of launch tags.
 Native readiness does not attest managed ingress or SSH setup.
+
+## Saved retirement
+
+The compute plan may delete only the recorded instance. Its security group and
+rules stay in place until exact instance absence is confirmed. The plan must
+show the recorded root volume with deletion on termination and no additional
+EBS volume set to delete on termination. The module corroborates those facts
+with one exact `DescribeInstances` read during plan and another immediately
+before saved apply. Unknown, incomplete or conflicting attachments refuse.
+AWS termination has no attachment revision precondition, so the fresh read
+narrows the interval in which an external change could invalidate the check.
+
+The remaining plan may delete only the recorded security group. The saved apply
+uses the declared procedure for one exact group deletion and confirms absence
+before settling native state with a saved refresh-only plan. The procedure
+leaves dependencies in place. An explicit AWS dependency refusal leaves the
+group for fresh review. An uncertain delete keeps the original retirement held.
+Final settlement requires independent absence of the instance, security group
+and root volume. The volume never receives its own mutation permission. A
+present or unqualified volume holds retirement open.
+
+## Leased certification
+
+The private certification procedure qualifies the sealed proof Name and birth
+tags across complete instance, security-group and volume inventories. It can
+report an owned root volume after the instance disappears. The backend records
+the exact IDs before admitting fallback. Cleanup can terminate only their
+exact instance, delete only their exact security group, and delete the recorded
+root volume only when AWS reports it available and unattached. The procedure
+does not detach, revoke, or retry an uncertain delete. A separate exact read
+confirms absence before the certification records cleanup.
+
+The original failed-create observer uses the sealed Name and tags for all three
+inventories. Any surviving matching group or volume prevents release of the
+failed apply's retained material and capacity through that observer.
 
 ## Read-only observation
 
 The independent [observe/](observe/main.tf) root requires an ordered `targets`
-list of `{name, id}` objects (`instance`, `security_group`) and a nonempty
+list of `{name, id}` objects (`instance`, `security_group`, `volume`) and a nonempty
 `region`. It uses hashicorp/aws ~> 5.0, OpenTofu >= 1.13.2 and native AWS credential
 delivery. No secret is a module input; no managed resource/import/apply belongs
 to this root.
@@ -50,6 +86,12 @@ other statuses remain unqualified. Terminated instances excluded by the inventor
 filter are absent from that live selection. Security-group Server attributes
 are unsupported; errors or identity conflicts never imply absence.
 
+EBS volumes use one exact `volume-id` filter per recorded `vol-…` ID through
+`aws_ebs_volumes`. One matching result establishes presence. A successful
+empty result establishes absence. A different or extra ID yields unknown
+with `identity_conflict`. Lifecycle, size and addresses are unsupported
+for present volumes. Volume observation cannot grant deletion authority.
+
 Pairs must be unique; repeated names with different IDs support batched Servers.
 `opsctl_provider_observations` is keyed by exactly the string request ordinals
 `"0"` through `"N-1"`. The Runner joins by ordinal and ID, preserving the original
@@ -59,12 +101,12 @@ the requested `id`, `presence`, `reason`, nullable `provider_observed_at`, and
 `coverage`/`value`/`reason`. Empty complete IP lists mean observed empty inventory.
 No creation timestamp is presented as an observation clock. The Runner adds UTC
 collection clocks and emits the versioned `provider_observations` result. Reads
-are dated facts, not current health or universal provider-parity claims. Destroy
-uses this same read before import and after apply; failed reads never grant it
-a deletion/absence result. Native AWS behavior remains unqualified until tested.
+are dated facts, not current health or universal provider-parity claims.
+Retirement uses this read for its ordered absence gates. Failed reads never
+establish absence.
 
 The v3 item contract declares `region` from the recorded Server metadata/region
-selectors; it retains the existing Destroy inputs and import declarations.
+selectors and declares the exact retirement targets.
 The [shared formatter](../../../opsctl/observation/main.tf) alone constructs
 coverage envelopes from raw native facts. Exact full-package materialization
 preserves this local dependency's revision and relative path. The Runner
@@ -72,7 +114,7 @@ requires exactly the captured `input_names`/`inputs`, with finite JSON bounded
 to 32 KiB; HCL owns provider input types. Destroy captures the same declaration
 under `observation`, without a region-specific Python path or compatibility
 fallback. One execution-private `TF_PLUGIN_CACHE_DIR` serves observation and
-import/delete states and is removed at closure. Cold fetches remain a cost;
+the native state steps and is removed at closure. Cold fetches remain a cost;
 there is no persistent/shared cache or zero-network initialization claim.
 
 ## Declared creation ingress procedure (source only)

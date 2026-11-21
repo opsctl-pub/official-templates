@@ -3,17 +3,99 @@
   "item_id": "aws_instance",
   "engine": "opentofu",
   "documentation": "README.md",
-  "provision": {"input": "opsctl_server", "output": "opsctl_server", "saved_plan_outputs": null},
-  "ingress": {"procedure": "ingress.sh", "actions": ["creation"], "firewall_output": "security_group_id"},
-  "provider_observation": {"inputs": {"region": ["server_metadata.region", "region"]}},
-  "creation_recovery": {"inputs": {"creation_region": ["region"], "creation_name": ["native_variables.opsctl_server.name"], "creation_tags": ["native_variables.opsctl_server.tags"]}},
+  "provision": {
+    "input": "opsctl_server",
+    "output": "opsctl_server",
+    "private_outputs": ["aws_account_id"],
+    "saved_plan_outputs": [
+      "instance_id",
+      "security_group_id",
+      "root_volume_id",
+      "instance_name",
+      "region",
+      "instance_type",
+      "ipv4_address",
+      "instance_state",
+      "ami_id",
+      "aws_account_id",
+      "opsctl_server"
+    ]
+  },
+  "ingress": {
+    "procedure": "ingress.sh",
+    "actions": [
+      "creation"
+    ],
+    "firewall_output": "security_group_id"
+  },
+  "provider_observation": {
+    "allocation_scope": "creation",
+    "allocation_scope_inputs": {
+      "account_id": "outputs.aws_account_id",
+      "region": "opsctl_server.region"
+    },
+    "inputs": {
+      "region": [
+        "server_metadata.region",
+        "region"
+      ]
+    }
+  },
+  "creation_recovery": {
+    "inputs": {
+      "creation_region": [
+        "region"
+      ],
+      "creation_name": [
+        "native_variables.opsctl_server.name"
+      ],
+      "creation_tags": [
+        "native_variables.opsctl_server.tags"
+      ]
+    }
+  },
   "destroy_import": {
     "primary_target": "instance",
     "targets": [
-      {"name": "instance", "address": "aws_instance.this[0]", "required": true, "id_field": "provider_instance_id", "input_name": "instance_id", "provisioned_only": false, "requires_primary_absence": false},
-      {"name": "security_group", "address": "aws_security_group.destroy[0]", "required": true, "id_field": "server_metadata.security_group_id", "input_name": "security_group_id", "provisioned_only": true, "requires_primary_absence": true}
+      {
+        "name": "instance",
+        "address": "aws_instance.server[0]",
+        "required": true,
+        "id_field": "provider_instance_id",
+        "input_name": "instance_id",
+        "provisioned_only": false,
+        "requires_primary_absence": false
+      },
+      {
+        "name": "security_group",
+        "address": "aws_security_group.this[0]",
+        "required": true,
+        "id_field": "server_metadata.security_group_id",
+        "input_name": "security_group_id",
+        "provisioned_only": true,
+        "requires_primary_absence": true
+      },
+      {
+        "name": "volume",
+        "address": "aws_instance.server[0].root_block_device[0]",
+        "required": true,
+        "id_field": "server_metadata.root_volume_id",
+        "input_name": "root_volume_id",
+        "provisioned_only": true,
+        "requires_primary_absence": true,
+        "observation_only": true
+      }
     ],
-    "inputs": {"region": ["server_metadata.region", "region"], "destroy_ami_id": ["server_metadata.ami_id"]},
+    "inputs": {},
     "sensitive_variables": {}
+  },
+  "certification_procedure": "certification.sh",
+  "managed_state": {
+    "compute_address": "aws_instance.server[0]",
+    "protection_address": "aws_security_group.this[0]",
+    "compute_present_input": "compute_present",
+    "plan_policy_procedure": "ingress.sh",
+    "apply_policy_procedure": "ingress.sh",
+    "retire_remaining_procedure": "ingress.sh"
   }
 }
