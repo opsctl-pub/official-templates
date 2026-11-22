@@ -24,8 +24,11 @@
   "ingress": {
     "procedure": "ingress.sh",
     "actions": [
-      "creation"
+      "creation",
+      "observe",
+      "change"
     ],
+    "require_before_fingerprint": true,
     "firewall_output": "security_group_id"
   },
   "provider_observation": {
