@@ -54,6 +54,10 @@
               - compose_unexpected_containers | length == 0
               - compose_observed_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
 
+        - name: Qualify failed first-install membership before freezing removal targets
+          ansible.builtin.include_tasks: ../../tasks/compose_failed_first_install.yml
+          when: compose_failed_first_install is defined
+
         - name: Freeze only fully inspected current owned workload identities
           ansible.builtin.set_fact:
             compose_removal_targets: "{{ compose_observed_instances | map(attribute='instance.id') | list }}"
@@ -68,6 +72,10 @@
               - compose_observation_complete
               - compose_unexpected_containers | length == 0
               - compose_observed_networks | selectattr('origin', 'equalto', 'unknown') | list | length == 0
+
+        - name: Requalify failed first-install membership before removal effects
+          ansible.builtin.include_tasks: ../../tasks/compose_failed_first_install.yml
+          when: compose_failed_first_install is defined
 
         - name: Require created network identity and no foreign users before deletion effects
           ansible.builtin.assert:
@@ -131,10 +139,22 @@
             loop_var: recorded_container_id
             label: recorded instance
           register: compose_container_removals
+          when: compose_failed_first_install is not defined
+
+        - name: Remove only stopped failed-install IDs without force or volume removal
+          ansible.builtin.command:
+            argv: [docker, container, rm, --, "{{ recorded_container_id }}"]
+          loop: "{{ compose_removal_targets }}"
+          loop_control:
+            loop_var: recorded_container_id
+            label: recorded stopped instance
+          register: compose_stopped_removals
+          changed_when: compose_stopped_removals.rc == 0
+          when: compose_failed_first_install is defined
 
         - name: Preserve actual workload-removal effects
           ansible.builtin.set_fact:
-            compose_changed: "{{ compose_container_removals.changed }}"
+            compose_changed: "{{ compose_container_removals.changed or compose_stopped_removals.changed }}"
 
         - name: Reobserve exact workloads and retained data
           ansible.builtin.include_tasks: ../../tasks/compose_observe.yml
@@ -289,6 +309,7 @@
             compose_failure_reason: "{{ compose_reason }}"
             compose_changed: >-
               {{ compose_changed or compose_container_removals.changed | default(false) or
+                compose_stopped_removals.changed | default(false) or
                 compose_network_removals.changed | default(false) or compose_volume_removals.changed | default(false) }}
 
         - name: Reobserve partial removal effects without expanding admitted membership

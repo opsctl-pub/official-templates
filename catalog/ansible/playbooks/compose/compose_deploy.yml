@@ -135,6 +135,10 @@
               - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
               - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
 
+        - name: Qualify failed first-install membership before file delivery
+          ansible.builtin.include_tasks: ../../tasks/compose_failed_first_install.yml
+          when: compose_failed_first_install is defined
+
         - name: Select file-delivery failure
           ansible.builtin.set_fact:
             compose_phase: compose:files
@@ -651,6 +655,10 @@
               - compose_observation_complete
               - compose_unexpected_containers | map(attribute='id') | difference(compose_known_containers | default([])) | length == 0
               - compose_project_info.containers | map(attribute='Id') | difference(compose_known_containers | default([])) | length == 0
+
+        - name: Requalify failed first-install membership before native effects
+          ansible.builtin.include_tasks: ../../tasks/compose_failed_first_install.yml
+          when: compose_failed_first_install is defined
 
         - name: Require explicit native volume data choices
           when: compose_empty_volume_keys is defined or compose_reuse_volumes is defined
