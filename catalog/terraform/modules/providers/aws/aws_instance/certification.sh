@@ -24,9 +24,19 @@ failed() {
     reason=$1
     result "$2"
 }
-# $1 resource kind, $2 collect status: 2 is an EC2 invocation failure, anything else an unqualified response.
+# $1 resource kind, $2 collect status: 2 is an unclassified EC2 read failure, 3-8 a classified one,
+# anything else an unqualified response.
 read_failure() {
-    if [ "$2" -eq 2 ]; then reason=${1}_read_failed; else reason=${1}_response_unqualified; fi
+    case "$2" in
+        2) reason=${1}_read_failed ;;
+        3) reason=read_timed_out ;;
+        4) reason=read_endpoint_unreachable ;;
+        5) reason=read_throttled ;;
+        6) reason=read_access_denied ;;
+        7) reason=read_authentication_failed ;;
+        8) reason=read_service_unavailable ;;
+        *) reason=${1}_response_unqualified ;;
+    esac
 }
 
 q() {
@@ -60,6 +70,39 @@ ec2() {
         --cli-connect-timeout 4 --cli-read-timeout "$remaining" ec2 "$@")
 }
 
+# Reads only: standard retries within the remaining action deadline, each attempt keeping the socket bounds.
+ec2_read() {
+    remaining=$((deadline - $(date +%s)))
+    [ "$remaining" -gt 0 ] || return 1
+    socket=$remaining
+    [ "$socket" -le 10 ] || socket=10
+    (ulimit -f 512; AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=3 timeout "$remaining" aws --region "$region" \
+        --no-paginate --output json --cli-error-format json --cli-connect-timeout 4 --cli-read-timeout "$socket" \
+        ec2 "$@")
+}
+
+# $1 read wrapper status. Exits collect with the read failure class from the deadline, the fixed client error
+# prefix of the CLI's single plain-text line, or the structured error Code; nothing from stderr is emitted.
+read_error() {
+    [ "$1" -ne 124 ] && [ "$(date +%s)" -lt "$deadline" ] || exit 3
+    if [ "$1" -eq 255 ] && [ "$(awk 'END { print NR }' "$work/error")" -eq 2 ] && [ -z "$(head -n 1 "$work/error")" ]; then
+        case "$(sed -n 2p "$work/error")" in
+            'aws: [ERROR]: Could not connect to the endpoint URL: '*) exit 4 ;;
+            'aws: [ERROR]: Connect timeout on endpoint URL: '*) exit 3 ;;
+            'aws: [ERROR]: Read timeout on endpoint URL: '*) exit 3 ;;
+        esac
+    fi
+    code=$(jq -r 'if type == "object" and (.Code | type) == "string" then .Code else empty end' \
+        "$work/error" 2> /dev/null) || exit 2
+    case "$code" in
+        RequestLimitExceeded|Throttling) exit 5 ;;
+        UnauthorizedOperation|AccessDenied) exit 6 ;;
+        AuthFailure|InvalidClientTokenId|ExpiredToken) exit 7 ;;
+        ServiceUnavailable|InternalFailure) exit 8 ;;
+    esac
+    exit 2
+}
+
 collect() (
     kind=$1
     expected=$2
@@ -81,8 +124,8 @@ collect() (
     token=''
     pages=0
     while [ "$pages" -lt 16 ]; do
-        if [ -z "$token" ]; then ec2 "$command" "$@" > "$work/page" 2> "$work/error" || exit 2
-        else ec2 "$command" "$@" --next-token "$token" > "$work/page" 2> "$work/error" || exit 2; fi
+        if [ -z "$token" ]; then ec2_read "$command" "$@" > "$work/page" 2> "$work/error" || read_error $?
+        else ec2_read "$command" "$@" --next-token "$token" > "$work/page" 2> "$work/error" || read_error $?; fi
         [ "$(wc -c < "$work/page")" -le 262144 ] || exit 1
         q --arg mode page -ce "$work/page" > "$work/decoded" 2> "$work/error" || exit 1
         jq -c '.rows[]' "$work/decoded" >> "$work/rows"
