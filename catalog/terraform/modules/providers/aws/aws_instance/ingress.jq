@@ -196,7 +196,9 @@ def configuration_projection:
   | ($rows - $managed) as $foreign
   | ($managed | map(declared_tuple) | sort) as $logical
   | require(($logical | unique) == $logical)
-  | {name:$sg.GroupName, attachment:$attachment, rules:($logical | map(select(length == 2))),
+  | {name:$sg.GroupName, attachment:($attachment | del(.host,.subnet,.ipv4_cidr)),
+      private_attachment:(if $selected == null then null else $attachment | {host,subnet,ipv4_cidr} end),
+      rules:($logical | map(select(length == 2))),
       private_rules:($logical | map(select(length == 3))), rows:$rows,
       protected:($foreign + $protected | sort_by(.id)),
       unrelated:[$foreign[] | select(.fact.egress | not) | .fact.rule] | sort,
@@ -227,7 +229,8 @@ def configuration_change:
     else [$p.rows[] | select(declared_tuple == $step) | .id] | require(length == 1) | .[0] end;
 def configuration_after:
   ($request[0].step.rule | request_tuple) as $step
-  | ($before[0].rows | map(select(declared_tuple != $step))) ==
+  | $before[0].private_attachment == $projection[0].private_attachment
+    and ($before[0].rows | map(select(declared_tuple != $step))) ==
     ($projection[0].rows | map(select(declared_tuple != $step)));
 
 if $mode == "request" then $request[0] | if .action == "creation" then request else configuration_request end
