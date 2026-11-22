@@ -31,6 +31,10 @@
     "require_before_fingerprint": true,
     "firewall_output": "security_group_id"
   },
+  "network": {
+    "procedure": "network.sh",
+    "actions": ["domain", "targets"]
+  },
   "provider_observation": {
     "allocation_scope": "creation",
     "allocation_scope_inputs": {
