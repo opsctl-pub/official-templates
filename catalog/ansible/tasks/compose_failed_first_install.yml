@@ -1,0 +1,61 @@
+---
+- name: Require the closed failed-install guard and exact current members
+  ansible.builtin.assert:
+    that:
+      - compose_failed_first_install is mapping
+      - compose_failed_first_install.keys() | sort == ['services_by_container', 'version']
+      - compose_failed_first_install.version is integer and compose_failed_first_install.version == 1
+      - compose_failed_first_install.services_by_container is mapping
+      - compose_failed_first_install.services_by_container | length > 0
+      - compose_failed_first_install.services_by_container.keys() | sort == compose_known_containers | sort
+      - compose_observation_complete
+      - compose_project_info.containers | map(attribute='Id') | sort ==
+        compose_observed_instances | map(attribute='instance.id') | sort
+      - compose_observed_instances | map(attribute='instance.id') | difference(compose_known_containers) | length == 0
+      - compose_observed_networks | selectattr('presence', 'equalto', 'present') | map(attribute='id') | sort ==
+        compose_known_networks | map(attribute='id') | sort
+      - compose_observed_volumes | selectattr('presence', 'equalto', 'present') | map(attribute='name') | sort ==
+        compose_known_volumes | map(attribute='name') | sort
+  no_log: true
+
+- name: Rejoin the exact present network names and exclude foreign users of created networks
+  ansible.builtin.assert:
+    that:
+      - observed | length == 1 and observed[0].network.Id == network.id
+      - observed[0].network.Name == network.name
+      - network.origin != 'created' or observed[0].network.Labels.get('com.docker.compose.project') == compose_project_name
+      - compose_action != 'deploy' or network.origin != 'created' or
+        (observed[0].network.Containers | default({}, true)).keys() | difference(compose_known_containers) | length == 0
+  vars:
+    observed: "{{ compose_network_inventory | selectattr('compose_network_name', 'equalto', network.name) | selectattr('exists') | list }}"
+  loop: "{{ compose_known_networks }}"
+  loop_control:
+    loop_var: network
+  no_log: true
+
+- name: Inspect the exact current failed-install members before effects
+  community.docker.docker_container_info:
+    name: "{{ member_id }}"
+  loop: "{{ compose_observed_instances | map(attribute='instance.id') | list }}"
+  loop_control:
+    loop_var: member_id
+  register: compose_failed_install_members
+  no_log: true
+
+- name: Refuse live or differently labeled failed-install members
+  ansible.builtin.assert:
+    that:
+      - member.exists and member.container.Id == member.member_id
+      - labels.get('com.docker.compose.project') == compose_project_name
+      - labels.get('com.docker.compose.project.working_dir') == ((compose_workspace + '/' + compose_project_directory) | normpath)
+      - labels.get('com.docker.compose.service') == compose_failed_first_install.services_by_container[member.member_id]
+      - labels.get('com.docker.compose.oneoff') == 'False'
+      - state.Status in ['created', 'exited']
+      - state.Running is sameas false and state.Paused is sameas false and state.Restarting is sameas false
+  vars:
+    labels: "{{ member.container.Config.Labels }}"
+    state: "{{ member.container.State }}"
+  loop: "{{ compose_failed_install_members.results }}"
+  loop_control:
+    loop_var: member
+  no_log: true
