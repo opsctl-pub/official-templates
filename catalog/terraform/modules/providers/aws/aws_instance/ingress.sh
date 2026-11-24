@@ -49,6 +49,31 @@ ec2_exact() {
     aws_exact ec2 "$@"
 }
 
+creation_read() {
+    read_kind=$1
+    read_output=$2
+    read_not_found=$3
+    shift 3
+    for read_delay in 2 4 0; do
+        if ec2_exact "$@" > "$read_output" 2> "$work/error"; then
+            return 0
+        else
+            read_status=$?
+        fi
+        if [ "$read_status" -eq 124 ]; then
+            read_reason=${read_kind}_read_timeout
+        elif [ "$read_status" -eq 254 ] && grep -Eq "$read_not_found" "$work/error"; then
+            read_reason=${read_kind}_not_visible
+        else
+            finish unknown provider_unavailable
+        fi
+        [ "$read_delay" -gt 0 ] && [ "$((deadline - $(date +%s)))" -gt "$read_delay" ] \
+            || finish unknown "$read_reason"
+        sleep "$read_delay"
+        [ "$(date +%s)" -lt "$deadline" ] || finish unknown "$read_reason"
+    done
+}
+
 group_presence() {
     ec2_exact describe-security-groups --filters "Name=group-id,Values=$firewall" > "$work/group" 2> "$work/error" \
         && [ "$(wc -c < "$work/group")" -le 262144 ] && closed_json "$work/group" \
@@ -202,10 +227,12 @@ region=$(jq -r .region "$work/request")
 has_credentials || finish unknown credentials_unavailable
 [ "$action" = creation ] || configure_ingress
 while :; do
-    ec2_exact describe-security-groups --group-ids "$firewall" > "$work/group" 2> "$work/error" \
-        || finish unknown provider_unavailable
-    ec2_exact describe-instances --instance-ids "$instance" > "$work/instance" 2> "$work/error" \
-        || finish unknown provider_unavailable
+    creation_read firewall "$work/group" \
+        '^aws: \[ERROR\]: An error occurred \(InvalidGroup\.NotFound\) when calling the DescribeSecurityGroups operation:' \
+        describe-security-groups --group-ids "$firewall"
+    creation_read instance "$work/instance" \
+        '^aws: \[ERROR\]: An error occurred \(InvalidInstanceID\.NotFound\) when calling the DescribeInstances operation:' \
+        describe-instances --instance-ids "$instance"
     [ "$(wc -c < "$work/group")" -le 262144 ] && [ "$(wc -c < "$work/instance")" -le 262144 ] \
         || finish unknown response_too_large
     closed_json "$work/group" && closed_json "$work/instance" || finish unknown malformed_response
