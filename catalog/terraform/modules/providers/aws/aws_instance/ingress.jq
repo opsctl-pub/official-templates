@@ -1,6 +1,5 @@
-def require($ok): if $ok then . else error("unqualified") end;
-def exact($fields): type == "object" and keys == ($fields | sort);
-def port: type == "number" and floor == . and . >= 1 and . <= 65535;
+include "network_policy";
+
 def rule: exact(["protocol","port"]) and (.protocol == "tcp" or .protocol == "udp") and (.port | port);
 def request:
   . as $r
@@ -122,13 +121,20 @@ def group_presence:
     elif length == 1 and .[0].GroupId == $expected then "present"
     else error("unqualified security group") end;
 
-def native_id($prefix): type == "string" and test("^" + $prefix + "-([0-9a-f]{8}|[0-9a-f]{17})$");
-def bounded_text: type == "string" and length > 0 and length <= 255 and all(explode[]; . >= 32 and . != 127);
 def configuration_rules:
   type == "array" and length <= 67 and all(.[]; rule) and length == (unique | length);
+def private_rule:
+  exact(["protocol","port","source_addresses"]) and .protocol == "tcp" and (.port | port)
+  and (.source_addresses | type == "array" and length == 1 and (.[0] | host_cidr));
+def private_rules:
+  type == "array" and length <= 64 and all(.[]; private_rule) and length == (unique | length);
+def request_tuple:
+  [.protocol,.port] + (.source_addresses // []);
+def state_rules:
+  (.managed_rules + .managed_private_rules) | map(request_tuple) | sort;
 def configuration_state:
   exact(["managed_rules","managed_private_rules"]) and
-  (.managed_rules | configuration_rules and length <= 35) and .managed_private_rules == [];
+  (.managed_rules | configuration_rules and length <= 35) and (.managed_private_rules | private_rules);
 def configuration_request:
   . as $r
   | require(exact(["format_version","action","provider_instance_id","firewall_id","region",
@@ -138,99 +144,25 @@ def configuration_request:
   | require(.format_version == 1 and (.action == "observe" or .action == "change"))
   | require((.provider_instance_id | instance_id) and (.firewall_id | group_id))
   | require(.region | type == "string" and test("^[a-z]{2}(-[a-z]+)+-[0-9]+$"))
-  | require((.ssh_port | port) and (.managed_rules | configuration_rules) and .managed_private_rules == [])
+  | require((.ssh_port | port) and (.managed_rules | configuration_rules) and
+      (.managed_private_rules | private_rules and all(.[]; .port != $r.ssh_port)))
   | require(any(.managed_rules[]; .protocol == "tcp" and .port == $r.ssh_port))
   | if .action == "change" then
       require((.expected_before | configuration_state) and (.expected_after | configuration_state))
-      | require(.step | exact(["action","rule"]) and (.action == "add" or .action == "remove") and (.rule | rule))
+      | require(.step | exact(["action","rule"]) and (.action == "add" or .action == "remove")
+                              and (.rule | rule or private_rule))
       | require(.step.rule != {protocol:"tcp",port:.ssh_port})
       | require((.expected_before_fingerprint | type == "string" and test("^[0-9a-f]{64}$"))
                 and (.preserved_policy | type == "object"))
-      | require(all(($r.expected_before.managed_rules + $r.expected_after.managed_rules)[]; . as $rule
-          | any($r.managed_rules[]; . == $rule)))
-      | .step.rule as $step
+      | ($r | state_rules) as $union
+      | (.expected_before | state_rules) as $before | (.expected_after | state_rules) as $after
+      | require(all(($before + $after)[]; . as $rule | any($union[]; . == $rule)))
+      | (.step.rule | request_tuple) as $step
       | require(if .step.action == "add" then
-          (.expected_before.managed_rules | index($step)) == null and
-          ((.expected_before.managed_rules + [$step]) | sort) == (.expected_after.managed_rules | sort)
-        else (.expected_before.managed_rules | index($step)) != null and
-          ((.expected_before.managed_rules - [$step]) | sort) == (.expected_after.managed_rules | sort) end)
+          (any($before[]; . == $step) | not) and (($before + [$step]) | sort) == $after
+        else any($before[]; . == $step) and (($before - [$step]) | sort) == $after end)
     else . end
   | true;
-
-def cidr($v6):
-  require(type == "string" and length <= 49)
-  | . as $cidr | split("/") | require(length == 2 and (.[1] | test("^(0|[1-9][0-9]{0,2})$")))
-  | (.[1] | tonumber) as $mask
-  | if $v6 then
-      require($mask <= 128 and (.[0] | test("^[0-9a-fA-F:]+$")))
-      | .[0] | split("::")
-      | require(length <= 2)
-      | ([.[] | select(length > 0) | split(":")[]]) as $groups
-      | require(all($groups[]; test("^[0-9a-fA-F]{1,4}$"))
-          and (if length == 1 then ($groups | length) == 8 else ($groups | length) < 8 end))
-    else
-      require($mask <= 32)
-      | .[0] | split(".")
-      | require(length == 4 and all(.[]; test("^(0|[1-9][0-9]{0,2})$") and tonumber <= 255))
-    end
-  | $cidr;
-
-def native_fact($native; $peer; $description; $egress):
-  require(($description == null or ($description | type == "string" and length <= 255))
-      and ($egress | type == "boolean"))
-  | ($native | if .IpProtocol == "-1" then
-       require((has("FromPort") | not) and (has("ToPort") | not) or (.FromPort == -1 and .ToPort == -1))
-       | {protocol:"all",port_start:null,port_end:null}
-     else require((.IpProtocol == "tcp" or .IpProtocol == "udp") and (.FromPort | port) and (.ToPort | port)
-                  and .FromPort <= .ToPort)
-       | {protocol:.IpProtocol,port_start:.FromPort,port_end:.ToPort} end) as $rule
-  | {egress:$egress, description:$description,
-     rule:($rule + {peers:[{kind:"address",identity:$peer}]})};
-def detailed_rule($group):
-  require(type == "object" and (keys - ["SecurityGroupRuleId","GroupId","GroupOwnerId","IsEgress",
-      "IpProtocol","FromPort","ToPort","CidrIpv4","CidrIpv6","Description","SecurityGroupRuleArn","Tags"]) == [])
-  | require(.GroupId == $group.GroupId and (.GroupOwnerId == null or .GroupOwnerId == $group.OwnerId))
-  | require(.SecurityGroupRuleId | native_id("sgr"))
-  | require((.CidrIpv4 == null) != (.CidrIpv6 == null))
-  | (if .CidrIpv4 != null then .CidrIpv4 | cidr(false) else .CidrIpv6 | cidr(true) end) as $peer
-  | {id:.SecurityGroupRuleId, fact:native_fact(.;$peer;.Description;.IsEgress)};
-def group_rules($egress):
-  require(type == "array" and length <= 100)
-  | [.[] | require(type == "object" and (keys - ["IpProtocol","FromPort","ToPort",
-      "IpRanges","Ipv6Ranges","UserIdGroupPairs","PrefixListIds"]) == []
-      and (.UserIdGroupPairs // []) == [] and (.PrefixListIds // []) == []
-      and ((.IpRanges // []) | type == "array") and ((.Ipv6Ranges // []) | type == "array"))
-      | . as $permission
-      | ([ (.IpRanges // [])[] | require((keys - ["CidrIp","Description"]) == [])
-           | {peer:(.CidrIp | cidr(false)), description:.Description} ]
-         + [ (.Ipv6Ranges // [])[] | require((keys - ["CidrIpv6","Description"]) == [])
-           | {peer:(.CidrIpv6 | cidr(true)), description:.Description} ])
-      | require(length > 0 and length <= 100)
-      | .[] as $peer
-      | native_fact($permission;$peer.peer;$peer.description;$egress)]
-  | require(length <= 100);
-
-def exclusive_attachment($r; $sg):
-  ($instance[0] | require(type == "object" and .NextToken == null and
-       (.Reservations | type == "array" and length == 1 and
-        (.[0].Instances | type == "array" and length == 1)))
-       | .Reservations[0].Instances[0]) as $host
-  | require($host.InstanceId == $r.provider_instance_id and $host.VpcId == $sg.VpcId
-        and ($host.SecurityGroups | map(.GroupId)) == [$sg.GroupId]
-        and ($host.NetworkInterfaces | type == "array" and length == 1))
-  | ($interfaces[0] | require(type == "object" and (keys - ["NetworkInterfaces","NextToken"]) == []
-        and .NextToken == null and (.NetworkInterfaces | type == "array" and length == 1))
-      | .NetworkInterfaces[0]) as $eni
-  | require(($eni.NetworkInterfaceId | native_id("eni")) and $eni.VpcId == $sg.VpcId
-        and $eni.Status == "in-use" and ($eni.Groups | map(.GroupId)) == [$sg.GroupId]
-        and $eni.Attachment.InstanceId == $r.provider_instance_id
-        and $eni.Attachment.Status == "attached" and $eni.Attachment.DeviceIndex == 0
-        and ($eni.Attachment.AttachmentId | native_id("eni-attach")))
-  | require($host.NetworkInterfaces[0] as $local | $local.NetworkInterfaceId == $eni.NetworkInterfaceId
-        and $local.VpcId == $eni.VpcId and $local.Attachment.AttachmentId == $eni.Attachment.AttachmentId
-        and ($local.Groups | map(.GroupId)) == [$sg.GroupId])
-  | {instance:$r.provider_instance_id, firewall:$sg.GroupId, vpc:$sg.VpcId,
-     owner:$sg.OwnerId, interface:$eni.NetworkInterfaceId, attachment:$eni.Attachment.AttachmentId};
 
 def public_tuple:
   .fact as $f
@@ -238,55 +170,75 @@ def public_tuple:
         and $f.rule.port_start == $f.rule.port_end
         and $f.rule.peers[0].identity == "0.0.0.0/0" then [$f.rule.protocol,$f.rule.port_start]
     else null end;
+def private_tuple:
+  .fact as $f
+  | if ($f.egress | not) and $f.rule.protocol == "tcp" and $f.rule.port_start == $f.rule.port_end
+        and ($f.rule.peers[0].identity | host_cidr)
+    then ["tcp",$f.rule.port_start,$f.rule.peers[0].identity] else null end;
+def private_description: "OpsControl declared private ingress";
 def declared_tuple:
-  if .fact.description == "OpsControl declared ingress" then public_tuple else null end;
-def includes($tuple): any($request[0].managed_rules[]; [.protocol,.port] == $tuple);
+  if .fact.description == "OpsControl declared ingress" then public_tuple
+  elif .fact.description == private_description then private_tuple
+  else null end;
 def configuration_projection:
   $request[0] as $r
-  | ($group[0] | require(type == "object" and (keys - ["SecurityGroups","NextToken"]) == []
-       and .NextToken == null and (.SecurityGroups | type == "array" and length == 1))
-      | .SecurityGroups[0]) as $sg
-  | require($sg.GroupId == $r.firewall_id and ($sg.GroupName | bounded_text) and ($sg.VpcId | native_id("vpc"))
-      and ($sg.OwnerId | type == "string" and test("^[0-9]{12}$")))
-  | exclusive_attachment($r;$sg) as $attachment
-  | ($native_rules[0] | require(type == "object" and (keys - ["SecurityGroupRules","NextToken"]) == []
-       and .NextToken == null and (.SecurityGroupRules | type == "array" and length <= 200))
-     | .SecurityGroupRules | map(detailed_rule($sg)) | sort_by(.id)) as $rows
-  | require(($rows | map(.id) | unique | length) == ($rows | length))
-  | require(($rows | map(.fact) | sort) ==
-      ((($sg.IpPermissions | group_rules(false)) + ($sg.IpPermissionsEgress | group_rules(true))) | sort))
+  | ($group[0] | qualified_group($r.firewall_id)) as $sg
+  | (if $r.managed_private_rules == [] then null else $domain[0] end) as $selected
+  | exclusive_attachment($r;$sg;$instance[0];$interfaces[0];$selected) as $attachment
+  | require(all($r.managed_private_rules[]; .source_addresses[0] | split("/")[0] |
+        . != $attachment.host and usable_host($selected)))
+  | ($native_rules[0] | exact_rows($sg)) as $rows
   | ["tcp",$r.ssh_port] as $ssh
   | ($rows | map(select(declared_tuple == $ssh))) as $protected
   | require(($protected | length) == 1)
-  | ($rows | map(select(declared_tuple as $tuple | $tuple != null and includes($tuple)))) as $managed
+  | ($r | state_rules) as $union
+  | ($rows | map(select(declared_tuple as $tuple | $tuple != null and any($union[]; . == $tuple)))) as $managed
   | ($rows - $managed) as $foreign
   | ($managed | map(declared_tuple) | sort) as $logical
   | require(($logical | unique) == $logical)
-  | {name:$sg.GroupName, attachment:$attachment, rules:$logical, rows:$rows,
+  | {name:$sg.GroupName, attachment:($attachment | del(.host,.subnet,.ipv4_cidr)),
+      private_attachment:(if $selected == null then null else $attachment | {host,subnet,ipv4_cidr} end),
+      rules:($logical | map(select(length == 2))),
+      private_rules:($logical | map(select(length == 3))), rows:$rows,
       protected:($foreign + $protected | sort_by(.id)),
       unrelated:[$foreign[] | select(.fact.egress | not) | .fact.rule] | sort,
       outbound:[$foreign[] | select(.fact.egress) | .fact.rule] | sort};
 def configuration_observation:
   $request[0] as $r | $projection[0] as $p
-  | {provider_instance_id:$r.provider_instance_id,firewall_id:$r.firewall_id,rules:$p.rules,private_rules:[],
+  | {provider_instance_id:$r.provider_instance_id,firewall_id:$r.firewall_id,rules:$p.rules,private_rules:$p.private_rules,
      attached_firewall_ids:[$r.firewall_id],attached_instance_ids:[$r.provider_instance_id],settled:true,
      policy_fingerprint:$digest,fingerprint:$fingerprint,
      preserved_policy:{name:$p.name,unrelated_ingress:$p.unrelated,outbound:$p.outbound,
        attached_firewall_ids:[$r.firewall_id],attached_instance_ids:[$r.provider_instance_id],fingerprint:$digest},
      observed_at:$observed,observation_complete:true};
 def configuration_change:
-  $request[0] as $r | $projection[0] as $p | [$r.step.rule.protocol,$r.step.rule.port] as $step
+  $request[0] as $r | $projection[0] as $p | ($r.step.rule | request_tuple) as $step
+  | ($step | length == 3) as $private
+  | if $private then
+      ($r | state_rules) as $union
+      | require(all($p.rows[]; if (.fact.egress | not) and (.fact | covers_tcp($step[1]))
+           then declared_tuple as $candidate
+           | $candidate != null and ($candidate | length) == 3 and any($union[]; . == $candidate)
+           else true end))
+    else . end
   | if $r.step.action == "add" then
-      require(all($p.rows[]; public_tuple != $step))
+      require(all($p.rows[]; (if $private then private_tuple else public_tuple end) != $step))
       | [{IpProtocol:$step[0],FromPort:$step[1],ToPort:$step[1],
-          IpRanges:[{CidrIp:"0.0.0.0/0",Description:"OpsControl declared ingress"}]}]
+          IpRanges:[(if $private then {CidrIp:$step[2],Description:private_description}
+                     else {CidrIp:"0.0.0.0/0",Description:"OpsControl declared ingress"} end)]}]
     else [$p.rows[] | select(declared_tuple == $step) | .id] | require(length == 1) | .[0] end;
 def configuration_after:
-  [$request[0].step.rule.protocol,$request[0].step.rule.port] as $step
-  | ($before[0].rows | map(select(declared_tuple != $step))) ==
+  ($request[0].step.rule | request_tuple) as $step
+  | $before[0].private_attachment == $projection[0].private_attachment
+    and ($before[0].rows | map(select(declared_tuple != $step))) ==
     ($projection[0].rows | map(select(declared_tuple != $step)));
 
 if $mode == "request" then $request[0] | if .action == "creation" then request else configuration_request end
+elif $mode == "configuration_vpc_id" then $group[0] | qualified_group($request[0].firewall_id) | .VpcId
+elif $mode == "configuration_domain" then
+  ($identity[0] | identity_account) as $account
+  | ($group[0] | qualified_group($request[0].firewall_id)) as $sg
+  | $vpc[0] | qualified_vpc($sg.VpcId;$account;$request[0].region)
 elif $mode == "configuration_projection" then configuration_projection
 elif $mode == "configuration_observation" then configuration_observation
 elif $mode == "configuration_change" then configuration_change

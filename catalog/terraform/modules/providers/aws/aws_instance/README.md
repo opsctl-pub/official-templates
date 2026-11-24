@@ -121,8 +121,8 @@ there is no persistent/shared cache or zero-network initialization claim.
 
 The optional v3 `ingress` capability selects [ingress.sh](ingress.sh), with
 [ingress.jq](ingress.jq) owning its exact request/read projection. The creation action remains an exact readiness read. The observe and change
-actions qualify public IPv4 single-port TCP and UDP ingress on the exact
-module-owned Server and security group.
+actions qualify public IPv4 TCP and UDP and reviewed private IPv4 TCP ingress
+on the exact module-owned Server and security group.
 
 Stdin is one finite JSON object, at most32 KiB, with exactly `format_version:1`,
 `action:"creation"`, recorded `provider_instance_id` (`i-...`), `firewall_id`
@@ -216,11 +216,13 @@ Desired exposure and peer bindings are never changed by Verify.
 
 Observation cross-checks the exact instance, group and VPC, the sole attached
 interface, and the bounded native rule inventory with its stable rule IDs.
-Only the owned description and an exact requested public IPv4 TCP or UDP
-single-port tuple qualify as managed. SSH, other ingress and egress are
+An exact reviewed public IPv4 TCP or UDP single-port tuple or private IPv4
+TCP /32 tuple qualifies as managed with its distinct module-owned description.
+SSH, other ingress and egress are
 preserved. All-protocol rules with absent ports or the exact AWS `-1/-1`
 pair project as `all` with null ports. Unsupported
-protocols, non-CIDR peers, incomplete pages and private requests refuse.
+protocols, non-CIDR peers and incomplete pages refuse. Private changes also
+refuse foreign tuples and broader overlapping inbound policy before writing.
 
 One change requires the reviewed full fingerprint, the expected logical before
 state and the preserved policy. Both states must fit the reviewed Plan's
@@ -236,3 +238,15 @@ EC2 provides no atomic compare-and-write for this policy and attachment.
 Fresh reads constrain the change and detect drift but cannot prevent an
 external change in the gap before the write. Configuration has a 65-second
 deadline inside the Runner's 75-second invocation ceiling.
+
+### Existing provider network
+
+The [network procedure](network.sh) reads an owned VPC in the credential's
+configured AWS region. It requires one canonical private IPv4 CIDR and can
+qualify one or two existing running instances in the requested order. STS,
+the VPC, reservations, primary interfaces and exclusive groups must agree.
+The attachment and complete native policy are fingerprinted for requalification.
+The listener result requires exact approved peer hosts and source egress.
+A missing rule is reported after complete observations. Broad or incomplete
+policy leaves the result unavailable. These facts do not attest application
+reachability. The declaration provides no creation action or VPC placement.
