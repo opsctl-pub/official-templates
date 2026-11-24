@@ -176,12 +176,21 @@
 
     - name: Converge WireGuard overlay state
       block:
+        - name: Check the exact WireGuard package installation
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, '-f=${db:Status-Status}', --, wireguard]
+            expand_argument_vars: false
+          register: wireguard_package_status
+          changed_when: false
+          failed_when: wireguard_package_status.rc not in [0, 1]
+
         - name: Ensure WireGuard packages present
           apt:
             name:
               - wireguard
             state: present
             update_cache: true
+          when: wireguard_package_status.rc != 0 or wireguard_package_status.stdout | trim != 'installed'
 
         - name: Ensure WireGuard base directory exists
           file:
