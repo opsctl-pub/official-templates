@@ -33,6 +33,10 @@
           assert:
             that:
               - (item.action | string) in ["create", "update", "delete", "adopt"]
+              - >-
+                item.action != 'delete'
+                or (item.tracked_record_id | default(none)) is none
+                or (compare_before_apply | default(false)) is sameas true
               - (item.record_type | string | upper) == "A"
               - item.proxied is boolean
               - not item.proxied or item.ttl == 1
@@ -61,13 +65,26 @@
           loop_control:
             label: "{{ item.hostname }}:{{ item.action }}"
 
+        - name: Validate tracked DNS delete scope before looping
+          assert:
+            that:
+              - dns_delete_scope in ['retirement_tracked_delete', 'tenant_tracked_delete']
+              - compare_before_apply | default(false) is sameas true
+              - >-
+                dns_delete_scope != 'tenant_tracked_delete'
+                or (dns_changes is sequence and dns_changes is not mapping and dns_changes is not string
+                    and (dns_changes | length) > 0)
+            fail_msg: "Tracked DNS delete scope or changeset is invalid"
+          when: dns_delete_scope is defined
+
         - name: Validate confirmed DNS delete shape
           assert:
             that:
               - (compare_before_apply | default(false)) is boolean
               - >-
                 dns_delete_scope is not defined
-                or (dns_delete_scope == 'retirement_tracked_delete' and compare_before_apply is sameas true)
+                or (dns_delete_scope in ['retirement_tracked_delete', 'tenant_tracked_delete']
+                    and compare_before_apply is sameas true)
               - >-
                 not (compare_before_apply | default(false) | bool)
                 or (
@@ -80,13 +97,26 @@
                      and (item.tracked_record_id is not defined or item.tracked_record_id is none)
                      and item.proxied is sameas false)
                     or
-                    (dns_delete_scope | default('') == 'retirement_tracked_delete'
+                    (dns_delete_scope | default('') in ['retirement_tracked_delete', 'tenant_tracked_delete']
                      and item.tracked_record_id is string
                      and item.tracked_record_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
                      and item.deployment_id is string
                      and item.deployment_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
                      and item.ttl is integer and item.ttl > 0)
                   )
+                )
+              - >-
+                dns_delete_scope | default('') != 'tenant_tracked_delete'
+                or (
+                  item.tracked_record_id == (item.tracked_record_id | trim)
+                  and item.deployment_id == (item.deployment_id | trim)
+                  and item.provider_record_id is string
+                  and item.provider_record_id == (item.provider_record_id | trim)
+                  and item.provider_record_id is match('^[A-Za-z0-9_-]+$')
+                  and item.hostname is string and item.hostname == (item.hostname | trim)
+                  and item.hostname is match('^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$')
+                  and item.value is string and item.value == (item.value | trim)
+                  and item.value is match('^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])[.]){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$')
                 )
             fail_msg: "Confirmed DNS delete plan is invalid"
           loop: "{{ dns_changes }}"
