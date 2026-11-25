@@ -50,6 +50,7 @@ cleanup() {
     fi
     if "$cleanup_failed"; then exit 1; fi
     if [ "$status" -ne 0 ]; then exit "$status"; fi
+    if [ "$action" != due ]; then rm -f -- "$work/failure"; fi
     rm -f -- "$work/expected.json" "$work/client.id" "$work/publication.json" "$work/client.log"
     rmdir -- "$work" || cleanup_failed=true
     if "$cleanup_failed"; then exit 1; fi
@@ -58,6 +59,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
+mark_failure_phase() {
+    [ "$action" != due ] && [ ! -L "$work/failure" ] || return 0
+    if [ -e "$work/failure" ]; then
+        [ -f "$work/failure" ] && [ "$(stat -c '%u:%a:%h' -- "$work/failure" 2>/dev/null)" = "0:600:1" ] || return 0
+    fi
+    { printf '%s\n' "$1" > "$work/failure"; } 2>/dev/null || true
+}
+
+mark_failure_phase setup
 if [ "$action" = due ]; then
     timeout 5s python3 "$store/runtime/certificate_facts.py" \
         --selection "$selection" --root "$store" --subject "$subject" \
@@ -69,6 +79,7 @@ fi
 
 exec 9>{{ (traefik_acme_state_dir ~ '/http-challenge.lock') | quote }}
 flock -w 600 9
+mark_failure_phase account
 [ -d "$state/lego/accounts" ] && [ ! -L "$state/lego/accounts" ]
 [ "$(readlink -f -- "$state/lego/accounts")" = "$state/lego/accounts" ]
 [ "$(stat -c '%u:%a' -- "$state/lego/accounts")" = "0:700" ]
@@ -77,6 +88,7 @@ account_target_entry=$(find "$state/lego/accounts" -mindepth 1 -maxdepth 1 -prin
 python3 "$store/runtime/acme_account_storage.py" "$accounts" \
     {{ acme_directory_url | quote }} {{ acme_email | quote }} "$account_id"
 {% if challenge == 'http-01' %}
+mark_failure_phase challenge-route
 if [ -e "$route" ] || [ -L "$route" ]; then exit 1; fi
 install -m 0644 -- "$state/challenge.yml" "$route_stage"
 ln -- "$route_stage" "$route"
@@ -112,10 +124,36 @@ lego_args+=(--dns httpreq)
 if [ "$action" != issue ]; then lego_args+=(--reuse-key --no-random-sleep); fi
 if [ "$action" = renew ]; then lego_args+=(--renew-force); fi
 if [ "$action" = due ]; then lego_args+=(--renew-days 30); fi
-timeout --signal=TERM --kill-after=5s 600s docker "${docker_args[@]}" \
+mark_failure_phase client
+if timeout --signal=TERM --kill-after=5s 600s docker "${docker_args[@]}" \
     goacme/lego@sha256:1944e8c36055beec47c7de6f15202b41128be75eea0ffa257f0c14d93c5155fd \
-    "${lego_args[@]}" > "$work/client.log" 2>&1
+    "${lego_args[@]}" > "$work/client.log" 2>&1; then
+    :
+else
+    client_status=$?
+    if [ "$action" != due ]; then
+        category=$(python3 - "$work/client.log" 2>/dev/null <<'PY' || true
+import os
+import re
+import stat
+import sys
 
+with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as log:
+    metadata = os.fstat(log.fileno())
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 65536:
+        data = log.read(65537)
+        if len(data) <= 65536:
+            tokens = set(re.findall(rb"(?<![\w:/.-])urn:ietf:params:acme:error:([\w.-]+)", data))
+            if len(tokens) == 1 and tokens <= {b"connection", b"dns", b"unauthorized", b"rateLimited", b"rejectedIdentifier"}:
+                print(tokens.pop().decode("ascii"))
+PY
+        )
+        if [ -n "$category" ]; then mark_failure_phase "client $category"; fi
+    fi
+    exit "$client_status"
+fi
+
+mark_failure_phase publication
 timeout --signal=TERM --kill-after=1s 30s python3 "$store/runtime/traefik_certificate_publish.py" \
     --selection "$selection" --root "$store" --subject "$subject" --source automatic \
     --hosts "$hosts" --expected-file "$work/expected.json" \
