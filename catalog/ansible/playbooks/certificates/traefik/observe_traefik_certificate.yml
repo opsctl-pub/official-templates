@@ -11,18 +11,29 @@
           - certificate_probe_hosts is boolean
         fail_msg: Certificate probe mode must be an explicit boolean.
 
+    - name: Require a boolean opt-in for subject renewal unit observation
+      ansible.builtin.assert:
+        that:
+          - certificate_observe_subject_units | default(false) is boolean
+        fail_msg: Subject renewal unit observation must be an explicit boolean.
+
     - name: Read native certificate facts without mutation
       ansible.builtin.include_tasks: ../../../tasks/traefik_custom_certificate_observation.yml
       vars:
-        certificate_allow_uninstalled_gateway: "{{ not certificate_probe_hosts }}"
+        certificate_read_subject_units: "{{ certificate_observe_subject_units | default(false) }}"
+        certificate_allow_uninstalled_gateway: "{{ not certificate_probe_hosts and not certificate_read_subject_units }}"
 
     - name: Emit plain certificate facts
       ansible.builtin.debug:
         msg: >-
           TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'certificate_subject_units': certificate_subject_unit_facts}
+              if certificate_observe_subject_units | default(false) and certificate_procedure_error is none else {}) |
             combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
 
     - name: Refuse unavailable or unverified native facts
       ansible.builtin.fail:
         msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
-      when: certificate_observation.outcome != 'succeeded'
+      when: >-
+        certificate_observation.outcome != 'succeeded' or
+        (certificate_observe_subject_units | default(false) and certificate_procedure_error is not none)

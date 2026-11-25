@@ -6,6 +6,7 @@
   vars:
     wireguard_base_dir: "/etc/wireguard"
     wireguard_requested_state: "{{ wireguard_state | default('present') }}"
+    wireguard_observe_absent: "{{ wireguard_requested_state == 'absent' and require_absent is defined }}"
     wireguard_requested_listen_port: "{{ wireguard_listen_port | default(51820) }}"
     short_deployment_id: "{{ (deployment_id | string | regex_replace('-', ''))[:8] }}"
     wireguard_interface_name: "{{ gateway_interface | default('wg-' ~ short_deployment_id) }}"
@@ -25,9 +26,9 @@
           - require_absent is not defined or require_absent is true
           - (expected_public_key is defined) == (expected_wireguard_ip is defined)
           - expected_public_key is not defined or wireguard_requested_state == 'absent'
-          - require_absent is not defined or wireguard_requested_state == 'present'
-          - wireguard_requested_state != 'absent' or gateway_interface is defined
-          - wireguard_requested_state != 'absent' or gateway_service is defined
+          - require_absent is not defined or wireguard_requested_state in ['present', 'absent']
+          - wireguard_requested_state != 'absent' or wireguard_observe_absent or gateway_interface is defined
+          - wireguard_requested_state != 'absent' or wireguard_observe_absent or gateway_service is defined
           - gateway_service is not defined or gateway_service.manager == 'systemd'
           - wireguard_interface_name is string
           - wireguard_interface_name | length > 0
@@ -39,12 +40,82 @@
           - wireguard_service_name is match('^[A-Za-z0-9_.@-]+$')
         fail_msg: "WireGuard ownership guard is invalid"
 
+    - name: Prove default WireGuard overlay is absent without mutation
+      when: wireguard_observe_absent
+      block:
+        - name: Require the closed absence observation request
+          assert:
+            that:
+              - deployment_id is string
+              - deployment_id is match('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+              - gateway_interface is not defined and gateway_service is not defined
+              - expected_public_key is not defined and expected_wireguard_ip is not defined
+              - wireguard_ip is not defined and overlay_cidr is not defined and wireguard_peers is not defined
+              - wireguard_listen_port is not defined
+              - wireguard_interface_name == ('wg-' ~ short_deployment_id)
+              - wireguard_service_name == ('wg-quick@' ~ wireguard_interface_name ~ '.service')
+
+        - name: Read native interface inventory
+          command:
+            argv: [ip, -j, link, show]
+          register: observed_wireguard_links
+          changed_when: false
+
+        - name: Inspect exact managed paths without following links
+          stat:
+            path: "{{ item }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+            get_attributes: false
+          loop:
+            - "{{ wireguard_config_path }}"
+            - "{{ wireguard_private_key_path }}"
+            - "{{ wireguard_public_key_path }}"
+          register: observed_wireguard_paths
+
+        - name: Read native unit state without loading or changing its files
+          command:
+            argv:
+              - systemctl
+              - show
+              - --property=LoadState,ActiveState,UnitFileState
+              - "{{ wireguard_service_name }}"
+          register: observed_wireguard_unit
+          changed_when: false
+
+        - name: Require positive evidence of overlay absence
+          vars:
+            links: "{{ observed_wireguard_links.stdout | from_json }}"
+            unit: "{{ observed_wireguard_unit.stdout_lines | sort }}"
+          assert:
+            that:
+              - links | type_debug == 'list'
+              - links | length > 0
+              - links | select('mapping') | length == links | length
+              - links | selectattr('ifname', 'defined') | length == links | length
+              - links | map(attribute='ifname') | select('string') | length == links | length
+              - wireguard_interface_name not in (links | map(attribute='ifname') | list)
+              - observed_wireguard_paths.results | length == 3
+              - observed_wireguard_paths.results | selectattr('stat.exists', 'sameas', false) | length == 3
+              - >-
+                unit == ['ActiveState=inactive', 'LoadState=loaded', 'UnitFileState=disabled']
+                or unit == ['ActiveState=inactive', 'LoadState=not-found', 'UnitFileState=']
+            fail_msg: "WireGuard overlay absence is unconfirmed"
+
+        - name: Emit read-only WireGuard absence evidence
+          debug:
+            msg: "TEMPLATE_OUTPUT_JSON={{ {'wireguard_absent': true, 'wireguard_interface': wireguard_interface_name, 'wireguard_service': {'manager': 'systemd', 'name': wireguard_service_name, 'state': 'inactive'}} | to_json }}"
+
+        - name: End play after WireGuard absence observation
+          meta: end_play
+
     - name: Inspect fresh WireGuard interface before mutation
       command: "ip link show dev {{ wireguard_interface_name }}"
       register: fresh_wireguard_interface
       changed_when: false
       failed_when: false
-      when: require_absent | default(false)
+      when: wireguard_requested_state == 'present' and require_absent | default(false)
 
     - name: Inspect fresh WireGuard files before mutation
       stat:
@@ -54,14 +125,14 @@
         - "{{ wireguard_private_key_path }}"
         - "{{ wireguard_public_key_path }}"
       register: fresh_wireguard_files
-      when: require_absent | default(false)
+      when: wireguard_requested_state == 'present' and require_absent | default(false)
 
     - name: Inspect fresh WireGuard service before mutation
       command: "systemctl is-active {{ wireguard_service_name }}"
       register: fresh_wireguard_service
       changed_when: false
       failed_when: false
-      when: require_absent | default(false)
+      when: wireguard_requested_state == 'present' and require_absent | default(false)
 
     - name: Refuse preexisting fresh WireGuard state
       assert:
@@ -70,7 +141,7 @@
           - fresh_wireguard_files.results | selectattr('stat.exists') | list | length == 0
           - fresh_wireguard_service.rc != 0
         fail_msg: "Fresh WireGuard interface is not absent"
-      when: require_absent | default(false)
+      when: wireguard_requested_state == 'present' and require_absent | default(false)
 
     - name: Read owned WireGuard public key before cleanup
       command: "wg show {{ wireguard_interface_name }} public-key"
@@ -105,12 +176,21 @@
 
     - name: Converge WireGuard overlay state
       block:
+        - name: Check the exact WireGuard package installation
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, '-f=${db:Status-Status}', --, wireguard]
+            expand_argument_vars: false
+          register: wireguard_package_status
+          changed_when: false
+          failed_when: wireguard_package_status.rc not in [0, 1]
+
         - name: Ensure WireGuard packages present
           apt:
             name:
               - wireguard
             state: present
             update_cache: true
+          when: wireguard_package_status.rc != 0 or wireguard_package_status.stdout | trim != 'installed'
 
         - name: Ensure WireGuard base directory exists
           file:

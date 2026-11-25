@@ -1,0 +1,100 @@
+---
+- name: Install the admitted Deployment's generated certificate
+  hosts: all
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    generated_certificate_uuid_pattern: '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+    generated_certificate_digest_pattern: '^[0-9a-f]{64}$'
+    generated_certificate_host_pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+  pre_tasks:
+    - name: End simulation without a consumed result
+      ansible.builtin.meta: end_play
+      when: simulate | default(false)
+
+    - name: Qualify admitted identity and mounted files on the controller
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Require the exact generated material and expected selection
+          ansible.builtin.assert:
+            that:
+              - certificate_subject is mapping
+              - certificate_subject.keys() | sort == ['id', 'type']
+              - certificate_subject.type == 'deployment'
+              - certificate_subject.id is match(generated_certificate_uuid_pattern)
+              - revision_id is match(generated_certificate_uuid_pattern)
+              - leaf_fingerprint_sha256 is match(generated_certificate_digest_pattern)
+              - content_digest is match(generated_certificate_digest_pattern)
+              - route_hosts is sequence and route_hosts is not string and route_hosts is not mapping
+              - 1 <= route_hosts | length <= 100
+              - route_hosts == route_hosts | unique | sort
+              - route_hosts | select('match', generated_certificate_host_pattern) | list == route_hosts
+              - route_hosts | map('length') | max <= 253
+              - expected_certificate is mapping
+              - expected_certificate.keys() | sort == ['leaf_fingerprint_sha256', 'material_id', 'presence', 'revision_id', 'source']
+              - expected_certificate.presence in ['absent', 'present']
+              - >-
+                expected_certificate.presence != 'absent' or
+                (expected_certificate.source is none and expected_certificate.material_id is none and
+                 expected_certificate.revision_id is none and expected_certificate.leaf_fingerprint_sha256 is none)
+              - >-
+                expected_certificate.presence != 'present' or
+                (expected_certificate.source in ['automatic', 'custom', 'native'] and
+                 expected_certificate.leaf_fingerprint_sha256 is match(generated_certificate_digest_pattern))
+              - >-
+                expected_certificate.material_id is none or
+                expected_certificate.material_id is match(generated_certificate_uuid_pattern)
+              - >-
+                expected_certificate.revision_id is none or
+                expected_certificate.revision_id is match(generated_certificate_uuid_pattern)
+              - expected_certificate.source != 'custom' or expected_certificate.material_id is not none
+              - expected_certificate.source not in ['custom', 'native'] or expected_certificate.revision_id is not none
+              - certificate_source | default('automatic') == 'automatic'
+              - material_id | default(none) is none
+              - trust_bundle_pem | default(none) is none
+              - certificate_selection_action | default('publish') == 'publish'
+              - certificate_chain_source is undefined and certificate_key_source is undefined
+              - not (certificate_source_remote | default(false))
+              - not (certificate_selection_only | default(false))
+              - not (certificate_allow_uninstalled_gateway | default(false))
+              - certificate_probe_hosts is undefined
+            quiet: true
+          no_log: true
+
+        - name: Validate protected mounted file-secret content before delivery
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - "{{ lookup('ansible.builtin.file', '../../../scripts/traefik_custom_certificate_material_digest.py', lstrip=false, rstrip=false) }}"
+              - /var/run/opsctl/file-secret
+              - "{{ content_digest }}"
+            expand_argument_vars: false
+          changed_when: false
+          no_log: true
+      rescue:
+        - name: Refuse without observing or modifying the Server
+          ansible.builtin.fail:
+            msg: Generated certificate local preflight refused.
+
+  tasks:
+    - name: Stage, compare, publish and probe the admitted material
+      ansible.builtin.include_tasks: ../../../tasks/traefik_certificate_selection.yml
+      vars:
+        certificate_source: automatic
+        certificate_selection_action: publish
+        certificate_chain_source: /var/run/opsctl/file-secret/tls.crt
+        certificate_key_source: /var/run/opsctl/file-secret/tls.key
+
+    - name: Emit actual certificate facts and any closed procedure failure
+      ansible.builtin.debug:
+        msg: >-
+          TEMPLATE_OUTPUT_JSON={{ {'certificate_observation': certificate_observation} |
+            combine({'procedure_error': certificate_procedure_error} if certificate_procedure_error is not none else {}) | to_json }}
+
+    - name: Fail after preserving actual selection and restoration facts
+      ansible.builtin.fail:
+        msg: Requested certificate serving could not be verified. Review the observed selection and connectivity.
+      when: not certificate_selection_succeeded or certificate_observation.outcome != 'succeeded'

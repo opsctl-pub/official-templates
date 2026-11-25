@@ -33,6 +33,18 @@
       }
     },
     {
+      "case": "observed_absent",
+      "outputs": {
+        "wireguard_absent": true,
+        "wireguard_interface": "wg-01234567",
+        "wireguard_service": {
+          "manager": "systemd",
+          "name": "wg-quick@wg-01234567.service",
+          "state": "inactive"
+        }
+      }
+    },
+    {
       "case": "unknown",
       "outputs": {
         "wireguard_ip": "10.77.0.1",

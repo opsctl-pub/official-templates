@@ -118,13 +118,12 @@ fallback. One execution-private `TF_PLUGIN_CACHE_DIR` serves observation and
 the native state steps and is removed at closure. Cold fetches remain a cost;
 there is no persistent/shared cache or zero-network initialization claim.
 
-## Declared creation ingress procedure (source only)
+## Declared ingress procedure
 
 The optional v3 `ingress` capability selects [ingress.sh](ingress.sh), with
-[ingress.jq](ingress.jq) owning its exact request/read projection. This procedure
-is **unexecuted**, not serving acceptance. This private source wires creation
-reads into the original apply Job; serving callers remain unchanged. Only `creation` is declared; ordinary full-policy observation
-and ingress changes are unsupported. AWS provisioning policy remains unchanged.
+[ingress.jq](ingress.jq) owning its exact request/read projection. The creation action remains an exact readiness read. The observe and change
+actions qualify public IPv4 TCP and UDP and reviewed private IPv4 TCP ingress
+on the exact module-owned Server and security group.
 
 Stdin is one finite JSON object, at most32 KiB, with exactly `format_version:1`,
 `action:"creation"`, recorded `provider_instance_id` (`i-...`), `firewall_id`
@@ -152,10 +151,9 @@ Stdout is one version1 object with `format_version`, original `action`,
 `rejected`), nullable bounded `reason`, and `observation:null`. Complete exits0;
 all other statuses exit1. The Runner bounds results to256 KiB and owns Operation
 markers; the script emits only this JSON and no raw native diagnostic/secret.
-Temporary files are private and removed on exit/interruption. This declaration
-makes no AWS live proof, mutation support or readiness parity claim.
+Temporary files are private and removed on exit or interruption.
 
-### Creation caller contract (unexecuted source)
+### Creation caller contract
 
 The ingress declaration's optional `firewall_output` is required when `creation`
 is declared. Here it names `security_group_id` exactly, without provider-name or
@@ -183,19 +181,17 @@ fails creation while existing registration/capacity owners retain responsibility
 It qualifies original source/terminal custody and immutable reviewed intent;
 saved evidence stays on the original closed apply child, not a synthetic root
 receipt. Creation complete requires reason=null and observation=null. A source
-without captured creation ingress requires fresh review before new work. Verify now captures ingress in its existing native read Job; configuration
-and comparison remain pending separate migration. No behavior here
-has been demonstrated or accepted by this source handback.
+without captured creation ingress requires fresh review before new work. Verify captures ingress in its existing native read Job.
 
-### Verify reuse (unexecuted source)
+### Verify reuse
 
 Verify captures an optional ordered ingress read beside each existing primary
 target in the same account/module group and Job. Only provision-owned Servers
 with recorded firewall output, exposure, SSH port and qualified private bindings
 supply a scope. Imported/registered inventory and unavailable scope use null;
 there is no guessed firewall ID or peer/network/source lookup during ingestion.
-DO selects declared `observe`; AWS selects its declared creation-only exact
-match. `change` is never a Verify action.
+Verify selects the declared `observe` action when available. `change`
+is never a Verify action.
 
 The backend's closed read capture includes `exposure` and `private_bindings` for
 current-scope requalification. Runner delivers only the eight plain procedure
@@ -217,8 +213,41 @@ desired public/private rules with no foreign inbound policy may repair an
 unverified creation gate; AWS creation-complete supplies that exact match.
 Desired exposure and peer bindings are never changed by Verify.
 
-The API creation-ingress recovery poll and DO/AWS creation reader are removed
-in this private source. Configuration retains its current full-policy reader
-and incremental writer until its reviewed migration. This source has not run:
-the earlier credential-free diagnostic does not qualify Verify, provider
-behavior, AWS parity or serving acceptance.
+### Reviewed configuration
+
+Observation cross-checks the exact instance, group and VPC, the sole attached
+interface, and the bounded native rule inventory with its stable rule IDs.
+An exact reviewed public IPv4 TCP or UDP single-port tuple or private IPv4
+TCP /32 tuple qualifies as managed with its distinct module-owned description.
+SSH, other ingress and egress are
+preserved. All-protocol rules with absent ports or the exact AWS `-1/-1`
+pair project as `all` with null ports. Unsupported
+protocols, non-CIDR peers and incomplete pages refuse. Private changes also
+refuse foreign tuples and broader overlapping inbound policy before writing.
+
+One change requires the reviewed full fingerprint, the expected logical before
+state and the preserved policy. Both states must fit the reviewed Plan's
+rule union and differ by exactly the requested step. The full fingerprint includes native rule IDs,
+so a replacement with the same tuple invalidates the review. The preserved
+fingerprint covers the attachment, SSH and all foreign and outbound rules.
+Add authorizes one allowance with the module description. Remove revokes only
+the exact recorded rule ID. After a write attempt, one bounded read can settle
+the expected after state with unchanged non-step rows. An unavailable or
+conflicting read leaves the write unconfirmed. The procedure never retries it.
+
+EC2 provides no atomic compare-and-write for this policy and attachment.
+Fresh reads constrain the change and detect drift but cannot prevent an
+external change in the gap before the write. Configuration has a 65-second
+deadline inside the Runner's 75-second invocation ceiling.
+
+### Existing provider network
+
+The [network procedure](network.sh) reads an owned VPC in the credential's
+configured AWS region. It requires one canonical private IPv4 CIDR and can
+qualify one or two existing running instances in the requested order. STS,
+the VPC, reservations, primary interfaces and exclusive groups must agree.
+The attachment and complete native policy are fingerprinted for requalification.
+The listener result requires exact approved peer hosts and source egress.
+A missing rule is reported after complete observations. Broad or incomplete
+policy leaves the result unavailable. These facts do not attest application
+reachability. The declaration provides no creation action or VPC placement.

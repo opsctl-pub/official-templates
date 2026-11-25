@@ -2,6 +2,7 @@
   "format_version": 1,
   "item_id": "compose_deploy",
   "engine": "ansible",
+  "failed_first_install": {"version": 1},
   "settings_delivery": {
     "version": 1,
     "capability": "delivery_and_replacement_cleanup"

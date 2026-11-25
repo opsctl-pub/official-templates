@@ -378,13 +378,44 @@ def observe(args, hosts, trust=None):
     return facts
 
 
-def native_read(argv, allowed=(0,)):
+def native_read(argv, allowed=(0,), maximum=2 * 1024 * 1024, timeout=30):
     """Require complete bounded native reads without exposing their private output."""
     result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, timeout=30)
-    if result.returncode not in allowed or len(result.stdout.encode()) > 2 * 1024 * 1024:
+                            text=True, timeout=timeout)
+    if result.returncode not in allowed or len(result.stdout.encode()) > maximum:
         raise ValueError("native observation unavailable")
     return result.stdout.strip()
+
+
+def subject_units(args, key):
+    """Read only the exact subject timer and service, failing closed on unknown states."""
+    prefix = args.unit_prefix + key
+    if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,246}", prefix)
+            or args.timer != prefix + ".timer"):
+        raise ValueError("invalid subject unit")
+    facts = {"version": 1}
+    for suffix in ("timer", "service"):
+        lines = native_read([
+            "systemctl", "show", prefix + "." + suffix, "--all", "--no-pager",
+            "--property=LoadState,ActiveState,UnitFileState",
+        ], allowed=(0, 4), maximum=8192, timeout=3).splitlines()
+        fields = dict(line.split("=", 1) for line in lines)
+        if len(lines) != 3 or fields.keys() != {"LoadState", "ActiveState", "UnitFileState"}:
+            raise ValueError("subject unit state unavailable")
+        load, active, installed = (fields[name] for name in ("LoadState", "ActiveState", "UnitFileState"))
+        if (load, active, installed) == ("not-found", "inactive", ""):
+            installed = None
+        elif (
+            load != "loaded"
+            or active not in {"active", "inactive", "failed", "activating", "deactivating",
+                              "reloading", "maintenance", "refreshing"}
+            or installed not in {"enabled", "enabled-runtime", "disabled", "static",
+                                 "indirect", "linked", "linked-runtime", "alias",
+                                 "generated", "transient", "masked", "masked-runtime"}
+        ):
+            raise ValueError("subject unit state unavailable")
+        facts[suffix] = {"load_state": load, "active_state": active, "unit_file_state": installed}
+    return facts
 
 
 def gateway_inventory():
@@ -524,6 +555,7 @@ def main():
     parser.add_argument("--snapshot", action="store_true")
     parser.add_argument("--selection-only", action="store_true")
     parser.add_argument("--uninstalled-gateway", action="store_true")
+    parser.add_argument("--subject-units", action="store_true")
     parser.add_argument("--dynamic-root", default="/etc/traefik/dynamic/opsctl")
     parser.add_argument("--acme-root", default="/var/lib/traefik")
     parser.add_argument("--state-root", default="/var/lib/opsctl/automatic-certificates")
@@ -536,6 +568,15 @@ def main():
     args = parser.parse_args()
     facts = empty()
     try:
+        units = None
+        if args.subject_units:
+            subject = subject_key(args.subject)
+            if (args.subject["type"] != "deployment" or args.hosts != []
+                    or args.uninstalled_gateway or args.selection_only or args.snapshot
+                    or args.csr or args.unused_directory
+                    or args.selection != str(Path(args.dynamic_root) / ("certificate-" + subject + ".yml"))):
+                raise ValueError("conflicting subject unit observation mode")
+            units = subject_units(args, subject)
         if args.uninstalled_gateway:
             print(json.dumps({'certificate_observation': uninstalled_gateway(args)}, separators=(',', ':')))
             return 0
@@ -570,6 +611,10 @@ def main():
             if args.require_source and facts["source"] != args.require_source:
                 raise ValueError("unexpected selected source")
         result = snapshot(facts) if args.snapshot else {key: facts}
+        if units is not None:
+            if units != subject_units(args, subject):
+                raise ValueError("subject units changed during observation")
+            result["certificate_subject_units"] = units
         encoded = json.dumps(result, separators=(",", ":"))
         if len(encoded.encode()) > MAX_OUTPUT:
             raise ValueError("output too large")

@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "item_id": "generated_dns01_issue",
+  "engine": "ansible",
+  "documentation": "generated_dns01_issue.md"
+}
