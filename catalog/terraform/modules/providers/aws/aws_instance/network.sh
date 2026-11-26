@@ -7,7 +7,7 @@ trap 'rm -rf "$work"' EXIT
 trap 'exit 130' HUP INT TERM
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-deadline=$(( $(date +%s) + 14 ))
+deadline=$(( $(date +%s) + 24 ))
 region=${AWS_DEFAULT_REGION:-}
 for file in payload domain instance group interfaces rules; do printf '{}\n' > "$work/$file"; done
 printf '[]\n' > "$work/missing"
@@ -43,6 +43,19 @@ finish() {
     exit 1
 }
 
+read_network() {
+    unavailable_reason=$1
+    shift
+    if read_native "$@"; then
+        return 0
+    else
+        read_status=$?
+    fi
+    if [ "$read_status" -eq 124 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+        finish unknown collection_timeout
+    fi
+    finish unknown "$unavailable_reason"
+}
 
 if [ "$(wc -c < "$work/request")" -gt 32768 ] || ! closed_json "$work/request"; then
     printf '{}\n' > "$work/request"
@@ -50,21 +63,20 @@ if [ "$(wc -c < "$work/request")" -gt 32768 ] || ! closed_json "$work/request"; 
 fi
 q request > /dev/null 2> "$work/error" || finish rejected request_invalid
 has_credentials || finish unknown credentials_unavailable
-read_native payload sts get-caller-identity || finish unknown identity_unavailable
+read_network identity_unavailable payload sts get-caller-identity
 account=$(q identity -re 2> "$work/error") || finish unknown identity_unqualified
 network=$(jq -r .network_id "$work/request")
-read_native payload ec2 describe-vpcs --vpc-ids "$network" || finish unknown domain_unavailable
+read_network domain_unavailable payload ec2 describe-vpcs --vpc-ids "$network"
 q domain > "$work/qualified" 2> "$work/error" || finish unknown domain_unqualified
 mv "$work/qualified" "$work/domain"
 
 jq -r '.members[]' "$work/request" > "$work/ids"
 while IFS= read -r id; do
-    read_native instance ec2 describe-instances --instance-ids "$id" || finish unknown member_unavailable
+    read_network member_unavailable instance ec2 describe-instances --instance-ids "$id"
     firewall=$(q group -re 2> "$work/error") || finish unknown member_unqualified
-    read_native group ec2 describe-security-groups --group-ids "$firewall" &&
-    read_native interfaces ec2 describe-network-interfaces --filters "Name=group-id,Values=$firewall" &&
-    read_native rules ec2 describe-security-group-rules --filters "Name=group-id,Values=$firewall" ||
-        finish unknown policy_unavailable
+    read_network policy_unavailable group ec2 describe-security-groups --group-ids "$firewall"
+    read_network policy_unavailable interfaces ec2 describe-network-interfaces --filters "Name=group-id,Values=$firewall"
+    read_network policy_unavailable rules ec2 describe-security-group-rules --filters "Name=group-id,Values=$firewall"
     q member > "$work/member" 2> "$work/error" || finish unknown member_unqualified
     jq -cS 'del(.id,.host)' "$work/member" > "$work/preimage" || finish unknown member_unqualified
     digest=$(sha256sum < "$work/preimage") || finish unknown member_unqualified
