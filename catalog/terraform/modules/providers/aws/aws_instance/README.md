@@ -14,9 +14,10 @@ Creation accepts one `opsctl_server` object: `name`, `region`, `size`, `image`,
 contains no credentials or private key. Native AWS credentials stay in their
 execution environment.
 
-The module maps size to instance type, reads the captured
-`image_metadata.ssm_parameter` through native SSM, and converts platform tags
-to native tag keys with `Name` set to the actual requested name. The instance,
+The module maps size to instance type and requires a nonblank
+`image_metadata.ssm_parameter_by_region[opsctl_server.region]` entry for the
+sealed region. It reads that reference through native SSM and converts platform
+tags to native tag keys with `Name` set to the actual requested name. The instance,
 security group and root volume receive those same tags at launch. A bounded
 exact AMI read qualifies an EBS root with no additional EBS mapping. Ordinary
 creation uses `ssh_key.registered_name`; the public key and fingerprint do not

@@ -9,7 +9,7 @@ data "aws_caller_identity" "allocation" {
 locals {
   creation            = var.opsctl_server
   resource_name       = local.creation.name
-  image_ssm_parameter = try(local.creation.image_metadata.ssm_parameter, "")
+  image_ssm_parameter = try(trimspace(local.creation.image_metadata.ssm_parameter_by_region[local.creation.region]), "")
   image_id            = try(nonsensitive(data.aws_ssm_parameter.selected_image[0].value), "")
   default_subnet_id   = try(sort(data.aws_subnets.default[0].ids)[0], "")
   instance_key_name   = local.creation.simulate ? null : local.creation.ssh_key.registered_name
@@ -130,7 +130,7 @@ resource "aws_instance" "server" {
         && trimspace(local.creation.size) != ""
         && local.image_ssm_parameter != ""
       )
-      error_message = "name, region, instance_type, and image_ssm_parameter are required for creation."
+      error_message = "Creation requires name, region, instance_type, and a nonblank image_metadata.ssm_parameter_by_region entry for the selected region."
     }
 
     precondition {
