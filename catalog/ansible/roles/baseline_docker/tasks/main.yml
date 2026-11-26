@@ -143,74 +143,42 @@
 - name: Ensure package headroom on small declared-image hosts
   when: baseline_profile | default('declared_image') == 'declared_image'
   block:
-    - name: Prepare and activate the managed swap file when needed
-      ansible.builtin.shell: |
-        set -eu
-        umask 077
-        path=/opsctl.swap
-        set -- $(awk '
-          /^MemTotal:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { memory = $2 }
-          /^SwapTotal:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { swap = $2 }
-          END { if (memory > 0 && swap != "") print memory, swap }
-        ' /proc/meminfo)
-        [ "$#" -eq 2 ]
-        [ "$1" -le 524288 ] || exit 0
-        [ ! -L "$path" ]
-        if [ -e "$path" ]; then
-          [ -f "$path" ]
-          [ "$(stat -c '%u:%g:%a:%s:%h' -- "$path")" = '0:0:600:1073741824:1' ]
-          [ "$(blkid -p -s TYPE -o value -- "$path")" = swap ]
-        fi
-        active=$(awk -v path="$path" '
-          NR == 1 && $1 != "Filename" { exit 1 }
-          NR > 1 && $1 == path { active = 1 }
-          END { if (NR == 0) exit 1; print active + 0 }
-        ' /proc/swaps)
-        # A 1 GiB swap file reports less usable space than its file size.
-        if [ "$active" -eq 0 ] && [ "$2" -ge 1048512 ]; then
-          exit 0
-        fi
-        [ -f /etc/fstab ] && [ ! -L /etc/fstab ]
-        awk -v path="$path" '
-          $1 == path {
-            if (++found > 1 || NF != 6 || $2 != "none" || $3 != "swap" ||
-                $4 != "sw" || $5 != 0 || $6 != 0) bad = 1
-          }
-          END { exit bad ? 1 : 0 }
-        ' /etc/fstab
-        if [ "$active" -eq 0 ]; then
-          if [ ! -e "$path" ]; then
-            staged=$(mktemp "${path}.XXXXXX")
-            trap 'rm -f -- "$staged"' EXIT
-            trap 'exit 1' HUP INT TERM
-            dd if=/dev/zero of="$staged" bs=1M count=1024 conv=fsync status=none
-            mkswap "$staged" >/dev/null
-            mv -T -n -- "$staged" "$path"
-            [ ! -e "$staged" ]
-          fi
-          swapon -- "$path"
-          printf 'activated\n'
-        else
-          [ -f "$path" ]
-          printf 'active\n'
-        fi
-      args:
-        executable: /bin/sh
-      register: baseline_swap
-      changed_when: baseline_swap.stdout == 'activated'
-      no_log: true
+    - name: Gather memory and swap facts
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', hardware]
+        filter: [ansible_memtotal_mb, ansible_swaptotal_mb]
+      register: baseline_memory
 
-    - name: Persist only the managed swap file
-      ansible.builtin.lineinfile:
-        path: /etc/fstab
-        regexp: '^\s*/opsctl\.swap\s'
-        line: '/opsctl.swap none swap sw 0 0'
-      when: baseline_swap.stdout in ['activated', 'active']
-      no_log: true
-  rescue:
-    - name: Fail when managed swap could not be prepared safely
-      ansible.builtin.fail:
-        msg: "The managed swap file could not be safely prepared and persisted."
+    - name: Allocate managed swap on a small host without enough swap
+      ansible.builtin.command: dd if=/dev/zero of=/opsctl.swap bs=1M count=1024 conv=fsync status=none
+      args:
+        creates: /opsctl.swap
+      register: baseline_swap
+      when:
+        - baseline_memory.ansible_facts.ansible_memtotal_mb <= 512
+        - baseline_memory.ansible_facts.ansible_swaptotal_mb < 1023
+
+    - name: Configure the newly allocated swap file
+      when: baseline_swap is changed
+      block:
+        - name: Restrict swap file permissions
+          ansible.builtin.file:
+            path: /opsctl.swap
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Format the swap file
+          ansible.builtin.command: mkswap /opsctl.swap
+
+        - name: Activate the swap file
+          ansible.builtin.command: swapon /opsctl.swap
+
+        - name: Persist the managed swap file
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^\s*/opsctl\.swap\s'
+            line: '/opsctl.swap none swap sw 0 0'
 
 - name: Report Docker installation started
   shell: |
