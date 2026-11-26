@@ -26,11 +26,43 @@ def member_group($id; $domain):
   | .SecurityGroups | require(type == "array" and length == 1)
   | .[0].GroupId | require(native_id("sg"));
 
-def member($id; $group; $domain):
-  ($group | qualified_group($firewall)) as $sg
-  | exclusive_attachment({provider_instance_id:$id};$sg;$instance[0];$interfaces[0];$domain) as $attachment
-  | ($rules[0] | exact_rows($sg)) as $policy
+def member($id; $firewall; $instances; $groups; $interfaces; $rules; $domain):
+  ($groups | qualified_group($firewall)) as $sg
+  | exclusive_attachment({provider_instance_id:$id};$sg;$instances;$interfaces;$domain) as $attachment
+  | ($rules | exact_rows($sg)) as $policy
   | {id:$id, host:$attachment.host, attachment:$attachment, policy:$policy};
+
+def member_selection($ids; $domain):
+  ($ids | length) as $count
+  | bounded_page("Reservations";$count)
+  | [ .[] | require(.OwnerId == $domain.account
+                    and (.Instances | type == "array" and length > 0 and length <= $count))
+      | .OwnerId as $owner | .Instances[] | {OwnerId:$owner, Instances:[.]} ]
+  | require((map(.Instances[0].InstanceId) | sort) == ($ids | sort))
+  | . as $reservations
+  | [ $ids[] as $id
+      | {Reservations:[$reservations[] | select(.Instances[0].InstanceId == $id)]} as $instances
+      | {id:$id, firewall:($instances | member_group($id;$domain)), instances:$instances} ]
+  | require((map(.firewall) | unique | length) == $count);
+
+def qualified_members($selection; $group_reply; $interface_reply; $rule_reply; $domain):
+  ($selection | map(.firewall) | sort) as $firewalls
+  | ($firewalls | length) as $count
+  | ($group_reply | bounded_page("SecurityGroups";$count)
+      | require((map(.GroupId) | sort) == $firewalls)) as $groups
+  | ($interface_reply | bounded_page("NetworkInterfaces";$count)
+      | require(all(.[]; .Groups | type == "array" and length == 1)
+          and (map(.Groups[0].GroupId) | sort) == $firewalls
+          and (map(.NetworkInterfaceId) | unique | length) == $count)) as $interfaces
+  | ($rule_reply | bounded_page("SecurityGroupRules";($count * 200))
+      | require(all(.[]; .GroupId as $id | ($firewalls | index($id)) != null)
+          and (map(.SecurityGroupRuleId) | unique | length) == length)) as $rules
+  | $selection[] as $member
+  | $member.firewall as $firewall
+  | member($member.id;$firewall;$member.instances;
+      {SecurityGroups:[$groups[] | select(.GroupId == $firewall)]};
+      {NetworkInterfaces:[$interfaces[] | select(.Groups[0].GroupId == $firewall)]};
+      {SecurityGroupRules:[$rules[] | select(.GroupId == $firewall)]};$domain);
 
 def permits_host($host):
   ($host | ipv4_number) as $ip
@@ -56,8 +88,9 @@ $request[0] as $r
   elif $mode == "domain" then
     $payload[0] | qualified_vpc($r.network_id;$account;$region)
     | require($r.ipv4_cidr == null or $r.ipv4_cidr == .ipv4_cidr)
-  elif $mode == "group" then $instance[0] | member_group($id;$domain[0])
-  elif $mode == "member" then member($id;$group[0];$domain[0])
+  elif $mode == "instances" then $instance[0] | member_selection($r.members;$domain[0])
+  elif $mode == "members" then
+    qualified_members($selection[0];$group[0];$interfaces[0];$rules[0];$domain[0])
   elif $mode == "listeners" then
     $members | require((map(.host) | unique | length) == length)
     | require((map(.attachment.firewall) | unique | length) == length

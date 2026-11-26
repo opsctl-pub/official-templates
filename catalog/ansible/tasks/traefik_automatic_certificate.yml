@@ -290,6 +290,40 @@
             that: automatic_changed_service.stdout | trim in ['inactive', 'failed']
           when: automatic_unit_attempted
 
+        - name: Read only this settled invocation's fixed failure detail
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import os
+                import re
+                import stat
+                import sys
+
+                try:
+                    with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as marker:
+                        metadata = os.fstat(marker.fileno())
+                        if (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+                                and stat.S_IMODE(metadata.st_mode) == 0o600 and metadata.st_nlink == 1
+                                and 0 < metadata.st_size <= 128):
+                            matched = re.fullmatch(
+                                rb"(setup|account|challenge-route|publication|client)(?: (connection|dns|unauthorized|rateLimited|rejectedIdentifier))?\n",
+                                marker.read(129),
+                            )
+                            if matched and (matched[2] is None or matched[1] == b"client"):
+                                print(matched[0].decode("ascii").rstrip())
+                except OSError:
+                    pass
+              - "{{ automatic_attempt.path }}/failure"
+          register: automatic_failure_detail
+          changed_when: false
+          failed_when: false
+          when:
+            - automatic_unit_attempted
+            - not automatic_certificate_succeeded
+            - automatic_attempt.path is defined
+
         - name: Inspect this invocation's private publication outcome before cleanup
           ansible.builtin.stat:
             path: "{{ automatic_attempt.path }}/publication.json"
@@ -416,6 +450,11 @@
             path: "{{ automatic_attempt.path }}/{{ item }}"
             state: absent
           loop: [expected.json, client.id, publication.json, client.log]
+          when: automatic_attempt.path is defined
+
+        - name: Unlink only this invocation's diagnostic leaf
+          ansible.builtin.command:
+            argv: [rm, -f, --, "{{ automatic_attempt.path }}/failure"]
           when: automatic_attempt.path is defined
 
         - name: Inspect the invocation directory after exact file cleanup
@@ -569,5 +608,14 @@
 
 - name: Fail after reporting the actual automatic result
   ansible.builtin.fail:
-    msg: Certificate issuance failed. The previous selection is retained unless restoration is reported failed.
+    msg: >-
+      Certificate issuance failed. The previous selection is retained unless restoration is reported failed.
+      {%- if certificate_procedure_error == {'phase': 'renew', 'code': 'certificate_issue_failed'}
+          and automatic_failure_detail.rc | default(1) == 0
+          and detail is match('^(setup|account|challenge-route|publication|client( (connection|dns|unauthorized|rateLimited|rejectedIdentifier))?)\Z') %}
+      {{ ' Last attempted phase was ' ~ detail.split()[0] ~
+         (' (ACME category ' ~ detail.split()[1] ~ ')' if ' ' in detail else '') ~ '.' }}
+      {%- endif %}
+  vars:
+    detail: "{{ automatic_failure_detail.stdout | default('') }}"
   when: not automatic_certificate_succeeded or certificate_observation.outcome != 'succeeded'
