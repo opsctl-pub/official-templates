@@ -9,7 +9,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deadline=$(( $(date +%s) + 24 ))
 region=${AWS_DEFAULT_REGION:-}
-for file in payload domain instance group interfaces rules; do printf '{}\n' > "$work/$file"; done
+for file in payload domain instance group interfaces rules selection; do printf '{}\n' > "$work/$file"; done
 printf '[]\n' > "$work/missing"
 : > "$work/members"
 head -c 32769 > "$work/request"
@@ -20,11 +20,11 @@ q() {
     mode=$1
     shift
     jq -L "$root" -n "$@" --arg mode "$mode" --arg region "$region" --arg account "${account:-}" \
-        --arg id "${id:-}" --arg firewall "${firewall:-}" --slurpfile request "$work/request" \
+        --slurpfile request "$work/request" \
         --slurpfile payload "$work/payload" --slurpfile domain "$work/domain" \
         --slurpfile instance "$work/instance" --slurpfile group "$work/group" \
         --slurpfile interfaces "$work/interfaces" --slurpfile rules "$work/rules" \
-        --slurpfile members "$work/members" -f "$root/network.jq"
+        --slurpfile selection "$work/selection" --slurpfile members "$work/members" -f "$root/network.jq"
 }
 
 finish() {
@@ -70,17 +70,28 @@ read_network domain_unavailable payload ec2 describe-vpcs --vpc-ids "$network"
 q domain > "$work/qualified" 2> "$work/error" || finish unknown domain_unqualified
 mv "$work/qualified" "$work/domain"
 
-jq -r '.members[]' "$work/request" > "$work/ids"
-while IFS= read -r id; do
-    read_network member_unavailable instance ec2 describe-instances --instance-ids "$id"
-    firewall=$(q group -re 2> "$work/error") || finish unknown member_unqualified
-    read_network policy_unavailable group ec2 describe-security-groups --group-ids "$firewall"
-    read_network policy_unavailable interfaces ec2 describe-network-interfaces --filters "Name=group-id,Values=$firewall"
-    read_network policy_unavailable rules ec2 describe-security-group-rules --filters "Name=group-id,Values=$firewall"
-    q member > "$work/member" 2> "$work/error" || finish unknown member_unqualified
+if [ "$(jq -r .action "$work/request")" = domain ]; then
+    finish complete ''
+fi
+
+# IDs were validated by request/member_selection before forming native filters.
+member_ids=$(jq -er '.members[]' "$work/request") || finish unknown member_unqualified
+set -- $member_ids
+read_network member_unavailable instance ec2 describe-instances --instance-ids "$@"
+q instances > "$work/members.selected" 2> "$work/error" || finish unknown member_unqualified
+mv "$work/members.selected" "$work/selection"
+group_ids=$(jq -er '.[].firewall' "$work/selection") || finish unknown member_unqualified
+set -- $group_ids
+firewalls=$(jq -er 'map(.firewall) | join(",") | select(length > 0)' "$work/selection") || finish unknown member_unqualified
+read_network policy_unavailable group ec2 describe-security-groups --group-ids "$@"
+read_network policy_unavailable interfaces ec2 describe-network-interfaces --filters "Name=group-id,Values=$firewalls"
+read_network policy_unavailable rules ec2 describe-security-group-rules --filters "Name=group-id,Values=$firewalls"
+q members -c > "$work/members.qualified" 2> "$work/error" || finish unknown member_unqualified
+while IFS= read -r member; do
+    printf '%s\n' "$member" > "$work/member"
     jq -cS 'del(.id,.host)' "$work/member" > "$work/preimage" || finish unknown member_unqualified
     digest=$(sha256sum < "$work/preimage") || finish unknown member_unqualified
     jq -c --arg digest "${digest%% *}" '. + {access_fingerprint:$digest}' "$work/member" >> "$work/members"
-done < "$work/ids"
+done < "$work/members.qualified"
 q listeners > "$work/missing" 2> "$work/error" || finish unknown listener_unqualified
 finish complete ''
