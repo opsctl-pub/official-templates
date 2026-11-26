@@ -3,8 +3,18 @@
 set -eu
 umask 077
 work=$(mktemp -d "${TMPDIR:-/tmp}/opsctl-aws-network.XXXXXXXX")
-trap 'rm -rf "$work"' EXIT
+transport_pid=
+cleanup() {
+    if [ -n "$transport_pid" ]; then
+        exec 3>&- 4<&-
+        kill "$transport_pid" 2>/dev/null || true
+        wait "$transport_pid" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
+trap '' PIPE
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deadline=$(( $(date +%s) + 24 ))
@@ -45,13 +55,18 @@ finish() {
 
 read_network() {
     unavailable_reason=$1
-    shift
-    if read_native "$@"; then
-        return 0
+    destination=$2
+    shift 2
+    if printf '%s\n' "$*" >&3 2> "$work/error" && IFS= read -r read_status <&4; then
+        if [ "$read_status" = 0 ] && IFS= read -r response <&4 &&
+            printf '%s\n' "$response" > "$work/$destination" &&
+            [ "$(wc -c < "$work/$destination")" -le 262144 ] && closed_json "$work/$destination"; then
+            return 0
+        fi
     else
-        read_status=$?
+        read_status=1
     fi
-    if [ "$read_status" -eq 124 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+    if [ "$read_status" = 124 ] || [ "$(date +%s)" -ge "$deadline" ]; then
         finish unknown collection_timeout
     fi
     finish unknown "$unavailable_reason"
@@ -63,10 +78,14 @@ if [ "$(wc -c < "$work/request")" -gt 32768 ] || ! closed_json "$work/request"; 
 fi
 q request > /dev/null 2> "$work/error" || finish rejected request_invalid
 has_credentials || finish unknown credentials_unavailable
-read_network identity_unavailable payload sts get-caller-identity
+mkfifo "$work/requests" "$work/replies" || finish unknown identity_unavailable
+python3 "$root/network_transport.py" "$region" "$deadline" < "$work/requests" > "$work/replies" 2> "$work/error" &
+transport_pid=$!
+exec 3> "$work/requests" 4< "$work/replies"
+read_network identity_unavailable payload identity
 account=$(q identity -re 2> "$work/error") || finish unknown identity_unqualified
 network=$(jq -r .network_id "$work/request")
-read_network domain_unavailable payload ec2 describe-vpcs --vpc-ids "$network"
+read_network domain_unavailable payload vpc "$network"
 q domain > "$work/qualified" 2> "$work/error" || finish unknown domain_unqualified
 mv "$work/qualified" "$work/domain"
 
@@ -77,15 +96,14 @@ fi
 # IDs were validated by request/member_selection before forming native filters.
 member_ids=$(jq -er '.members[]' "$work/request") || finish unknown member_unqualified
 set -- $member_ids
-read_network member_unavailable instance ec2 describe-instances --instance-ids "$@"
+read_network member_unavailable instance instances "$@"
 q instances > "$work/members.selected" 2> "$work/error" || finish unknown member_unqualified
 mv "$work/members.selected" "$work/selection"
 group_ids=$(jq -er '.[].firewall' "$work/selection") || finish unknown member_unqualified
 set -- $group_ids
-firewalls=$(jq -er 'map(.firewall) | join(",") | select(length > 0)' "$work/selection") || finish unknown member_unqualified
-read_network policy_unavailable group ec2 describe-security-groups --group-ids "$@"
-read_network policy_unavailable interfaces ec2 describe-network-interfaces --filters "Name=group-id,Values=$firewalls"
-read_network policy_unavailable rules ec2 describe-security-group-rules --filters "Name=group-id,Values=$firewalls"
+read_network policy_unavailable group groups "$@"
+read_network policy_unavailable interfaces interfaces "$@"
+read_network policy_unavailable rules rules "$@"
 q members -c > "$work/members.qualified" 2> "$work/error" || finish unknown member_unqualified
 while IFS= read -r member; do
     printf '%s\n' "$member" > "$work/member"
