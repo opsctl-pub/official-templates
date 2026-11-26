@@ -210,7 +210,8 @@ def configuration_observation:
      policy_fingerprint:$digest,fingerprint:$fingerprint,
      preserved_policy:{name:$p.name,unrelated_ingress:$p.unrelated,outbound:$p.outbound,
        attached_firewall_ids:[$r.firewall_id],attached_instance_ids:[$r.provider_instance_id],fingerprint:$digest},
-     observed_at:$observed,observation_complete:true};
+     observed_at:$observed,observation_complete:true}
+  + (if $r.action == "observe" then {network_id:$p.attachment.vpc} else {} end);
 def configuration_change:
   $request[0] as $r | $projection[0] as $p | ($r.step.rule | request_tuple) as $step
   | ($step | length == 3) as $private

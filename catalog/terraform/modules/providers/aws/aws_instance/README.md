@@ -192,6 +192,7 @@ supply a scope. Imported/registered inventory and unavailable scope use null;
 there is no guessed firewall ID or peer/network/source lookup during ingestion.
 Verify selects the declared `observe` action when available. `change`
 is never a Verify action.
+The observe-only `network_id` is the qualified VPC ID for that exact attachment and is omitted when evidence is unavailable.
 
 The backend's closed read capture includes `exposure` and `private_bindings` for
 current-scope requalification. Runner delivers only the eight plain procedure
